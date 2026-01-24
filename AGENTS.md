@@ -371,3 +371,5 @@ pub fn run(self: *Daemon) !void {
 - Test on real X11 server, not headless - this is a GUI tool
 - When in doubt about Zig syntax, use `zig build` early and often - compiler errors are helpful
 - QML integration is last - daemon should work standalone first
+
+note: raylib can be downloaded from https://github.com/raysan5/raylib/releases/download/5.5/raylib-5.5_linux_amd64.tar.gz

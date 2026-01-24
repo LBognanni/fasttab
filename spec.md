@@ -98,7 +98,7 @@ The QML stub exists solely to integrate with KWin's keyboard handling. KWin grab
    - Capture window contents using XComposite extension
    - Store thumbnails as in-memory RGBA buffers
    - Refresh thumbnails periodically (initial implementation: polling)
-   - Scale thumbnails to target height of 100 pixels, preserving aspect ratio
+   - Scale thumbnails to target height of 256 pixels, preserving aspect ratio
 
 3. **Socket Server**
    - Listen on a Unix domain socket
@@ -256,12 +256,12 @@ The binary should have two completely separate code paths: the full daemon initi
 
 ### Grid Sizing Algorithm
 
-1. Calculate thumbnail widths based on each window's aspect ratio (height fixed at 100px)
+1. Calculate thumbnail widths based on each window's aspect ratio (height fixed at 128px)
 2. Determine optimal column count:
    - Start with 1 column
    - Add columns while total grid width (including spacing and padding) fits within 1820px
    - Add rows while total grid height fits within 980px
-3. If all windows don't fit at 100px height:
+3. If all windows don't fit at 128px height:
    - Reduce thumbnail height proportionally until they fit
    - Minimum thumbnail height: 60px
 4. If still doesn't fit at 60px height:

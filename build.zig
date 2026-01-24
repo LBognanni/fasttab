@@ -11,8 +11,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Add include path for stb headers
+    exe.addIncludePath(b.path("include"));
+
+    // Add stb implementation
+    exe.addCSourceFile(.{
+        .file = b.path("src/stb_impl.c"),
+        .flags = &[_][]const u8{"-std=c99"},
+    });
+
     // Link XCB libraries
     exe.linkSystemLibrary("xcb");
+    exe.linkSystemLibrary("xcb-composite");
+    exe.linkSystemLibrary("xcb-image");
     exe.linkLibC();
 
     b.installArtifact(exe);
@@ -33,7 +44,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    exe_unit_tests.addIncludePath(b.path("include"));
     exe_unit_tests.linkSystemLibrary("xcb");
+    exe_unit_tests.linkSystemLibrary("xcb-composite");
+    exe_unit_tests.linkSystemLibrary("xcb-image");
     exe_unit_tests.linkLibC();
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
