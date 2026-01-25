@@ -256,6 +256,24 @@ fn initComposite(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) X11Error!v
     // Instead, we redirect each individual window before capturing it.
 }
 
+const MousePosition = struct {
+    x: i32,
+    y: i32,
+};
+
+fn getMousePosition(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) MousePosition {
+    const cookie = xcb.xcb_query_pointer(conn, root);
+    const reply = xcb.xcb_query_pointer_reply(conn, cookie, null);
+    if (reply == null) {
+        return MousePosition{ .x = 0, .y = 0 };
+    }
+    defer std.c.free(reply);
+    return MousePosition{
+        .x = reply.*.root_x,
+        .y = reply.*.root_y,
+    };
+}
+
 const Thumbnail = struct {
     data: []u8,
     width: u32,
@@ -275,7 +293,7 @@ const CORNER_RADIUS: f32 = 12.0;
 const ITEM_CORNER_RADIUS: f32 = 4.0;
 const MAX_GRID_WIDTH: u32 = 1820;
 const MAX_GRID_HEIGHT: u32 = 980;
-const TITLE_FONT_SIZE: i32 = 12;
+const TITLE_FONT_SIZE: i32 = 14;
 const TITLE_SPACING: u32 = 8;
 const SELECTION_BORDER: u32 = 3;
 const BACKGROUND_COLOR = rl.Color{ .r = 0x22, .g = 0x22, .b = 0x22, .a = 217 }; // #222222 @ 85%
@@ -587,10 +605,91 @@ fn loadTextureFromThumbnail(thumbnail: *const Thumbnail) rl.Texture2D {
         .format = rl.PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
         .mipmaps = 1,
     };
-    return rl.LoadTextureFromImage(image);
+    const texture = rl.LoadTextureFromImage(image);
+    // Enable bilinear filtering for smooth thumbnail scaling
+    rl.SetTextureFilter(texture, rl.TEXTURE_FILTER_BILINEAR);
+    return texture;
 }
 
-fn renderSwitcher(items: []WindowItem, selected_index: usize) void {
+// Try to load a system font with bilinear filtering for smooth rendering
+fn loadSystemFont(size: i32) rl.Font {
+    // Try common Linux font paths
+    const font_paths = [_][*c]const u8{
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+    };
+
+    for (font_paths) |path| {
+        const font = rl.LoadFontEx(path, size, null, 0);
+        if (font.texture.id != 0) {
+            // Enable bilinear filtering for smooth font rendering
+            rl.SetTextureFilter(font.texture, rl.TEXTURE_FILTER_BILINEAR);
+            return font;
+        }
+    }
+
+    // Fall back to default font
+    return rl.GetFontDefault();
+}
+
+// Truncate text to fit within max_width, adding ellipsis if needed
+fn drawTruncatedText(font: rl.Font, text: []const u8, x: f32, y: f32, font_size: f32, max_width: f32, color: rl.Color) void {
+    const spacing: f32 = 0;
+    var text_buf: [256]u8 = undefined;
+    const ellipsis = "...";
+
+    // Ensure null-terminated string
+    const len = @min(text.len, text_buf.len - 1);
+    @memcpy(text_buf[0..len], text[0..len]);
+    text_buf[len] = 0;
+
+    const text_ptr: [*c]const u8 = &text_buf;
+    const text_size = rl.MeasureTextEx(font, text_ptr, font_size, spacing);
+
+    if (text_size.x <= max_width) {
+        // Text fits, draw centered
+        const text_x = x + (max_width - text_size.x) / 2.0;
+        rl.DrawTextEx(font, text_ptr, rl.Vector2{ .x = text_x, .y = y }, font_size, spacing, color);
+        return;
+    }
+
+    // Text too long, truncate with ellipsis
+    const ellipsis_size = rl.MeasureTextEx(font, ellipsis, font_size, spacing);
+    const available_width = max_width - ellipsis_size.x;
+
+    // Find how many characters fit
+    var fit_len: usize = 0;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const saved_char = text_buf[i + 1];
+        text_buf[i + 1] = 0; // Temporarily null-terminate at this position
+        const partial_size = rl.MeasureTextEx(font, text_ptr, font_size, spacing);
+        text_buf[i + 1] = saved_char; // Restore
+        if (partial_size.x > available_width) break;
+        fit_len = i + 1;
+    }
+
+    // Build truncated string with ellipsis
+    if (fit_len > 0) {
+        @memcpy(text_buf[fit_len .. fit_len + 3], ellipsis);
+        text_buf[fit_len + 3] = 0;
+    } else {
+        @memcpy(text_buf[0..3], ellipsis);
+        text_buf[3] = 0;
+    }
+
+    const final_size = rl.MeasureTextEx(font, text_ptr, font_size, spacing);
+    const text_x = x + (max_width - final_size.x) / 2.0;
+    rl.DrawTextEx(font, text_ptr, rl.Vector2{ .x = text_x, .y = y }, font_size, spacing, color);
+}
+
+fn renderSwitcher(items: []WindowItem, selected_index: usize, font: rl.Font) void {
     if (items.len == 0) return;
 
     // Calculate layout
@@ -657,13 +756,9 @@ fn renderSwitcher(items: []WindowItem, selected_index: usize) void {
             };
             rl.DrawTexturePro(item.texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
 
-            // Draw title
+            // Draw title (truncated with ellipsis if too long)
             const title_y = y + @as(f32, @floatFromInt(item.display_height + TITLE_SPACING));
-            // Truncate title if too long (simple approach - just measure and clip)
-            const title_ptr: [*c]const u8 = @ptrCast(item.title.ptr);
-            const text_width = rl.MeasureText(title_ptr, TITLE_FONT_SIZE);
-            const title_x = x + (@as(f32, @floatFromInt(item.display_width)) - @as(f32, @floatFromInt(text_width))) / 2.0;
-            rl.DrawText(title_ptr, @intFromFloat(title_x), @intFromFloat(title_y), TITLE_FONT_SIZE, TITLE_COLOR);
+            drawTruncatedText(font, item.title, x, title_y, @floatFromInt(TITLE_FONT_SIZE), @floatFromInt(item.display_width), TITLE_COLOR);
 
             x += @as(f32, @floatFromInt(item.display_width + SPACING));
             item_idx += 1;
@@ -797,6 +892,9 @@ pub fn main() !void {
         layout.total_height,
     });
 
+    // Get mouse position BEFORE initializing raylib (to find correct monitor)
+    const mouse_pos = getMousePosition(conn.?, root);
+
     // Initialize raylib
     rl.SetConfigFlags(rl.FLAG_WINDOW_UNDECORATED | rl.FLAG_WINDOW_TRANSPARENT | rl.FLAG_WINDOW_TOPMOST);
     rl.SetTraceLogLevel(rl.LOG_WARNING); // Reduce log noise
@@ -804,19 +902,50 @@ pub fn main() !void {
 
     rl.SetTargetFPS(60);
 
+    // Load system font for better text rendering
+    const font = loadSystemFont(TITLE_FONT_SIZE * 2); // Load at 2x for better quality
+
     // Load textures from thumbnails (must be done after InitWindow)
     for (items.items) |*item| {
         item.texture = loadTextureFromThumbnail(&item.thumbnail);
     }
 
-    // Center window on screen
-    const monitor = rl.GetCurrentMonitor();
-    const monitor_width = rl.GetMonitorWidth(monitor);
-    const monitor_height = rl.GetMonitorHeight(monitor);
-    const win_x = @divTrunc(monitor_width - @as(i32, @intCast(layout.total_width)), 2);
-    const win_y = @divTrunc(monitor_height - @as(i32, @intCast(layout.total_height)), 2);
+    // Find monitor containing mouse cursor and center window on it
+    const monitor_count = rl.GetMonitorCount();
+    var target_monitor: i32 = 0;
+    var mon_x: i32 = 0;
+    var mon_y: i32 = 0;
+    var mon_width: i32 = 1920;
+    var mon_height: i32 = 1080;
+
+    var m: i32 = 0;
+    while (m < monitor_count) : (m += 1) {
+        const mx = rl.GetMonitorPosition(m).x;
+        const my = rl.GetMonitorPosition(m).y;
+        const mw = rl.GetMonitorWidth(m);
+        const mh = rl.GetMonitorHeight(m);
+
+        // Check if mouse is within this monitor
+        if (mouse_pos.x >= @as(i32, @intFromFloat(mx)) and
+            mouse_pos.x < @as(i32, @intFromFloat(mx)) + mw and
+            mouse_pos.y >= @as(i32, @intFromFloat(my)) and
+            mouse_pos.y < @as(i32, @intFromFloat(my)) + mh)
+        {
+            target_monitor = m;
+            mon_x = @intFromFloat(mx);
+            mon_y = @intFromFloat(my);
+            mon_width = mw;
+            mon_height = mh;
+            break;
+        }
+    }
+
+    // Center window on the target monitor
+    const win_x = mon_x + @divTrunc(mon_width - @as(i32, @intCast(layout.total_width)), 2);
+    const win_y = mon_y + @divTrunc(mon_height - @as(i32, @intCast(layout.total_height)), 2);
     rl.SetWindowPosition(win_x, win_y);
 
+    try stdout.print("Mouse at ({d}, {d}), using monitor {d}\n", .{ mouse_pos.x, mouse_pos.y, target_monitor });
     try stdout.print("Displaying {d} windows in switcher. Press ESC or close window to exit.\n", .{items.items.len});
 
     var selected_index: usize = 0;
@@ -847,14 +976,15 @@ pub fn main() !void {
 
         rl.BeginDrawing();
         rl.ClearBackground(rl.Color{ .r = 0, .g = 0, .b = 0, .a = 0 }); // Transparent
-        renderSwitcher(items.items, selected_index);
+        renderSwitcher(items.items, selected_index, font);
         rl.EndDrawing();
     }
 
-    // Unload textures BEFORE closing window (must happen while GL context is valid)
+    // Unload resources BEFORE closing window (must happen while GL context is valid)
     for (items.items) |*item| {
         rl.UnloadTexture(item.texture);
     }
+    rl.UnloadFont(font);
 
     rl.CloseWindow();
     try stdout.print("Switcher closed.\n", .{});
