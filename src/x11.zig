@@ -1,5 +1,8 @@
 const std = @import("std");
 
+// Feature flags
+pub const FILTER_BY_CURRENT_DESKTOP = true;
+
 pub const xcb = @cImport({
     @cInclude("xcb/xcb.h");
     @cInclude("xcb/composite.h");
@@ -33,6 +36,10 @@ pub const Atoms = struct {
     net_wm_window_type_dock: xcb.xcb_atom_t,
     net_wm_window_type_dialog: xcb.xcb_atom_t,
     net_wm_window_type_utility: xcb.xcb_atom_t,
+    net_wm_state: xcb.xcb_atom_t,
+    net_wm_state_hidden: xcb.xcb_atom_t,
+    net_current_desktop: xcb.xcb_atom_t,
+    net_wm_desktop: xcb.xcb_atom_t,
 };
 
 pub const MousePosition = struct {
@@ -133,6 +140,10 @@ pub fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
         .net_wm_window_type_dock = try internAtom(conn, "_NET_WM_WINDOW_TYPE_DOCK"),
         .net_wm_window_type_dialog = try internAtom(conn, "_NET_WM_WINDOW_TYPE_DIALOG"),
         .net_wm_window_type_utility = try internAtom(conn, "_NET_WM_WINDOW_TYPE_UTILITY"),
+        .net_wm_state = try internAtom(conn, "_NET_WM_STATE"),
+        .net_wm_state_hidden = try internAtom(conn, "_NET_WM_STATE_HIDDEN"),
+        .net_current_desktop = try internAtom(conn, "_NET_CURRENT_DESKTOP"),
+        .net_wm_desktop = try internAtom(conn, "_NET_WM_DESKTOP"),
     };
 }
 
@@ -242,6 +253,94 @@ pub fn shouldShowWindow(
     }
 
     return true;
+}
+
+/// Check if a window is minimized (has _NET_WM_STATE_HIDDEN)
+pub fn isWindowMinimized(
+    conn: *xcb.xcb_connection_t,
+    window: xcb.xcb_window_t,
+    atoms: Atoms,
+) bool {
+    const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_state, xcb.XCB_ATOM_ATOM, 0, 32);
+    const reply = xcb.xcb_get_property_reply(conn, cookie, null);
+    if (reply == null) {
+        return false;
+    }
+    defer std.c.free(reply);
+
+    const len = xcb.xcb_get_property_value_length(reply);
+    if (len == 0) {
+        return false;
+    }
+
+    const data: [*]const xcb.xcb_atom_t = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
+    const count = @as(usize, @intCast(len)) / @sizeOf(xcb.xcb_atom_t);
+
+    for (data[0..count]) |state| {
+        if (state == atoms.net_wm_state_hidden) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/// Get the current virtual desktop number from root window
+pub fn getCurrentDesktop(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t, atoms: Atoms) ?u32 {
+    const cookie = xcb.xcb_get_property(conn, 0, root, atoms.net_current_desktop, xcb.XCB_ATOM_CARDINAL, 0, 1);
+    const reply = xcb.xcb_get_property_reply(conn, cookie, null);
+    if (reply == null) {
+        return null;
+    }
+    defer std.c.free(reply);
+
+    const len = xcb.xcb_get_property_value_length(reply);
+    if (len < @sizeOf(u32)) {
+        return null;
+    }
+
+    const data: *const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
+    return data.*;
+}
+
+/// Get the desktop number a window is on (0xFFFFFFFF means "all desktops")
+pub fn getWindowDesktop(conn: *xcb.xcb_connection_t, window: xcb.xcb_window_t, atoms: Atoms) ?u32 {
+    const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_desktop, xcb.XCB_ATOM_CARDINAL, 0, 1);
+    const reply = xcb.xcb_get_property_reply(conn, cookie, null);
+    if (reply == null) {
+        return null;
+    }
+    defer std.c.free(reply);
+
+    const len = xcb.xcb_get_property_value_length(reply);
+    if (len < @sizeOf(u32)) {
+        return null;
+    }
+
+    const data: *const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
+    return data.*;
+}
+
+/// Check if a window is on the current desktop (or on all desktops)
+pub fn isWindowOnCurrentDesktop(
+    conn: *xcb.xcb_connection_t,
+    window: xcb.xcb_window_t,
+    root: xcb.xcb_window_t,
+    atoms: Atoms,
+) bool {
+    if (!FILTER_BY_CURRENT_DESKTOP) {
+        return true;
+    }
+
+    const current_desktop = getCurrentDesktop(conn, root, atoms) orelse return true;
+    const window_desktop = getWindowDesktop(conn, window, atoms) orelse return true;
+
+    // 0xFFFFFFFF means window is on all desktops (sticky)
+    if (window_desktop == 0xFFFFFFFF) {
+        return true;
+    }
+
+    return window_desktop == current_desktop;
 }
 
 pub fn getMousePosition(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) MousePosition {

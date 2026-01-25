@@ -47,6 +47,11 @@ pub fn main() !void {
             continue;
         }
 
+        // Filter by current desktop if enabled
+        if (!x11.isWindowOnCurrentDesktop(conn.conn, window_id, conn.root, conn.atoms)) {
+            continue;
+        }
+
         const title = x11.getWindowTitle(allocator, conn.conn, window_id, conn.atoms);
 
         var raw_capture = x11.captureRawImage(allocator, conn.conn, window_id, title) catch |err| {
@@ -388,6 +393,7 @@ pub fn main() !void {
     // Stop background worker
     update_queue.requestStop();
     worker_thread.join();
+    update_queue.deinit(); // Clean up any unconsumed results
 
     // Unload resources
     for (items.items) |*item| {

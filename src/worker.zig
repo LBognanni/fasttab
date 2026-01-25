@@ -94,6 +94,16 @@ pub const UpdateQueue = struct {
         defer self.mutex.unlock();
         return self.our_window_id;
     }
+
+    /// Clean up any pending result that was never consumed
+    pub fn deinit(self: *UpdateQueue) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.pending_result) |*result| {
+            result.deinit();
+            self.pending_result = null;
+        }
+    }
 };
 
 pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void {
@@ -129,7 +139,19 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
             if (window_id == our_window_id) continue;
             if (!x11.shouldShowWindow(conn.conn, window_id, conn.atoms)) continue;
 
+            // Filter by current desktop if enabled
+            if (!x11.isWindowOnCurrentDesktop(conn.conn, window_id, conn.root, conn.atoms)) {
+                continue;
+            }
+
+            // Always include in current window list (so it doesn't get removed)
             result.current_window_ids.append(window_id) catch continue;
+
+            // Skip capturing minimized windows - they don't change visually
+            if (x11.isWindowMinimized(conn.conn, window_id, conn.atoms)) {
+                log.debug("Background worker: Skipping minimized window {d}", .{window_id});
+                continue;
+            }
 
             const title = x11.getWindowTitle(allocator, conn.conn, window_id, conn.atoms);
 
