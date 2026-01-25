@@ -134,33 +134,67 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
         var result = RefreshResult.init(allocator);
         errdefer result.deinit();
 
-        // Capture all windows
+        // Build list of windows that should be included (before capture)
+        var windows_to_process = std.ArrayList(x11.xcb.xcb_window_t).init(allocator);
+        defer windows_to_process.deinit();
+
+        var total_windows: usize = 0;
+        var filtered_by_type: usize = 0;
+        var filtered_by_desktop: usize = 0;
         for (windows) |window_id| {
+            total_windows += 1;
             if (window_id == our_window_id) continue;
-            if (!x11.shouldShowWindow(conn.conn, window_id, conn.atoms)) continue;
+
+            if (!x11.shouldShowWindow(conn.conn, window_id, conn.atoms)) {
+                filtered_by_type += 1;
+                continue;
+            }
 
             // Filter by current desktop if enabled
             if (!x11.isWindowOnCurrentDesktop(conn.conn, window_id, conn.root, conn.atoms)) {
+                filtered_by_desktop += 1;
                 continue;
             }
 
-            // Always include in current window list (so it doesn't get removed)
-            result.current_window_ids.append(window_id) catch continue;
+            // Add to processing list
+            windows_to_process.append(window_id) catch continue;
 
-            // Skip capturing minimized windows - they don't change visually
-            if (x11.isWindowMinimized(conn.conn, window_id, conn.atoms)) {
-                log.debug("Background worker: Skipping minimized window {d}", .{window_id});
-                continue;
-            }
+        }
 
+        // Now process each window and capture thumbnails
+        for (windows_to_process.items) |window_id| {
+            // First, verify the window actually exists by trying to get its title
             const title = x11.getWindowTitle(allocator, conn.conn, window_id, conn.atoms);
 
+            // Try to capture the window
             const raw_capture = x11.captureRawImage(allocator, conn.conn, window_id, title) catch |err| {
+                // If it's a geometry fetch error, this window likely doesn't exist anymore
+                // Don't add it to current_window_ids
+                if (err == x11.X11Error.GeometryFetchFailed) {
+                    log.debug("Background worker: Window {d} no longer exists, skipping", .{window_id});
+                    if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+                    continue;
+                }
+
+                // For other errors (e.g., minimized windows), still keep in current list
                 log.debug("Background worker: Failed to capture window {d}: {}", .{ window_id, err });
                 if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+
+                // Add to current_window_ids so it doesn't get removed
+                result.current_window_ids.append(window_id) catch {};
                 continue;
             };
             defer allocator.free(raw_capture.data);
+
+            // Window captured successfully, add to current list
+            result.current_window_ids.append(window_id) catch continue;
+
+            // Skip processing minimized windows - they don't change visually
+            if (x11.isWindowMinimized(conn.conn, window_id, conn.atoms)) {
+                log.debug("Background worker: Skipping minimized window {d}", .{window_id});
+                if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+                continue;
+            }
 
             const thumb = thumbnail.processRawCapture(&raw_capture, allocator) catch |err| {
                 log.debug("Background worker: Failed to process window {d}: {}", .{ window_id, err });
@@ -183,7 +217,13 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
         }
 
         queue.push(result);
-        log.debug("Background worker: Pushed update with {d} thumbnails", .{result.updates.items.len});
+        log.debug("Background worker: Scanned {d} windows, filtered {d} by type, {d} by desktop, included {d} in current list, captured {d} thumbnails", .{
+            total_windows,
+            filtered_by_type,
+            filtered_by_desktop,
+            result.current_window_ids.items.len,
+            result.updates.items.len,
+        });
     }
 
     log.info("Background worker stopped", .{});

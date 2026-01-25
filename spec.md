@@ -359,6 +359,21 @@ Window ID: 23456789
 
 ---
 
+### Milestone 4.5: Daemon Mode
+**Goal:** Refactor program to run as a background daemon.
+
+**Deliverable:** The program will now run as a long-lived background process:
+- without showing the raylib window until commanded
+- existing functionality (window tracking, thumbnail caching) works as before
+- closing the window does not terminate the program
+
+**Technical notes:**
+- For now, just add a command line argument `--daemon` that starts the program without showing the window.
+- The window should be created after 2 seconds of running in daemon mode, to simulate delayed initialization.
+- Ensure that all existing functionality (window tracking, thumbnail caching) works in daemon mode.
+
+---
+
 ### Milestone 5: Socket Server
 
 **Goal:** Accept commands over Unix socket.

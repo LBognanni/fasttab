@@ -14,6 +14,22 @@ pub fn main() !void {
 
     const stdout = std.io.getStdOut().writer();
 
+    // Parse command-line arguments
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
+    _ = args.next(); // skip program name
+
+    var daemon_mode = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--daemon") or std.mem.eql(u8, arg, "daemon")) {
+            daemon_mode = true;
+        }
+    }
+
+    if (daemon_mode) {
+        try stdout.print("Starting in daemon mode...\n", .{});
+    }
+
     // Connect to X11
     var conn = try x11.Connection.init();
     defer conn.deinit();
@@ -157,6 +173,22 @@ pub fn main() !void {
     // Get mouse position BEFORE initializing raylib
     const mouse_pos = x11.getMousePosition(conn.conn, conn.root);
 
+    // Create update queue and start background worker BEFORE raylib initialization
+    var update_queue = worker.UpdateQueue{};
+    // We'll set our window ID after creating the window
+
+    const worker_thread = std.Thread.spawn(.{}, worker.backgroundWorker, .{ &update_queue, allocator }) catch |err| {
+        log.err("Failed to spawn background worker: {}", .{err});
+        return err;
+    };
+
+    // In daemon mode, wait 2 seconds to demonstrate background thumbnailing
+    if (daemon_mode) {
+        try stdout.print("Daemon mode: background worker running, waiting 2 seconds before showing window...\n", .{});
+        std.time.sleep(2 * std.time.ns_per_s);
+        try stdout.print("Initializing window...\n", .{});
+    }
+
     // Save window list before creating raylib window
     const windows_before_raylib = try x11.getWindowList(conn.conn, conn.root, conn.atoms);
     var pre_raylib_windows = std.AutoHashMap(x11.xcb.xcb_window_t, void).init(allocator);
@@ -184,17 +216,11 @@ pub fn main() !void {
         }
     }
 
-    // Create update queue and start background worker
-    var update_queue = worker.UpdateQueue{};
+    // Now set our window ID in the update queue
     update_queue.setOurWindowId(our_window_id);
 
-    const worker_thread = std.Thread.spawn(.{}, worker.backgroundWorker, .{ &update_queue, allocator }) catch |err| {
-        log.err("Failed to spawn background worker: {}", .{err});
-        return err;
-    };
-
     // Load system font
-    const font = ui.loadSystemFont(ui.TITLE_FONT_SIZE * 2);
+    var font = ui.loadSystemFont(ui.TITLE_FONT_SIZE * 2);
 
     // Load textures from thumbnails
     for (items.items) |*item| {
@@ -236,16 +262,97 @@ pub fn main() !void {
     rl.SetWindowPosition(win_x, win_y);
 
     try stdout.print("Mouse at ({d}, {d}), using monitor {d}\n", .{ mouse_pos.x, mouse_pos.y, target_monitor });
-    try stdout.print("Displaying {d} windows in switcher. Press ESC or close window to exit.\n", .{items.items.len});
+    if (daemon_mode) {
+        try stdout.print("Displaying {d} windows in switcher (daemon mode - closing window will keep process running).\n", .{items.items.len});
+    } else {
+        try stdout.print("Displaying {d} windows in switcher. Press ESC or close window to exit.\n", .{items.items.len});
+    }
 
     var selected_index: usize = 0;
     var current_layout = layout;
+    var window_hidden = false;
+    var window_close_time: ?i64 = null;
 
     // Main render loop
-    while (!rl.WindowShouldClose()) {
+    // In daemon mode, continue running even if window is closed
+    while (true) {
+        // Check if window should close (only call raylib functions when window is open)
+        if (!window_hidden and (rl.WindowShouldClose() or (items.items.len > 0 and rl.IsKeyPressed(rl.KEY_ESCAPE)))) {
+            if (daemon_mode) {
+                // In daemon mode, close the window but keep running
+                try stdout.print("Window closed but daemon continues running. Will reopen in 4 seconds...\n", .{});
+
+                // Unload all textures before closing window
+                for (items.items) |*item| {
+                    rl.UnloadTexture(item.texture);
+                    item.texture = rl.Texture2D{}; // Set to empty/invalid texture
+                }
+                rl.UnloadFont(font);
+
+                rl.CloseWindow();
+                window_hidden = true;
+                window_close_time = std.time.milliTimestamp();
+            } else {
+                // In normal mode, exit the loop
+                break;
+            }
+        }
+
+        // In daemon mode, reopen window after 4 seconds
+        if (daemon_mode and window_hidden) {
+            if (window_close_time) |close_time| {
+                const elapsed = std.time.milliTimestamp() - close_time;
+                if (elapsed >= 4000) {
+                    try stdout.print("Reopening window...\n", .{});
+
+                    // Recalculate layout in case windows changed
+                    current_layout = ui.calculateGridLayout(items.items, ui.THUMBNAIL_HEIGHT);
+
+                    // Reinitialize raylib window
+                    rl.SetConfigFlags(rl.FLAG_WINDOW_UNDECORATED | rl.FLAG_WINDOW_TRANSPARENT | rl.FLAG_WINDOW_TOPMOST);
+                    rl.SetTraceLogLevel(rl.LOG_WARNING);
+                    rl.InitWindow(@intCast(current_layout.total_width), @intCast(current_layout.total_height), "FastTab");
+                    rl.SetTargetFPS(60);
+
+                    // Reload font
+                    font = ui.loadSystemFont(ui.TITLE_FONT_SIZE * 2);
+
+                    // Reload textures for all items (they were unloaded when window closed)
+                    try stdout.print("Reopening window with {d} items\n", .{items.items.len});
+                    log.debug("Reloading textures for {d} windows", .{items.items.len});
+                    for (items.items) |*item| {
+                        // Only load texture if we have valid thumbnail data
+                        // (minimized windows might not have been captured)
+                        if (item.thumbnail.data.len > 0) {
+                            item.texture = ui.loadTextureFromThumbnail(&item.thumbnail);
+                            log.debug("  Loaded texture for window {d}: {s} (data len: {d})", .{ item.id, item.title, item.thumbnail.data.len });
+                        } else {
+                            item.texture = rl.Texture2D{};
+                            log.debug("  Skipped texture for window {d}: {s} (NO thumbnail data)", .{ item.id, item.title });
+                        }
+                    }
+
+                    // Center window on monitor
+                    const new_win_x = mon_x + @divTrunc(mon_width - @as(i32, @intCast(current_layout.total_width)), 2);
+                    const new_win_y = mon_y + @divTrunc(mon_height - @as(i32, @intCast(current_layout.total_height)), 2);
+                    rl.SetWindowPosition(new_win_x, new_win_y);
+
+                    window_hidden = false;
+                    window_close_time = null;
+                    try stdout.print("Window reopened with {d} windows.\n", .{items.items.len});
+                }
+            }
+        }
         // Poll update queue from background worker
         if (update_queue.pop()) |*update_result| {
             defer @constCast(update_result).deinit();
+
+            if (window_hidden) {
+                log.debug("Processing update while hidden: {d} current windows, {d} updates", .{
+                    update_result.current_window_ids.items.len,
+                    update_result.updates.items.len,
+                });
+            }
 
             var current_window_set = std.AutoHashMap(x11.xcb.xcb_window_t, void).init(allocator);
             defer current_window_set.deinit();
@@ -265,6 +372,9 @@ pub fn main() !void {
             for (items.items, 0..) |item, idx| {
                 if (!current_window_set.contains(item.id)) {
                     to_remove.append(idx) catch {};
+                    if (window_hidden) {
+                        log.debug("Will remove window {d}: {s} (not in current set)", .{ item.id, item.title });
+                    }
                 }
             }
 
@@ -274,7 +384,7 @@ pub fn main() !void {
                 remove_idx -= 1;
                 const idx = to_remove.items[remove_idx];
                 const item = &items.items[idx];
-                rl.UnloadTexture(item.texture);
+                if (!window_hidden) rl.UnloadTexture(item.texture);
                 item.thumbnail.deinit();
                 if (!std.mem.eql(u8, item.title, "(unknown)")) {
                     allocator.free(item.title);
@@ -283,7 +393,7 @@ pub fn main() !void {
                 log.debug("Removed window at index {d}", .{idx});
             }
 
-            // Update existing windows and add new ones
+            // Process updates for existing and new windows
             for (update_result.updates.items) |*update| {
                 var found_idx: ?usize = null;
                 for (items.items, 0..) |item, idx| {
@@ -302,13 +412,18 @@ pub fn main() !void {
                         .height = update.thumbnail_height,
                         .allocator = update.allocator,
                     };
-                    const new_texture = ui.loadTextureFromThumbnail(&new_thumb);
 
-                    rl.UnloadTexture(item.texture);
+                    // Update thumbnail data
                     item.thumbnail.deinit();
-
                     item.thumbnail = new_thumb;
-                    item.texture = new_texture;
+
+                    // Only update texture if window is visible
+                    if (!window_hidden) {
+                        const new_texture = ui.loadTextureFromThumbnail(&new_thumb);
+                        rl.UnloadTexture(item.texture);
+                        item.texture = new_texture;
+                    }
+                    // If window is hidden, texture remains empty and will be created when window reopens
 
                     update.thumbnail_data = &[_]u8{};
                 } else {
@@ -318,24 +433,35 @@ pub fn main() !void {
                         .height = update.thumbnail_height,
                         .allocator = update.allocator,
                     };
-                    const texture = ui.loadTextureFromThumbnail(&new_thumb);
 
-                    items.append(ui.WindowItem{
+                    // Only create texture if window is visible
+                    const texture = if (!window_hidden)
+                        ui.loadTextureFromThumbnail(&new_thumb)
+                    else
+                        rl.Texture2D{};
+
+                    const new_item = ui.WindowItem{
                         .id = update.window_id,
                         .title = update.title,
                         .thumbnail = new_thumb,
                         .texture = texture,
                         .display_width = 0,
                         .display_height = 0,
-                    }) catch {
-                        rl.UnloadTexture(texture);
+                    };
+
+                    items.append(new_item) catch {
+                        if (!window_hidden) rl.UnloadTexture(texture);
                         continue;
                     };
 
+                    if (window_hidden) {
+                        log.debug("Added new window {d}: {s} (window hidden, no texture)", .{ new_item.id, new_item.title });
+                    } else {
+                        log.debug("Added new window {d}: {s}", .{ new_item.id, new_item.title });
+                    }
+
                     update.thumbnail_data = &[_]u8{};
                     update.title = "(unknown)";
-
-                    log.debug("Added new window {d}", .{update.window_id});
                 }
             }
 
@@ -351,7 +477,8 @@ pub fn main() !void {
             const prev_height = current_layout.total_height;
             current_layout = ui.calculateGridLayout(items.items, ui.THUMBNAIL_HEIGHT);
 
-            if (current_layout.total_width != prev_width or current_layout.total_height != prev_height) {
+            // Only update window size/position if window is visible
+            if (!window_hidden and (current_layout.total_width != prev_width or current_layout.total_height != prev_height)) {
                 rl.SetWindowSize(@intCast(current_layout.total_width), @intCast(current_layout.total_height));
                 const new_win_x = mon_x + @divTrunc(mon_width - @as(i32, @intCast(current_layout.total_width)), 2);
                 const new_win_y = mon_y + @divTrunc(mon_height - @as(i32, @intCast(current_layout.total_height)), 2);
@@ -360,8 +487,8 @@ pub fn main() !void {
             }
         }
 
-        // Handle keyboard input
-        if (items.items.len > 0) {
+        // Handle keyboard input (only when window is visible)
+        if (!window_hidden and items.items.len > 0) {
             if (rl.IsKeyPressed(rl.KEY_RIGHT) or rl.IsKeyPressed(rl.KEY_TAB)) {
                 selected_index = (selected_index + 1) % items.items.len;
             }
@@ -384,10 +511,16 @@ pub fn main() !void {
             }
         }
 
-        rl.BeginDrawing();
-        rl.ClearBackground(rl.Color{ .r = 0, .g = 0, .b = 0, .a = 0 });
-        ui.renderSwitcher(items.items, selected_index, font);
-        rl.EndDrawing();
+        // Only render if window is visible
+        if (!window_hidden) {
+            rl.BeginDrawing();
+            rl.ClearBackground(rl.Color{ .r = 0, .g = 0, .b = 0, .a = 0 });
+            ui.renderSwitcher(items.items, selected_index, font);
+            rl.EndDrawing();
+        } else {
+            // In daemon mode with hidden window, sleep briefly to avoid busy loop
+            std.time.sleep(16 * std.time.ns_per_ms); // ~60 FPS equivalent
+        }
     }
 
     // Stop background worker
@@ -395,12 +528,13 @@ pub fn main() !void {
     worker_thread.join();
     update_queue.deinit(); // Clean up any unconsumed results
 
-    // Unload resources
-    for (items.items) |*item| {
-        rl.UnloadTexture(item.texture);
+    // Unload resources (only if window is still open)
+    if (!window_hidden) {
+        for (items.items) |*item| {
+            rl.UnloadTexture(item.texture);
+        }
+        rl.UnloadFont(font);
+        rl.CloseWindow();
     }
-    rl.UnloadFont(font);
-
-    rl.CloseWindow();
     try stdout.print("Switcher closed.\n", .{});
 }
