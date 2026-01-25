@@ -53,22 +53,25 @@ zig fmt --check .
 ```
 fasttab/
 ├── src/
-│   ├── main.zig              # Entry point (daemon vs CLI mode selection)
-│   ├── daemon.zig            # Daemon initialization and event loop
-│   ├── cli.zig               # Command-line interface (show/hide/index)
-│   ├── window_tracker.zig    # X11 window list tracking
-│   ├── thumbnail_cache.zig   # XComposite thumbnail capture
-│   ├── socket_server.zig     # Unix socket IPC
-│   ├── renderer.zig          # raylib UI rendering
-│   └── protocol.zig          # Command protocol parser
-├── qml/
+│   ├── main.zig              # Main implementation (currently monolithic)
+│   └── stb_impl.c            # STB image library implementation
+├── include/
+│   └── stb_image_write.h     # STB header for PNG writing
+├── lib/                      # Downloaded dependencies (gitignored)
+│   └── raylib-5.5_linux_amd64/
+├── qml/                      # (Future) KDE plugin
 │   └── fasttab/
-│       ├── metadata.json     # KDE plugin metadata
+│       ├── metadata.json
 │       └── contents/ui/
-│           └── main.qml      # KWin TabBox integration
+│           └── main.qml
 ├── build.zig                 # Zig build script
+├── setup.sh                  # Developer setup script (downloads raylib)
 └── spec.md                   # Full project specification
 ```
+
+## Setup
+
+Run `./setup.sh` to download raylib before building. The `lib/` directory is gitignored.
 
 ## Code Style
 
@@ -204,6 +207,19 @@ KWin.TabBoxSwitcher {
 - EWMH/NetWM (for `_NET_CLIENT_LIST`, `_NET_WM_NAME`)
 - XDamage (future enhancement for change notifications)
 
+**Window Filtering:**
+- Filter windows by `_NET_WM_WINDOW_TYPE` property to exclude non-application windows
+- Skip `_NET_WM_WINDOW_TYPE_DESKTOP` (desktop background windows)
+- Skip `_NET_WM_WINDOW_TYPE_DOCK` (panels, docks like plasmashell)
+- Include `_NET_WM_WINDOW_TYPE_NORMAL`, `_NET_WM_WINDOW_TYPE_DIALOG`, `_NET_WM_WINDOW_TYPE_UTILITY`
+- Windows with no type set should be treated as normal windows
+
+**Mouse Position for Multi-Monitor:**
+- Use `xcb_query_pointer` to get global mouse coordinates BEFORE initializing raylib
+- Query mouse position against root window to get absolute screen coordinates
+- Iterate through raylib monitors to find which one contains the cursor
+- Center the switcher window on that monitor
+
 **Event Handling:**
 - Poll both XCB and socket file descriptors in event loop
 - Handle `PropertyNotify` on root for window list changes
@@ -214,17 +230,19 @@ KWin.TabBoxSwitcher {
 
 **Window Configuration:**
 ```zig
-raylib.SetConfigFlags(raylib.FLAG_WINDOW_UNDECORATED | 
-                      raylib.FLAG_WINDOW_TRANSPARENT | 
+raylib.SetConfigFlags(raylib.FLAG_WINDOW_UNDECORATED |
+                      raylib.FLAG_WINDOW_TRANSPARENT |
                       raylib.FLAG_WINDOW_TOPMOST);
 raylib.InitWindow(width, height, "FastTab");
 raylib.SetTargetFPS(60);
 ```
 
+
 **Rendering Strategy:**
 - Pre-create textures from cached thumbnails
 - Render grid in single pass
 - Use `DrawRectangleRounded` for containers/background
+- Use `DrawTexturePro` for scaled thumbnail rendering
 - Center window on monitor containing mouse cursor
 
 ## Development Workflow
@@ -368,8 +386,7 @@ pub fn run(self: *Daemon) !void {
 - Follow milestone order - don't skip ahead
 - Performance is critical: Profile before optimizing, but keep CLI path minimal
 - X11 and raylib are C libraries - use `@cImport` and respect C semantics
-- Test on real X11 server, not headless - this is a GUI tool
+- You are running in a container, this means that the user will have to test GUI features on their own machine
 - When in doubt about Zig syntax, use `zig build` early and often - compiler errors are helpful
 - QML integration is last - daemon should work standalone first
-
-note: raylib can be downloaded from https://github.com/raysan5/raylib/releases/download/5.5/raylib-5.5_linux_amd64.tar.gz
+- Run `./setup.sh` before first build to download raylib
