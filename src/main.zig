@@ -1085,6 +1085,11 @@ pub fn main() !void {
     // Initialize Composite extension
     try initComposite(conn.?, root);
 
+    // Register for PropertyNotify events on root window to detect window list changes
+    const event_mask = [_]u32{xcb.XCB_EVENT_MASK_PROPERTY_CHANGE};
+    _ = xcb.xcb_change_window_attributes(conn.?, root, xcb.XCB_CW_EVENT_MASK, &event_mask);
+    _ = xcb.xcb_flush(conn.?);
+
     // Get window list
     const windows = try getWindowList(conn.?, root, atoms);
 
@@ -1224,12 +1229,33 @@ pub fn main() !void {
     // Get mouse position BEFORE initializing raylib (to find correct monitor)
     const mouse_pos = getMousePosition(conn.?, root);
 
+    // Save window list before creating raylib window (to detect our own window)
+    const windows_before_raylib = try getWindowList(conn.?, root, atoms);
+    var pre_raylib_windows = std.AutoHashMap(xcb.xcb_window_t, void).init(allocator);
+    defer pre_raylib_windows.deinit();
+    for (windows_before_raylib) |wid| {
+        try pre_raylib_windows.put(wid, {});
+    }
+
     // Initialize raylib
     rl.SetConfigFlags(rl.FLAG_WINDOW_UNDECORATED | rl.FLAG_WINDOW_TRANSPARENT | rl.FLAG_WINDOW_TOPMOST);
     rl.SetTraceLogLevel(rl.LOG_WARNING); // Reduce log noise
     rl.InitWindow(@intCast(layout.total_width), @intCast(layout.total_height), "FastTab");
 
     rl.SetTargetFPS(60);
+
+    // Find our own window ID (the new window that appeared after InitWindow)
+    _ = xcb.xcb_flush(conn.?);
+    std.time.sleep(50 * std.time.ns_per_ms); // Brief delay for window to appear in X11
+    const windows_after_raylib = getWindowList(conn.?, root, atoms) catch &[_]xcb.xcb_window_t{};
+    var our_window_id: xcb.xcb_window_t = 0;
+    for (windows_after_raylib) |wid| {
+        if (!pre_raylib_windows.contains(wid)) {
+            our_window_id = wid;
+            log.info("Detected our window ID: {d}", .{our_window_id});
+            break;
+        }
+    }
 
     // Load system font for better text rendering
     const font = loadSystemFont(TITLE_FONT_SIZE * 2); // Load at 2x for better quality
@@ -1279,27 +1305,201 @@ pub fn main() !void {
 
     var selected_index: usize = 0;
 
+    // State tracking for live updates
+    var last_refresh_time = std.time.milliTimestamp();
+    var needs_window_refresh = false;
+    const REFRESH_INTERVAL_MS: i64 = 1000;
+
+    // Keep track of current layout for window resizing
+    var current_layout = layout;
+
     // Main render loop
     while (!rl.WindowShouldClose()) {
-        // Handle keyboard input for selection
-        if (rl.IsKeyPressed(rl.KEY_RIGHT) or rl.IsKeyPressed(rl.KEY_TAB)) {
-            selected_index = (selected_index + 1) % items.items.len;
-        }
-        if (rl.IsKeyPressed(rl.KEY_LEFT)) {
-            if (selected_index == 0) {
-                selected_index = items.items.len - 1;
-            } else {
-                selected_index -= 1;
+        // === Poll XCB for window list changes ===
+        while (xcb.xcb_poll_for_event(conn.?)) |event| {
+            defer std.c.free(event);
+            const event_type = event.*.response_type & 0x7F;
+            if (event_type == xcb.XCB_PROPERTY_NOTIFY) {
+                const prop: *xcb.xcb_property_notify_event_t = @ptrCast(event);
+                if (prop.atom == atoms.net_client_list) {
+                    needs_window_refresh = true;
+                    log.debug("Window list changed, refresh scheduled", .{});
+                }
             }
         }
-        if (rl.IsKeyPressed(rl.KEY_DOWN)) {
-            const cols = layout.columns;
-            selected_index = @min(selected_index + cols, items.items.len - 1);
+
+        // === Check periodic refresh timer ===
+        const now = std.time.milliTimestamp();
+        if (now - last_refresh_time >= REFRESH_INTERVAL_MS) {
+            needs_window_refresh = true;
+            last_refresh_time = now;
         }
-        if (rl.IsKeyPressed(rl.KEY_UP)) {
-            const cols = layout.columns;
-            if (selected_index >= cols) {
-                selected_index -= cols;
+
+        // === Handle window refresh ===
+        if (needs_window_refresh) {
+            needs_window_refresh = false;
+
+            // Get current window list from X11
+            const new_windows = getWindowList(conn.?, root, atoms) catch |err| {
+                log.warn("Failed to get window list: {}", .{err});
+                continue;
+            };
+
+            // Build set of new window IDs for quick lookup (excluding our own window)
+            var new_window_set = std.AutoHashMap(xcb.xcb_window_t, void).init(allocator);
+            defer new_window_set.deinit();
+            for (new_windows) |wid| {
+                if (wid != our_window_id and shouldShowWindow(conn.?, wid, atoms)) {
+                    new_window_set.put(wid, {}) catch {};
+                }
+            }
+
+            // Build set of existing window IDs
+            var existing_ids = std.AutoHashMap(xcb.xcb_window_t, usize).init(allocator);
+            defer existing_ids.deinit();
+            for (items.items, 0..) |item, idx| {
+                existing_ids.put(item.id, idx) catch {};
+            }
+
+            // Find windows to remove (exist in items but not in new list)
+            var to_remove = std.ArrayList(usize).init(allocator);
+            defer to_remove.deinit();
+            for (items.items, 0..) |item, idx| {
+                if (!new_window_set.contains(item.id)) {
+                    to_remove.append(idx) catch {};
+                }
+            }
+
+            // Find windows to add (exist in new list but not in items, excluding our own)
+            var to_add = std.ArrayList(xcb.xcb_window_t).init(allocator);
+            defer to_add.deinit();
+            for (new_windows) |wid| {
+                if (wid != our_window_id and shouldShowWindow(conn.?, wid, atoms) and !existing_ids.contains(wid)) {
+                    to_add.append(wid) catch {};
+                }
+            }
+
+            // Remove closed windows (iterate in reverse to preserve indices)
+            var remove_idx: usize = to_remove.items.len;
+            while (remove_idx > 0) {
+                remove_idx -= 1;
+                const idx = to_remove.items[remove_idx];
+                const item = &items.items[idx];
+                rl.UnloadTexture(item.texture);
+                item.thumbnail.deinit();
+                if (!std.mem.eql(u8, item.title, "(unknown)")) {
+                    allocator.free(item.title);
+                }
+                _ = items.orderedRemove(idx);
+                log.debug("Removed window at index {d}", .{idx});
+            }
+
+            // Add new windows
+            for (to_add.items) |wid| {
+                const title = getWindowTitle(allocator, conn.?, wid, atoms);
+
+                const raw_capture = captureRawImage(allocator, conn.?, wid, title) catch |err| {
+                    log.warn("Failed to capture new window {d}: {}", .{ wid, err });
+                    if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+                    continue;
+                };
+                defer {
+                    allocator.free(raw_capture.data);
+                }
+
+                const thumb = processRawCapture(&raw_capture, allocator) catch |err| {
+                    log.warn("Failed to process new window {d}: {}", .{ wid, err });
+                    if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+                    continue;
+                };
+
+                const texture = loadTextureFromThumbnail(&thumb);
+
+                items.append(WindowItem{
+                    .id = wid,
+                    .title = title,
+                    .thumbnail = thumb,
+                    .texture = texture,
+                    .display_width = 0,
+                    .display_height = 0,
+                }) catch {
+                    rl.UnloadTexture(texture);
+                    thumb.allocator.free(thumb.data);
+                    if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+                    continue;
+                };
+                log.debug("Added new window {d}: {s}", .{ wid, title });
+            }
+
+            // Update thumbnails for existing windows (periodic refresh)
+            if (to_remove.items.len == 0 and to_add.items.len == 0) {
+                // No structural changes, just refresh thumbnails
+                for (items.items) |*item| {
+                    // Re-capture the window thumbnail
+                    const raw_capture = captureRawImage(allocator, conn.?, item.id, item.title) catch continue;
+                    defer allocator.free(raw_capture.data);
+
+                    const new_thumb = processRawCapture(&raw_capture, allocator) catch continue;
+
+                    // Create new texture before unloading old one
+                    const new_texture = loadTextureFromThumbnail(&new_thumb);
+                    const old_texture = item.texture;
+                    const old_thumb = item.thumbnail;
+
+                    // Swap in new data
+                    item.texture = new_texture;
+                    item.thumbnail = new_thumb;
+
+                    // Now safe to unload old
+                    rl.UnloadTexture(old_texture);
+                    old_thumb.allocator.free(old_thumb.data);
+                }
+            }
+
+            // Adjust selected index if needed
+            if (items.items.len == 0) {
+                selected_index = 0;
+            } else if (selected_index >= items.items.len) {
+                selected_index = items.items.len - 1;
+            }
+
+            // Recalculate layout
+            const prev_width = current_layout.total_width;
+            const prev_height = current_layout.total_height;
+            current_layout = calculateGridLayout(items.items, THUMBNAIL_HEIGHT);
+
+            // Resize window if layout changed
+            if (current_layout.total_width != prev_width or current_layout.total_height != prev_height) {
+                rl.SetWindowSize(@intCast(current_layout.total_width), @intCast(current_layout.total_height));
+                // Re-center on monitor
+                const new_win_x = mon_x + @divTrunc(mon_width - @as(i32, @intCast(current_layout.total_width)), 2);
+                const new_win_y = mon_y + @divTrunc(mon_height - @as(i32, @intCast(current_layout.total_height)), 2);
+                rl.SetWindowPosition(new_win_x, new_win_y);
+                log.debug("Window resized to {d}x{d}", .{ current_layout.total_width, current_layout.total_height });
+            }
+
+        }
+        // Handle keyboard input for selection (only if we have items)
+        if (items.items.len > 0) {
+            if (rl.IsKeyPressed(rl.KEY_RIGHT) or rl.IsKeyPressed(rl.KEY_TAB)) {
+                selected_index = (selected_index + 1) % items.items.len;
+            }
+            if (rl.IsKeyPressed(rl.KEY_LEFT)) {
+                if (selected_index == 0) {
+                    selected_index = items.items.len - 1;
+                } else {
+                    selected_index -= 1;
+                }
+            }
+            if (rl.IsKeyPressed(rl.KEY_DOWN)) {
+                const cols = current_layout.columns;
+                selected_index = @min(selected_index + cols, items.items.len - 1);
+            }
+            if (rl.IsKeyPressed(rl.KEY_UP)) {
+                const cols = current_layout.columns;
+                if (selected_index >= cols) {
+                    selected_index -= cols;
+                }
             }
         }
 
