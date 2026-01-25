@@ -7,6 +7,9 @@ const xcb = @cImport({
 const stb = @cImport({
     @cInclude("stb_image_write.h");
 });
+const rl = @cImport({
+    @cInclude("raylib.h");
+});
 
 const log = std.log.scoped(.fasttab);
 
@@ -29,6 +32,12 @@ const Atoms = struct {
     wm_name: xcb.xcb_atom_t,
     wm_class: xcb.xcb_atom_t,
     utf8_string: xcb.xcb_atom_t,
+    net_wm_window_type: xcb.xcb_atom_t,
+    net_wm_window_type_normal: xcb.xcb_atom_t,
+    net_wm_window_type_desktop: xcb.xcb_atom_t,
+    net_wm_window_type_dock: xcb.xcb_atom_t,
+    net_wm_window_type_dialog: xcb.xcb_atom_t,
+    net_wm_window_type_utility: xcb.xcb_atom_t,
 };
 
 const WindowInfo = struct {
@@ -54,6 +63,12 @@ fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
         .wm_name = try internAtom(conn, "WM_NAME"),
         .wm_class = try internAtom(conn, "WM_CLASS"),
         .utf8_string = try internAtom(conn, "UTF8_STRING"),
+        .net_wm_window_type = try internAtom(conn, "_NET_WM_WINDOW_TYPE"),
+        .net_wm_window_type_normal = try internAtom(conn, "_NET_WM_WINDOW_TYPE_NORMAL"),
+        .net_wm_window_type_desktop = try internAtom(conn, "_NET_WM_WINDOW_TYPE_DESKTOP"),
+        .net_wm_window_type_dock = try internAtom(conn, "_NET_WM_WINDOW_TYPE_DOCK"),
+        .net_wm_window_type_dialog = try internAtom(conn, "_NET_WM_WINDOW_TYPE_DIALOG"),
+        .net_wm_window_type_utility = try internAtom(conn, "_NET_WM_WINDOW_TYPE_UTILITY"),
     };
 }
 
@@ -184,6 +199,49 @@ fn getWindowClass(
     return "(unknown)";
 }
 
+fn shouldShowWindow(
+    conn: *xcb.xcb_connection_t,
+    window: xcb.xcb_window_t,
+    atoms: Atoms,
+) bool {
+    // Get _NET_WM_WINDOW_TYPE property
+    const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_window_type, xcb.XCB_ATOM_ATOM, 0, 32);
+    const reply = xcb.xcb_get_property_reply(conn, cookie, null);
+    if (reply == null) {
+        // No window type set - treat as normal window
+        return true;
+    }
+    defer std.c.free(reply);
+
+    const len = xcb.xcb_get_property_value_length(reply);
+    if (len == 0) {
+        // No window type set - treat as normal window
+        return true;
+    }
+
+    const data: [*]const xcb.xcb_atom_t = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
+    const count = @as(usize, @intCast(len)) / @sizeOf(xcb.xcb_atom_t);
+
+    // Check each type - skip desktop, dock windows
+    for (data[0..count]) |window_type| {
+        if (window_type == atoms.net_wm_window_type_desktop) {
+            return false; // Desktop background
+        }
+        if (window_type == atoms.net_wm_window_type_dock) {
+            return false; // Panels, docks (plasmashell)
+        }
+        if (window_type == atoms.net_wm_window_type_normal or
+            window_type == atoms.net_wm_window_type_dialog or
+            window_type == atoms.net_wm_window_type_utility)
+        {
+            return true; // Normal application windows
+        }
+    }
+
+    // Unknown type - show it
+    return true;
+}
+
 fn initComposite(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) X11Error!void {
     _ = root; // Not needed anymore - we redirect individual windows instead
 
@@ -207,6 +265,32 @@ const Thumbnail = struct {
     pub fn deinit(self: *Thumbnail) void {
         self.allocator.free(self.data);
     }
+};
+
+// Visual design constants from spec
+const THUMBNAIL_HEIGHT: u32 = 100;
+const SPACING: u32 = 12;
+const PADDING: u32 = 16;
+const CORNER_RADIUS: f32 = 12.0;
+const ITEM_CORNER_RADIUS: f32 = 4.0;
+const MAX_GRID_WIDTH: u32 = 1820;
+const MAX_GRID_HEIGHT: u32 = 980;
+const TITLE_FONT_SIZE: i32 = 12;
+const TITLE_SPACING: u32 = 8;
+const SELECTION_BORDER: u32 = 3;
+const BACKGROUND_COLOR = rl.Color{ .r = 0x22, .g = 0x22, .b = 0x22, .a = 217 }; // #222222 @ 85%
+const HIGHLIGHT_COLOR = rl.Color{ .r = 0x3d, .g = 0xae, .b = 0xe9, .a = 255 }; // KDE accent blue #3daee9
+const TITLE_COLOR = rl.Color{ .r = 255, .g = 255, .b = 255, .a = 255 };
+
+// Item holding window data for rendering
+const WindowItem = struct {
+    id: xcb.xcb_window_t,
+    title: []const u8,
+    thumbnail: Thumbnail,
+    texture: rl.Texture2D,
+    // Scaled dimensions for display
+    display_width: u32,
+    display_height: u32,
 };
 
 fn captureWindowThumbnail(
@@ -394,6 +478,199 @@ fn captureFromImageReply(
     };
 }
 
+// Grid layout calculation
+const GridLayout = struct {
+    columns: u32,
+    rows: u32,
+    item_height: u32, // Scaled thumbnail height for display
+    total_width: u32,
+    total_height: u32,
+};
+
+fn calculateItemWidth(thumb_width: u32, thumb_height: u32, target_height: u32) u32 {
+    if (thumb_height == 0) return target_height; // Fallback for invalid thumbnails
+    const aspect_ratio = @as(f32, @floatFromInt(thumb_width)) / @as(f32, @floatFromInt(thumb_height));
+    const width = @as(f32, @floatFromInt(target_height)) * aspect_ratio;
+    if (width < 1.0) return 1;
+    return @intFromFloat(width);
+}
+
+fn calculateGridLayout(items: []WindowItem, target_height: u32) GridLayout {
+    if (items.len == 0) {
+        return GridLayout{
+            .columns = 0,
+            .rows = 0,
+            .item_height = target_height,
+            .total_width = PADDING * 2,
+            .total_height = PADDING * 2,
+        };
+    }
+
+    // Calculate display dimensions for each item at target height
+    var max_item_width: u32 = 0;
+    var total_item_width: u32 = 0;
+    for (items) |*item| {
+        item.display_height = target_height;
+        item.display_width = calculateItemWidth(item.thumbnail.width, item.thumbnail.height, target_height);
+        if (item.display_width > max_item_width) {
+            max_item_width = item.display_width;
+        }
+        total_item_width += item.display_width;
+    }
+
+    // Item height includes thumbnail + spacing + title
+    const item_full_height = target_height + TITLE_SPACING + @as(u32, @intCast(TITLE_FONT_SIZE));
+
+    // Try to find optimal column count that fits within MAX_GRID_WIDTH
+    var best_columns: u32 = 1;
+    var best_rows: u32 = @intCast(items.len);
+
+    // Try different column counts
+    var cols: u32 = 1;
+    while (cols <= items.len) : (cols += 1) {
+        const rows = (items.len + cols - 1) / cols;
+
+        // Estimate width: use average item width * columns + spacing + padding
+        const avg_width = total_item_width / @as(u32, @intCast(items.len));
+        const estimated_width = PADDING * 2 + cols * avg_width + (cols - 1) * SPACING;
+        const estimated_height = PADDING * 2 + @as(u32, @intCast(rows)) * item_full_height + (@as(u32, @intCast(rows)) - 1) * SPACING;
+
+        if (estimated_width <= MAX_GRID_WIDTH and estimated_height <= MAX_GRID_HEIGHT) {
+            best_columns = cols;
+            best_rows = @intCast(rows);
+        } else if (estimated_width > MAX_GRID_WIDTH) {
+            break;
+        }
+    }
+
+    // Calculate actual dimensions - find max row width across all rows
+    var max_row_width: u32 = 0;
+    var row_start: u32 = 0;
+    while (row_start < items.len) {
+        const items_in_row = @min(best_columns, @as(u32, @intCast(items.len)) - row_start);
+        const row_width = calculateRowWidth(items, row_start, items_in_row);
+        if (row_width > max_row_width) {
+            max_row_width = row_width;
+        }
+        row_start += best_columns;
+    }
+    const total_width = PADDING * 2 + max_row_width;
+    const total_height = PADDING * 2 + best_rows * item_full_height + (best_rows - 1) * SPACING;
+
+    return GridLayout{
+        .columns = best_columns,
+        .rows = best_rows,
+        .item_height = target_height,
+        .total_width = total_width,
+        .total_height = total_height,
+    };
+}
+
+fn calculateRowWidth(items: []WindowItem, start_idx: u32, count: u32) u32 {
+    var width: u32 = 0;
+    const end = @min(start_idx + count, @as(u32, @intCast(items.len)));
+    var i = start_idx;
+    while (i < end) : (i += 1) {
+        width += items[i].display_width;
+        if (i < end - 1) {
+            width += SPACING;
+        }
+    }
+    return width;
+}
+
+fn loadTextureFromThumbnail(thumbnail: *const Thumbnail) rl.Texture2D {
+    const image = rl.Image{
+        .data = thumbnail.data.ptr,
+        .width = @intCast(thumbnail.width),
+        .height = @intCast(thumbnail.height),
+        .format = rl.PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+        .mipmaps = 1,
+    };
+    return rl.LoadTextureFromImage(image);
+}
+
+fn renderSwitcher(items: []WindowItem, selected_index: usize) void {
+    if (items.len == 0) return;
+
+    // Calculate layout
+    var layout = calculateGridLayout(items, THUMBNAIL_HEIGHT);
+
+    // If it doesn't fit, try smaller thumbnail heights
+    var current_height = THUMBNAIL_HEIGHT;
+    while (layout.total_height > MAX_GRID_HEIGHT and current_height > 60) {
+        current_height -= 10;
+        layout = calculateGridLayout(items, current_height);
+    }
+
+    const item_full_height = layout.item_height + TITLE_SPACING + @as(u32, @intCast(TITLE_FONT_SIZE));
+
+    // Draw background
+    const bg_rect = rl.Rectangle{
+        .x = 0,
+        .y = 0,
+        .width = @floatFromInt(layout.total_width),
+        .height = @floatFromInt(layout.total_height),
+    };
+    rl.DrawRectangleRounded(bg_rect, CORNER_RADIUS / @as(f32, @floatFromInt(@max(layout.total_width, layout.total_height))), 16, BACKGROUND_COLOR);
+
+    // Draw items in grid
+    var item_idx: usize = 0;
+    var row: u32 = 0;
+    while (row < layout.rows and item_idx < items.len) : (row += 1) {
+        // Calculate how many items in this row
+        const items_in_row = @min(layout.columns, @as(u32, @intCast(items.len)) - @as(u32, @intCast(item_idx)));
+
+        // Calculate row width for centering
+        const row_width = calculateRowWidth(items, @intCast(item_idx), items_in_row);
+        var x: f32 = @floatFromInt(PADDING + (layout.total_width - 2 * PADDING - row_width) / 2);
+        const y: f32 = @floatFromInt(PADDING + row * (item_full_height + SPACING));
+
+        var col: u32 = 0;
+        while (col < items_in_row) : (col += 1) {
+            const item = &items[item_idx];
+            const is_selected = item_idx == selected_index;
+
+            // Draw selection highlight
+            if (is_selected) {
+                const highlight_rect = rl.Rectangle{
+                    .x = x - @as(f32, @floatFromInt(SELECTION_BORDER)),
+                    .y = y - @as(f32, @floatFromInt(SELECTION_BORDER)),
+                    .width = @as(f32, @floatFromInt(item.display_width + 2 * SELECTION_BORDER)),
+                    .height = @as(f32, @floatFromInt(item_full_height + 2 * SELECTION_BORDER)),
+                };
+                rl.DrawRectangleRounded(highlight_rect, ITEM_CORNER_RADIUS / @as(f32, @floatFromInt(@max(item.display_width, item_full_height))), 8, HIGHLIGHT_COLOR);
+            }
+
+            // Draw thumbnail (scaled)
+            const dest_rect = rl.Rectangle{
+                .x = x,
+                .y = y,
+                .width = @floatFromInt(item.display_width),
+                .height = @floatFromInt(item.display_height),
+            };
+            const source_rect = rl.Rectangle{
+                .x = 0,
+                .y = 0,
+                .width = @floatFromInt(item.texture.width),
+                .height = @floatFromInt(item.texture.height),
+            };
+            rl.DrawTexturePro(item.texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+
+            // Draw title
+            const title_y = y + @as(f32, @floatFromInt(item.display_height + TITLE_SPACING));
+            // Truncate title if too long (simple approach - just measure and clip)
+            const title_ptr: [*c]const u8 = @ptrCast(item.title.ptr);
+            const text_width = rl.MeasureText(title_ptr, TITLE_FONT_SIZE);
+            const title_x = x + (@as(f32, @floatFromInt(item.display_width)) - @as(f32, @floatFromInt(text_width))) / 2.0;
+            rl.DrawText(title_ptr, @intFromFloat(title_x), @intFromFloat(title_y), TITLE_FONT_SIZE, TITLE_COLOR);
+
+            x += @as(f32, @floatFromInt(item.display_width + SPACING));
+            item_idx += 1;
+        }
+    }
+}
+
 fn saveThumbnailPNG(thumbnail: Thumbnail, window_id: xcb.xcb_window_t) !void {
     var filename_buf: [256]u8 = undefined;
     const filename = try std.fmt.bufPrintZ(&filename_buf, "window_{d}.png", .{window_id});
@@ -462,26 +739,123 @@ pub fn main() !void {
         return;
     }
 
-    // Print each window's info
+    // Capture thumbnails for all windows
+    var items = std.ArrayList(WindowItem).init(allocator);
+    defer {
+        for (items.items) |*item| {
+            // Note: textures are unloaded manually before CloseWindow()
+            item.thumbnail.deinit();
+            if (!std.mem.eql(u8, item.title, "(unknown)")) {
+                allocator.free(item.title);
+            }
+        }
+        items.deinit();
+    }
+
+    try stdout.print("Scanning {d} windows...\n", .{windows.len});
+
     for (windows) |window_id| {
+        // Filter out desktop, dock, and other non-application windows
+        if (!shouldShowWindow(conn.?, window_id, atoms)) {
+            continue;
+        }
+
         const title = getWindowTitle(allocator, conn.?, window_id, atoms);
-        defer if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+        errdefer if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
 
-        const class = getWindowClass(allocator, conn.?, window_id, atoms);
-        defer if (!std.mem.eql(u8, class, "(unknown)")) allocator.free(class);
-
-        try stdout.print("Window ID: {d}\n", .{window_id});
-        try stdout.print("  Title: {s}\n", .{title});
-        try stdout.print("  Class: {s}\n", .{class});
-
-        // Capture and save thumbnail
         var thumbnail = captureWindowThumbnail(allocator, conn.?, window_id) catch |err| {
             log.warn("Failed to capture thumbnail for window {d}: {}", .{ window_id, err });
+            if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
             continue;
         };
-        defer thumbnail.deinit();
+        errdefer thumbnail.deinit();
 
-        try saveThumbnailPNG(thumbnail, window_id);
-        try stdout.print("  Saved thumbnail: window_{d}.png ({d}x{d})\n", .{ window_id, thumbnail.width, thumbnail.height });
+        try stdout.print("  Captured: {s} ({d}x{d})\n", .{ title, thumbnail.width, thumbnail.height });
+
+        try items.append(WindowItem{
+            .id = window_id,
+            .title = title,
+            .thumbnail = thumbnail,
+            .texture = undefined, // Will be set after raylib init
+            .display_width = 0,
+            .display_height = 0,
+        });
     }
+
+    if (items.items.len == 0) {
+        try stdout.print("No windows could be captured.\n", .{});
+        return;
+    }
+
+    // Calculate initial layout to determine window size
+    const layout = calculateGridLayout(items.items, THUMBNAIL_HEIGHT);
+
+    try stdout.print("Grid layout: {d} cols x {d} rows, window size: {d}x{d}\n", .{
+        layout.columns,
+        layout.rows,
+        layout.total_width,
+        layout.total_height,
+    });
+
+    // Initialize raylib
+    rl.SetConfigFlags(rl.FLAG_WINDOW_UNDECORATED | rl.FLAG_WINDOW_TRANSPARENT | rl.FLAG_WINDOW_TOPMOST);
+    rl.SetTraceLogLevel(rl.LOG_WARNING); // Reduce log noise
+    rl.InitWindow(@intCast(layout.total_width), @intCast(layout.total_height), "FastTab");
+
+    rl.SetTargetFPS(60);
+
+    // Load textures from thumbnails (must be done after InitWindow)
+    for (items.items) |*item| {
+        item.texture = loadTextureFromThumbnail(&item.thumbnail);
+    }
+
+    // Center window on screen
+    const monitor = rl.GetCurrentMonitor();
+    const monitor_width = rl.GetMonitorWidth(monitor);
+    const monitor_height = rl.GetMonitorHeight(monitor);
+    const win_x = @divTrunc(monitor_width - @as(i32, @intCast(layout.total_width)), 2);
+    const win_y = @divTrunc(monitor_height - @as(i32, @intCast(layout.total_height)), 2);
+    rl.SetWindowPosition(win_x, win_y);
+
+    try stdout.print("Displaying {d} windows in switcher. Press ESC or close window to exit.\n", .{items.items.len});
+
+    var selected_index: usize = 0;
+
+    // Main render loop
+    while (!rl.WindowShouldClose()) {
+        // Handle keyboard input for selection
+        if (rl.IsKeyPressed(rl.KEY_RIGHT) or rl.IsKeyPressed(rl.KEY_TAB)) {
+            selected_index = (selected_index + 1) % items.items.len;
+        }
+        if (rl.IsKeyPressed(rl.KEY_LEFT)) {
+            if (selected_index == 0) {
+                selected_index = items.items.len - 1;
+            } else {
+                selected_index -= 1;
+            }
+        }
+        if (rl.IsKeyPressed(rl.KEY_DOWN)) {
+            const cols = layout.columns;
+            selected_index = @min(selected_index + cols, items.items.len - 1);
+        }
+        if (rl.IsKeyPressed(rl.KEY_UP)) {
+            const cols = layout.columns;
+            if (selected_index >= cols) {
+                selected_index -= cols;
+            }
+        }
+
+        rl.BeginDrawing();
+        rl.ClearBackground(rl.Color{ .r = 0, .g = 0, .b = 0, .a = 0 }); // Transparent
+        renderSwitcher(items.items, selected_index);
+        rl.EndDrawing();
+    }
+
+    // Unload textures BEFORE closing window (must happen while GL context is valid)
+    for (items.items) |*item| {
+        rl.UnloadTexture(item.texture);
+    }
+
+    rl.CloseWindow();
+    try stdout.print("Switcher closed.\n", .{});
 }
