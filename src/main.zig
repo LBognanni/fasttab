@@ -6,6 +6,7 @@ const xcb = @cImport({
 });
 const stb = @cImport({
     @cInclude("stb_image_write.h");
+    @cInclude("stb_image_resize2.h");
 });
 const rl = @cImport({
     @cInclude("raylib.h");
@@ -285,6 +286,70 @@ const Thumbnail = struct {
     }
 };
 
+// Raw capture data from X11 (before processing)
+const RawCapture = struct {
+    window_id: xcb.xcb_window_t,
+    title: []const u8,
+    width: u16,
+    height: u16,
+    data: []u8, // Raw BGRA from X11
+    depth: u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *RawCapture) void {
+        self.allocator.free(self.data);
+        if (!std.mem.eql(u8, self.title, "(unknown)")) {
+            self.allocator.free(self.title);
+        }
+    }
+};
+
+// SIMD-accelerated BGRA to RGBA conversion
+// Processes 4 pixels (16 bytes) at a time using vector operations
+fn convertBgraToRgbaSimd(src: []const u8, dst: []u8) void {
+    std.debug.assert(src.len == dst.len);
+    std.debug.assert(src.len % 4 == 0); // Must be multiple of 4 bytes (1 pixel)
+
+    const pixel_count = src.len / 4;
+    const simd_pixels = pixel_count / 4; // Process 4 pixels at a time
+    const remaining_pixels = pixel_count % 4;
+
+    // SIMD shuffle mask: BGRA -> RGBA
+    // For each group of 4 bytes (1 pixel): swap indices 0 and 2 (B <-> R)
+    const shuffle_mask = @Vector(16, i8){
+        2, 1, 0, 3, // Pixel 0: BGRA -> RGBA
+        6, 5, 4, 7, // Pixel 1: BGRA -> RGBA
+        10, 9, 8, 11, // Pixel 2: BGRA -> RGBA
+        14, 13, 12, 15, // Pixel 3: BGRA -> RGBA
+    };
+
+    // Alpha mask: set all alpha channels to 255
+    const alpha_mask: @Vector(16, u8) = .{ 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255 };
+    const alpha_select: @Vector(16, bool) = .{ false, false, false, true, false, false, false, true, false, false, false, true, false, false, false, true };
+
+    // Process 4 pixels (16 bytes) at a time with SIMD
+    var i: usize = 0;
+    while (i < simd_pixels) : (i += 1) {
+        const offset = i * 16;
+        const src_vec: @Vector(16, u8) = src[offset..][0..16].*;
+        const shuffled = @shuffle(u8, src_vec, undefined, shuffle_mask);
+        const with_alpha = @select(u8, alpha_select, alpha_mask, shuffled);
+        dst[offset..][0..16].* = with_alpha;
+    }
+
+    // Handle remaining pixels with scalar loop
+    const simd_end = simd_pixels * 16;
+    var j: usize = 0;
+    while (j < remaining_pixels) : (j += 1) {
+        const src_idx = simd_end + j * 4;
+        const dst_idx = simd_end + j * 4;
+        dst[dst_idx + 0] = src[src_idx + 2]; // R <- B
+        dst[dst_idx + 1] = src[src_idx + 1]; // G <- G
+        dst[dst_idx + 2] = src[src_idx + 0]; // B <- R
+        dst[dst_idx + 3] = 255; // A = 255
+    }
+}
+
 // Visual design constants from spec
 const THUMBNAIL_HEIGHT: u32 = 100;
 const SPACING: u32 = 12;
@@ -439,53 +504,69 @@ fn captureFromImageReply(
     const thumb_height = target_height;
     const thumb_width = @as(u32, @intFromFloat(@as(f32, @floatFromInt(thumb_height)) * aspect_ratio));
 
-    // Allocate RGBA buffer for thumbnail
-    const thumb_data = try allocator.alloc(u8, thumb_width * thumb_height * 4);
-    errdefer allocator.free(thumb_data);
-
     // Get the depth/bpp information
     const depth = image_reply.*.depth;
     const bytes_per_pixel: u32 = if (depth == 24 or depth == 32) 4 else if (depth == 16) 2 else 1;
 
-    // Scale the image (simple nearest-neighbor)
-    var out_of_bounds_count: u32 = 0;
-    var y: u32 = 0;
-    while (y < thumb_height) : (y += 1) {
-        var x: u32 = 0;
-        while (x < thumb_width) : (x += 1) {
-            const src_x = (x * width) / thumb_width;
-            const src_y = (y * height) / thumb_height;
-            const src_idx = (src_y * width + src_x) * bytes_per_pixel;
-            const dst_idx = (y * thumb_width + x) * 4;
+    // Allocate temporary buffer for RGBA conversion of source image
+    const src_rgba = try allocator.alloc(u8, @as(usize, width) * @as(usize, height) * 4);
+    defer allocator.free(src_rgba);
 
-            if (src_idx + bytes_per_pixel <= image_data_len) {
-                if (bytes_per_pixel == 4) {
-                    // BGRA to RGBA
-                    thumb_data[dst_idx + 0] = image_data[src_idx + 2]; // R
-                    thumb_data[dst_idx + 1] = image_data[src_idx + 1]; // G
-                    thumb_data[dst_idx + 2] = image_data[src_idx + 0]; // B
-                    thumb_data[dst_idx + 3] = 255; // A
-                } else {
-                    // Fallback: grayscale or other formats
-                    const val = image_data[src_idx];
-                    thumb_data[dst_idx + 0] = val;
-                    thumb_data[dst_idx + 1] = val;
-                    thumb_data[dst_idx + 2] = val;
-                    thumb_data[dst_idx + 3] = 255;
-                }
+    // Convert BGRA to RGBA (or handle other formats)
+    var out_of_bounds_count: u32 = 0;
+    var i: usize = 0;
+    while (i < @as(usize, width) * @as(usize, height)) : (i += 1) {
+        const src_idx = i * bytes_per_pixel;
+        const dst_idx = i * 4;
+
+        if (src_idx + bytes_per_pixel <= image_data_len) {
+            if (bytes_per_pixel == 4) {
+                // BGRA to RGBA
+                src_rgba[dst_idx + 0] = image_data[src_idx + 2]; // R
+                src_rgba[dst_idx + 1] = image_data[src_idx + 1]; // G
+                src_rgba[dst_idx + 2] = image_data[src_idx + 0]; // B
+                src_rgba[dst_idx + 3] = 255; // A
             } else {
-                // Out of bounds - fill with transparent
-                out_of_bounds_count += 1;
-                thumb_data[dst_idx + 0] = 0;
-                thumb_data[dst_idx + 1] = 0;
-                thumb_data[dst_idx + 2] = 0;
-                thumb_data[dst_idx + 3] = 0;
+                // Fallback: grayscale or other formats
+                const val = image_data[src_idx];
+                src_rgba[dst_idx + 0] = val;
+                src_rgba[dst_idx + 1] = val;
+                src_rgba[dst_idx + 2] = val;
+                src_rgba[dst_idx + 3] = 255;
             }
+        } else {
+            out_of_bounds_count += 1;
+            src_rgba[dst_idx + 0] = 0;
+            src_rgba[dst_idx + 1] = 0;
+            src_rgba[dst_idx + 2] = 0;
+            src_rgba[dst_idx + 3] = 0;
         }
     }
 
     if (out_of_bounds_count > 0) {
-        log.warn("Window {d}: {d} pixels were out of bounds during scaling", .{ window, out_of_bounds_count });
+        log.warn("Window {d}: {d} pixels were out of bounds", .{ window, out_of_bounds_count });
+    }
+
+    // Allocate output buffer for resized thumbnail
+    const thumb_data = try allocator.alloc(u8, thumb_width * thumb_height * 4);
+    errdefer allocator.free(thumb_data);
+
+    // Use stb_image_resize2 for high-quality bilinear scaling
+    const result = stb.stbir_resize_uint8_linear(
+        src_rgba.ptr,
+        @intCast(width),
+        @intCast(height),
+        @intCast(@as(u32, width) * 4), // input stride
+        thumb_data.ptr,
+        @intCast(thumb_width),
+        @intCast(thumb_height),
+        @intCast(thumb_width * 4), // output stride
+        stb.STBIR_RGBA,
+    );
+
+    if (result == null) {
+        log.err("stbir_resize failed for window {d}", .{window});
+        return X11Error.ImageCaptureFailed;
     }
 
     return Thumbnail{
@@ -766,6 +847,184 @@ fn renderSwitcher(items: []WindowItem, selected_index: usize, font: rl.Font) voi
     }
 }
 
+// Capture raw image data from X11 (Phase 1: sequential, X11 not thread-safe)
+fn captureRawImage(
+    allocator: std.mem.Allocator,
+    conn: *xcb.xcb_connection_t,
+    window: xcb.xcb_window_t,
+    title: []const u8,
+) X11Error!RawCapture {
+    // Redirect this specific window (not root subwindows - that conflicts with KWin)
+    const redirect_cookie = xcb.xcb_composite_redirect_window_checked(conn, window, xcb.XCB_COMPOSITE_REDIRECT_AUTOMATIC);
+    const redirect_error = xcb.xcb_request_check(conn, redirect_cookie);
+    if (redirect_error != null) {
+        log.warn("xcb_composite_redirect_window failed for {d}: error_code={d}", .{
+            window,
+            redirect_error.*.error_code,
+        });
+        std.c.free(redirect_error);
+    }
+
+    // Get window geometry
+    const geom_cookie = xcb.xcb_get_geometry(conn, window);
+    const geom_reply = xcb.xcb_get_geometry_reply(conn, geom_cookie, null);
+    if (geom_reply == null) {
+        return X11Error.GeometryFetchFailed;
+    }
+    defer std.c.free(geom_reply);
+
+    const width = geom_reply.*.width;
+    const height = geom_reply.*.height;
+
+    if (width == 0 or height == 0) {
+        return X11Error.ImageCaptureFailed;
+    }
+
+    // Get pixmap for window using Composite
+    const pixmap = xcb.xcb_generate_id(conn);
+    const name_cookie = xcb.xcb_composite_name_window_pixmap_checked(conn, window, pixmap);
+    const name_error = xcb.xcb_request_check(conn, name_cookie);
+    if (name_error != null) {
+        std.c.free(name_error);
+        return X11Error.PixmapCreationFailed;
+    }
+    defer _ = xcb.xcb_free_pixmap(conn, pixmap);
+
+    // Get image from pixmap
+    const image_cookie = xcb.xcb_get_image(
+        conn,
+        xcb.XCB_IMAGE_FORMAT_Z_PIXMAP,
+        pixmap,
+        0,
+        0,
+        width,
+        height,
+        ~@as(u32, 0),
+    );
+
+    var error_ptr: ?*xcb.xcb_generic_error_t = null;
+    var image_reply = xcb.xcb_get_image_reply(conn, image_cookie, &error_ptr);
+
+    if (image_reply == null) {
+        if (error_ptr != null) {
+            std.c.free(error_ptr);
+        }
+        // Try fallback: get image directly from window
+        const fallback_cookie = xcb.xcb_get_image(
+            conn,
+            xcb.XCB_IMAGE_FORMAT_Z_PIXMAP,
+            window,
+            0,
+            0,
+            width,
+            height,
+            ~@as(u32, 0),
+        );
+        var fallback_error: ?*xcb.xcb_generic_error_t = null;
+        image_reply = xcb.xcb_get_image_reply(conn, fallback_cookie, &fallback_error);
+        if (image_reply == null) {
+            if (fallback_error != null) {
+                std.c.free(fallback_error);
+            }
+            return X11Error.ImageCaptureFailed;
+        }
+    }
+    defer std.c.free(image_reply);
+
+    const image_data_len = xcb.xcb_get_image_data_length(image_reply);
+    const image_data: [*]const u8 = @ptrCast(xcb.xcb_get_image_data(image_reply));
+    const depth = image_reply.?.*.depth;
+
+    // Copy the raw data to our buffer
+    const data = try allocator.alloc(u8, @intCast(image_data_len));
+    errdefer allocator.free(data);
+    @memcpy(data, image_data[0..@intCast(image_data_len)]);
+
+    return RawCapture{
+        .window_id = window,
+        .title = title,
+        .width = width,
+        .height = height,
+        .data = data,
+        .depth = depth,
+        .allocator = allocator,
+    };
+}
+
+// Process raw capture into thumbnail (Phase 2: can run in parallel)
+fn processRawCapture(capture: *const RawCapture, allocator: std.mem.Allocator) !Thumbnail {
+    const width = capture.width;
+    const height = capture.height;
+    const bytes_per_pixel: u32 = if (capture.depth == 24 or capture.depth == 32) 4 else if (capture.depth == 16) 2 else 1;
+
+    // Calculate thumbnail dimensions (target height: 256px)
+    const target_height: u32 = 256;
+    const aspect_ratio = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+    const thumb_height = target_height;
+    const thumb_width = @as(u32, @intFromFloat(@as(f32, @floatFromInt(thumb_height)) * aspect_ratio));
+
+    // Allocate buffer for RGBA conversion of source image
+    const pixel_count: usize = @as(usize, width) * @as(usize, height);
+    const src_rgba = try allocator.alloc(u8, pixel_count * 4);
+    defer allocator.free(src_rgba);
+
+    // Convert BGRA to RGBA using SIMD (if 32-bit depth)
+    if (bytes_per_pixel == 4 and capture.data.len >= pixel_count * 4) {
+        convertBgraToRgbaSimd(capture.data[0 .. pixel_count * 4], src_rgba);
+    } else {
+        // Fallback for non-32bit formats
+        var i: usize = 0;
+        while (i < pixel_count) : (i += 1) {
+            const src_idx = i * bytes_per_pixel;
+            const dst_idx = i * 4;
+            if (src_idx + bytes_per_pixel <= capture.data.len) {
+                if (bytes_per_pixel == 4) {
+                    src_rgba[dst_idx + 0] = capture.data[src_idx + 2];
+                    src_rgba[dst_idx + 1] = capture.data[src_idx + 1];
+                    src_rgba[dst_idx + 2] = capture.data[src_idx + 0];
+                    src_rgba[dst_idx + 3] = 255;
+                } else {
+                    const val = capture.data[src_idx];
+                    src_rgba[dst_idx + 0] = val;
+                    src_rgba[dst_idx + 1] = val;
+                    src_rgba[dst_idx + 2] = val;
+                    src_rgba[dst_idx + 3] = 255;
+                }
+            } else {
+                @memset(src_rgba[dst_idx..][0..4], 0);
+            }
+        }
+    }
+
+    // Allocate output buffer for resized thumbnail
+    const thumb_data = try allocator.alloc(u8, thumb_width * thumb_height * 4);
+    errdefer allocator.free(thumb_data);
+
+    // Use stb_image_resize2 for high-quality scaling
+    const result = stb.stbir_resize_uint8_linear(
+        src_rgba.ptr,
+        @intCast(width),
+        @intCast(height),
+        @intCast(@as(u32, width) * 4),
+        thumb_data.ptr,
+        @intCast(thumb_width),
+        @intCast(thumb_height),
+        @intCast(thumb_width * 4),
+        stb.STBIR_RGBA,
+    );
+
+    if (result == null) {
+        return X11Error.ImageCaptureFailed;
+    }
+
+    return Thumbnail{
+        .data = thumb_data,
+        .width = thumb_width,
+        .height = thumb_height,
+        .allocator = allocator,
+    };
+}
+
 fn saveThumbnailPNG(thumbnail: Thumbnail, window_id: xcb.xcb_window_t) !void {
     var filename_buf: [256]u8 = undefined;
     const filename = try std.fmt.bufPrintZ(&filename_buf, "window_{d}.png", .{window_id});
@@ -834,7 +1093,43 @@ pub fn main() !void {
         return;
     }
 
-    // Capture thumbnails for all windows
+    // === PHASE 1: Capture raw images from X11 (sequential - X11 is not thread-safe) ===
+    var raw_captures = std.ArrayList(RawCapture).init(allocator);
+    defer {
+        for (raw_captures.items) |*cap| {
+            cap.deinit();
+        }
+        raw_captures.deinit();
+    }
+
+    try stdout.print("Scanning {d} windows...\n", .{windows.len});
+
+    for (windows) |window_id| {
+        // Filter out desktop, dock, and other non-application windows
+        if (!shouldShowWindow(conn.?, window_id, atoms)) {
+            continue;
+        }
+
+        const title = getWindowTitle(allocator, conn.?, window_id, atoms);
+
+        var raw_capture = captureRawImage(allocator, conn.?, window_id, title) catch |err| {
+            log.warn("Failed to capture window {d}: {}", .{ window_id, err });
+            if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+            continue;
+        };
+        errdefer raw_capture.deinit();
+
+        try raw_captures.append(raw_capture);
+    }
+
+    if (raw_captures.items.len == 0) {
+        try stdout.print("No windows could be captured.\n", .{});
+        return;
+    }
+
+    try stdout.print("Captured {d} raw images, processing with SIMD...\n", .{raw_captures.items.len});
+
+    // === PHASE 2: Process raw captures in parallel (SIMD convert + resize) ===
     var items = std.ArrayList(WindowItem).init(allocator);
     defer {
         for (items.items) |*item| {
@@ -847,34 +1142,68 @@ pub fn main() !void {
         items.deinit();
     }
 
-    try stdout.print("Scanning {d} windows...\n", .{windows.len});
+    // Pre-allocate space for items
+    try items.ensureTotalCapacity(raw_captures.items.len);
 
-    for (windows) |window_id| {
-        // Filter out desktop, dock, and other non-application windows
-        if (!shouldShowWindow(conn.?, window_id, atoms)) {
-            continue;
+    // Process captures using thread pool for parallel SIMD conversion + resize
+    const ProcessResult = struct {
+        thumbnail: ?Thumbnail,
+        capture_idx: usize,
+    };
+
+    var results = try allocator.alloc(ProcessResult, raw_captures.items.len);
+    defer allocator.free(results);
+
+    // Initialize results
+    for (results, 0..) |*r, idx| {
+        r.* = .{ .thumbnail = null, .capture_idx = idx };
+    }
+
+    // Create thread pool
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    const thread_count: u32 = @intCast(@max(1, @min(cpu_count, raw_captures.items.len)));
+
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{
+        .allocator = allocator,
+        .n_jobs = thread_count,
+    });
+
+    // Spawn parallel processing tasks
+    for (raw_captures.items, 0..) |*capture, idx| {
+        try pool.spawn(struct {
+            fn work(cap: *const RawCapture, res: *ProcessResult, alloc: std.mem.Allocator) void {
+                res.thumbnail = processRawCapture(cap, alloc) catch null;
+            }
+        }.work, .{ capture, &results[idx], allocator });
+    }
+
+    // Wait for all tasks to complete (deinit waits for spawned tasks)
+    pool.deinit();
+
+    // Collect results
+    for (results, 0..) |result, idx| {
+        if (result.thumbnail) |thumb| {
+            const capture = &raw_captures.items[idx];
+            try stdout.print("  Processed: {s} ({d}x{d})\n", .{ capture.title, thumb.width, thumb.height });
+
+            // Duplicate title since RawCapture owns it
+            const title_copy = if (std.mem.eql(u8, capture.title, "(unknown)"))
+                capture.title
+            else
+                try allocator.dupe(u8, capture.title);
+
+            items.appendAssumeCapacity(WindowItem{
+                .id = capture.window_id,
+                .title = title_copy,
+                .thumbnail = thumb,
+                .texture = undefined,
+                .display_width = 0,
+                .display_height = 0,
+            });
+        } else {
+            log.warn("Failed to process window {d}", .{raw_captures.items[idx].window_id});
         }
-
-        const title = getWindowTitle(allocator, conn.?, window_id, atoms);
-        errdefer if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
-
-        var thumbnail = captureWindowThumbnail(allocator, conn.?, window_id) catch |err| {
-            log.warn("Failed to capture thumbnail for window {d}: {}", .{ window_id, err });
-            if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
-            continue;
-        };
-        errdefer thumbnail.deinit();
-
-        try stdout.print("  Captured: {s} ({d}x{d})\n", .{ title, thumbnail.width, thumbnail.height });
-
-        try items.append(WindowItem{
-            .id = window_id,
-            .title = title,
-            .thumbnail = thumbnail,
-            .texture = undefined, // Will be set after raylib init
-            .display_width = 0,
-            .display_height = 0,
-        });
     }
 
     if (items.items.len == 0) {

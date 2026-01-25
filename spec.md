@@ -348,13 +348,14 @@ Window ID: 23456789
 
 **Deliverable:** The program now runs continuously:
 - Detects when windows are created or destroyed
-- Updates thumbnails periodically (every 500ms)
+- Updates thumbnails periodically (every 1000ms)
 - Grid re-layouts when window count changes
 
 **Technical notes:**
 - Use XCB event loop to receive `PropertyNotify` on root window for `_NET_CLIENT_LIST` changes
 - Set up a timer for periodic thumbnail refresh
 - Handle the raylib event loop and XCB event loop together (poll both)
+- Ensure old textures are unloaded _after_ new ones are created to avoid crashes
 
 ---
 

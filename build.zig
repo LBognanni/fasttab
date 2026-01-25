@@ -18,10 +18,10 @@ pub fn build(b: *std.Build) void {
     exe.addIncludePath(b.path("lib/raylib-5.5_linux_amd64/include"));
     exe.addLibraryPath(b.path("lib/raylib-5.5_linux_amd64/lib"));
 
-    // Add stb implementation
+    // Add stb implementation with SIMD optimizations
     exe.addCSourceFile(.{
         .file = b.path("src/stb_impl.c"),
-        .flags = &[_][]const u8{"-std=c99"},
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-msse4.1" },
     });
 
     // Link XCB libraries
