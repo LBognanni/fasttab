@@ -14,6 +14,99 @@ const rl = @cImport({
 
 const log = std.log.scoped(.fasttab);
 
+// === Thread-safe queue for passing thumbnail updates from background to UI thread ===
+
+const ThumbnailUpdate = struct {
+    window_id: xcb.xcb_window_t,
+    title: []const u8, // Owned by this struct
+    thumbnail_data: []u8, // Owned by this struct
+    thumbnail_width: u32,
+    thumbnail_height: u32,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ThumbnailUpdate) void {
+        self.allocator.free(self.thumbnail_data);
+        if (!std.mem.eql(u8, self.title, "(unknown)")) {
+            self.allocator.free(self.title);
+        }
+    }
+};
+
+const RefreshResult = struct {
+    updates: std.ArrayList(ThumbnailUpdate),
+    current_window_ids: std.ArrayList(xcb.xcb_window_t), // Current valid window IDs
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) RefreshResult {
+        return .{
+            .updates = std.ArrayList(ThumbnailUpdate).init(allocator),
+            .current_window_ids = std.ArrayList(xcb.xcb_window_t).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *RefreshResult) void {
+        for (self.updates.items) |*update| {
+            update.deinit();
+        }
+        self.updates.deinit();
+        self.current_window_ids.deinit();
+    }
+};
+
+const UpdateQueue = struct {
+    mutex: std.Thread.Mutex = .{},
+    pending_result: ?RefreshResult = null,
+    should_stop: bool = false,
+    our_window_id: xcb.xcb_window_t = 0,
+
+    pub fn push(self: *UpdateQueue, result: RefreshResult) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Free any previous pending result that wasn't consumed
+        if (self.pending_result) |*old| {
+            old.deinit();
+        }
+        self.pending_result = result;
+    }
+
+    pub fn pop(self: *UpdateQueue) ?RefreshResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.pending_result) |result| {
+            self.pending_result = null;
+            return result;
+        }
+        return null;
+    }
+
+    pub fn requestStop(self: *UpdateQueue) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.should_stop = true;
+    }
+
+    pub fn shouldStop(self: *UpdateQueue) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.should_stop;
+    }
+
+    pub fn setOurWindowId(self: *UpdateQueue, id: xcb.xcb_window_t) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.our_window_id = id;
+    }
+
+    pub fn getOurWindowId(self: *UpdateQueue) xcb.xcb_window_t {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.our_window_id;
+    }
+};
+
 const X11Error = error{
     ConnectionFailed,
     ConnectionError,
@@ -1043,6 +1136,117 @@ fn saveThumbnailPNG(thumbnail: Thumbnail, window_id: xcb.xcb_window_t) !void {
     }
 }
 
+// === Background worker thread for capturing window thumbnails ===
+
+fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void {
+    // Create our own X11 connection (X11 is not thread-safe)
+    var screen_num: c_int = 0;
+    const conn = xcb.xcb_connect(null, &screen_num);
+    if (conn == null) {
+        log.err("Background worker: Failed to connect to X11", .{});
+        return;
+    }
+    defer xcb.xcb_disconnect(conn);
+
+    if (xcb.xcb_connection_has_error(conn) != 0) {
+        log.err("Background worker: X11 connection error", .{});
+        return;
+    }
+
+    // Get the screen
+    const setup = xcb.xcb_get_setup(conn);
+    var iter = xcb.xcb_setup_roots_iterator(setup);
+    var i: c_int = 0;
+    while (i < screen_num) : (i += 1) {
+        xcb.xcb_screen_next(&iter);
+    }
+    const screen = iter.data;
+    if (screen == null) {
+        log.err("Background worker: No screen found", .{});
+        return;
+    }
+    const root = screen.*.root;
+
+    // Initialize atoms
+    const atoms = initAtoms(conn.?) catch |err| {
+        log.err("Background worker: Failed to init atoms: {}", .{err});
+        return;
+    };
+
+    // Initialize Composite extension
+    initComposite(conn.?, root) catch |err| {
+        log.err("Background worker: Failed to init composite: {}", .{err});
+        return;
+    };
+
+    log.info("Background worker started", .{});
+
+    // Main worker loop
+    while (!queue.shouldStop()) {
+        // Sleep for refresh interval
+        std.time.sleep(1 * std.time.ns_per_s);
+
+        if (queue.shouldStop()) break;
+
+        const our_window_id = queue.getOurWindowId();
+
+        // Get current window list
+        const windows = getWindowList(conn.?, root, atoms) catch |err| {
+            log.warn("Background worker: Failed to get window list: {}", .{err});
+            continue;
+        };
+
+        var result = RefreshResult.init(allocator);
+        errdefer result.deinit();
+
+        // Capture all windows
+        for (windows) |window_id| {
+            // Skip our own window and non-application windows
+            if (window_id == our_window_id) continue;
+            if (!shouldShowWindow(conn.?, window_id, atoms)) continue;
+
+            result.current_window_ids.append(window_id) catch continue;
+
+            const title = getWindowTitle(allocator, conn.?, window_id, atoms);
+
+            // Capture raw image
+            const raw_capture = captureRawImage(allocator, conn.?, window_id, title) catch |err| {
+                log.debug("Background worker: Failed to capture window {d}: {}", .{ window_id, err });
+                if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+                continue;
+            };
+            defer allocator.free(raw_capture.data);
+
+            // Process to thumbnail
+            const thumb = processRawCapture(&raw_capture, allocator) catch |err| {
+                log.debug("Background worker: Failed to process window {d}: {}", .{ window_id, err });
+                if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+                continue;
+            };
+
+            // Add to result
+            result.updates.append(ThumbnailUpdate{
+                .window_id = window_id,
+                .title = title,
+                .thumbnail_data = thumb.data,
+                .thumbnail_width = thumb.width,
+                .thumbnail_height = thumb.height,
+                .allocator = allocator,
+            }) catch {
+                allocator.free(thumb.data);
+                if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+                continue;
+            };
+        }
+
+        // Push result to queue
+        queue.push(result);
+        log.debug("Background worker: Pushed update with {d} thumbnails", .{result.updates.items.len});
+    }
+
+    log.info("Background worker stopped", .{});
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1257,6 +1461,15 @@ pub fn main() !void {
         }
     }
 
+    // Create update queue and start background worker thread
+    var update_queue = UpdateQueue{};
+    update_queue.setOurWindowId(our_window_id);
+
+    const worker_thread = std.Thread.spawn(.{}, backgroundWorker, .{ &update_queue, allocator }) catch |err| {
+        log.err("Failed to spawn background worker: {}", .{err});
+        return err;
+    };
+
     // Load system font for better text rendering
     const font = loadSystemFont(TITLE_FONT_SIZE * 2); // Load at 2x for better quality
 
@@ -1305,77 +1518,35 @@ pub fn main() !void {
 
     var selected_index: usize = 0;
 
-    // State tracking for live updates
-    var last_refresh_time = std.time.milliTimestamp();
-    var needs_window_refresh = false;
-    const REFRESH_INTERVAL_MS: i64 = 1000;
-
     // Keep track of current layout for window resizing
     var current_layout = layout;
 
     // Main render loop
     while (!rl.WindowShouldClose()) {
-        // === Poll XCB for window list changes ===
-        while (xcb.xcb_poll_for_event(conn.?)) |event| {
-            defer std.c.free(event);
-            const event_type = event.*.response_type & 0x7F;
-            if (event_type == xcb.XCB_PROPERTY_NOTIFY) {
-                const prop: *xcb.xcb_property_notify_event_t = @ptrCast(event);
-                if (prop.atom == atoms.net_client_list) {
-                    needs_window_refresh = true;
-                    log.debug("Window list changed, refresh scheduled", .{});
-                }
-            }
-        }
+        // === Poll update queue from background worker (non-blocking) ===
+        if (update_queue.pop()) |*update_result| {
+            defer @constCast(update_result).deinit();
 
-        // === Check periodic refresh timer ===
-        const now = std.time.milliTimestamp();
-        if (now - last_refresh_time >= REFRESH_INTERVAL_MS) {
-            needs_window_refresh = true;
-            last_refresh_time = now;
-        }
-
-        // === Handle window refresh ===
-        if (needs_window_refresh) {
-            needs_window_refresh = false;
-
-            // Get current window list from X11
-            const new_windows = getWindowList(conn.?, root, atoms) catch |err| {
-                log.warn("Failed to get window list: {}", .{err});
-                continue;
-            };
-
-            // Build set of new window IDs for quick lookup (excluding our own window)
-            var new_window_set = std.AutoHashMap(xcb.xcb_window_t, void).init(allocator);
-            defer new_window_set.deinit();
-            for (new_windows) |wid| {
-                if (wid != our_window_id and shouldShowWindow(conn.?, wid, atoms)) {
-                    new_window_set.put(wid, {}) catch {};
-                }
+            // Build set of current window IDs from the update
+            var current_window_set = std.AutoHashMap(xcb.xcb_window_t, void).init(allocator);
+            defer current_window_set.deinit();
+            for (update_result.current_window_ids.items) |wid| {
+                current_window_set.put(wid, {}) catch {};
             }
 
-            // Build set of existing window IDs
-            var existing_ids = std.AutoHashMap(xcb.xcb_window_t, usize).init(allocator);
-            defer existing_ids.deinit();
-            for (items.items, 0..) |item, idx| {
-                existing_ids.put(item.id, idx) catch {};
+            // Build map of updates by window ID for quick lookup
+            var update_map = std.AutoHashMap(xcb.xcb_window_t, *ThumbnailUpdate).init(allocator);
+            defer update_map.deinit();
+            for (update_result.updates.items) |*update| {
+                update_map.put(update.window_id, update) catch {};
             }
 
-            // Find windows to remove (exist in items but not in new list)
+            // Find windows to remove (exist in items but not in current list)
             var to_remove = std.ArrayList(usize).init(allocator);
             defer to_remove.deinit();
             for (items.items, 0..) |item, idx| {
-                if (!new_window_set.contains(item.id)) {
+                if (!current_window_set.contains(item.id)) {
                     to_remove.append(idx) catch {};
-                }
-            }
-
-            // Find windows to add (exist in new list but not in items, excluding our own)
-            var to_add = std.ArrayList(xcb.xcb_window_t).init(allocator);
-            defer to_add.deinit();
-            for (new_windows) |wid| {
-                if (wid != our_window_id and shouldShowWindow(conn.?, wid, atoms) and !existing_ids.contains(wid)) {
-                    to_add.append(wid) catch {};
                 }
             }
 
@@ -1394,65 +1565,67 @@ pub fn main() !void {
                 log.debug("Removed window at index {d}", .{idx});
             }
 
-            // Add new windows
-            for (to_add.items) |wid| {
-                const title = getWindowTitle(allocator, conn.?, wid, atoms);
-
-                const raw_capture = captureRawImage(allocator, conn.?, wid, title) catch |err| {
-                    log.warn("Failed to capture new window {d}: {}", .{ wid, err });
-                    if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
-                    continue;
-                };
-                defer {
-                    allocator.free(raw_capture.data);
+            // Update existing windows and add new ones
+            for (update_result.updates.items) |*update| {
+                // Check if this window already exists
+                var found_idx: ?usize = null;
+                for (items.items, 0..) |item, idx| {
+                    if (item.id == update.window_id) {
+                        found_idx = idx;
+                        break;
+                    }
                 }
 
-                const thumb = processRawCapture(&raw_capture, allocator) catch |err| {
-                    log.warn("Failed to process new window {d}: {}", .{ wid, err });
-                    if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
-                    continue;
-                };
+                if (found_idx) |idx| {
+                    // Update existing window's thumbnail
+                    const item = &items.items[idx];
 
-                const texture = loadTextureFromThumbnail(&thumb);
-
-                items.append(WindowItem{
-                    .id = wid,
-                    .title = title,
-                    .thumbnail = thumb,
-                    .texture = texture,
-                    .display_width = 0,
-                    .display_height = 0,
-                }) catch {
-                    rl.UnloadTexture(texture);
-                    thumb.allocator.free(thumb.data);
-                    if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
-                    continue;
-                };
-                log.debug("Added new window {d}: {s}", .{ wid, title });
-            }
-
-            // Update thumbnails for existing windows (periodic refresh)
-            if (to_remove.items.len == 0 and to_add.items.len == 0) {
-                // No structural changes, just refresh thumbnails
-                for (items.items) |*item| {
-                    // Re-capture the window thumbnail
-                    const raw_capture = captureRawImage(allocator, conn.?, item.id, item.title) catch continue;
-                    defer allocator.free(raw_capture.data);
-
-                    const new_thumb = processRawCapture(&raw_capture, allocator) catch continue;
-
-                    // Create new texture before unloading old one
+                    // Create new thumbnail and texture
+                    const new_thumb = Thumbnail{
+                        .data = update.thumbnail_data,
+                        .width = update.thumbnail_width,
+                        .height = update.thumbnail_height,
+                        .allocator = update.allocator,
+                    };
                     const new_texture = loadTextureFromThumbnail(&new_thumb);
-                    const old_texture = item.texture;
-                    const old_thumb = item.thumbnail;
 
-                    // Swap in new data
-                    item.texture = new_texture;
+                    // Clean up old resources
+                    rl.UnloadTexture(item.texture);
+                    item.thumbnail.deinit();
+
+                    // Swap in new data (take ownership from update)
                     item.thumbnail = new_thumb;
+                    item.texture = new_texture;
 
-                    // Now safe to unload old
-                    rl.UnloadTexture(old_texture);
-                    old_thumb.allocator.free(old_thumb.data);
+                    // Prevent update from freeing the data we now own
+                    update.thumbnail_data = &[_]u8{};
+                } else {
+                    // Add new window
+                    const new_thumb = Thumbnail{
+                        .data = update.thumbnail_data,
+                        .width = update.thumbnail_width,
+                        .height = update.thumbnail_height,
+                        .allocator = update.allocator,
+                    };
+                    const texture = loadTextureFromThumbnail(&new_thumb);
+
+                    items.append(WindowItem{
+                        .id = update.window_id,
+                        .title = update.title,
+                        .thumbnail = new_thumb,
+                        .texture = texture,
+                        .display_width = 0,
+                        .display_height = 0,
+                    }) catch {
+                        rl.UnloadTexture(texture);
+                        continue;
+                    };
+
+                    // Prevent update from freeing resources we now own
+                    update.thumbnail_data = &[_]u8{};
+                    update.title = "(unknown)"; // Don't free the title we took
+
+                    log.debug("Added new window {d}", .{update.window_id});
                 }
             }
 
@@ -1477,7 +1650,6 @@ pub fn main() !void {
                 rl.SetWindowPosition(new_win_x, new_win_y);
                 log.debug("Window resized to {d}x{d}", .{ current_layout.total_width, current_layout.total_height });
             }
-
         }
         // Handle keyboard input for selection (only if we have items)
         if (items.items.len > 0) {
@@ -1508,6 +1680,10 @@ pub fn main() !void {
         renderSwitcher(items.items, selected_index, font);
         rl.EndDrawing();
     }
+
+    // Stop background worker thread
+    update_queue.requestStop();
+    worker_thread.join();
 
     // Unload resources BEFORE closing window (must happen while GL context is valid)
     for (items.items) |*item| {
