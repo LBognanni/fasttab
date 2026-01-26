@@ -31,9 +31,9 @@ pub fn convertBgraToRgbaSimd(src: []const u8, dst: []u8) void {
 
     // SIMD shuffle mask: BGRA -> RGBA
     const shuffle_mask = @Vector(16, i8){
-        2, 1, 0, 3,
-        6, 5, 4, 7,
-        10, 9, 8, 11,
+        2,  1,  0,  3,
+        6,  5,  4,  7,
+        10, 9,  8,  11,
         14, 13, 12, 15,
     };
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const x11 = @import("x11.zig");
 const thumbnail = @import("thumbnail.zig");
+const window_scanner = @import("window_scanner.zig");
 
 const log = std.log.scoped(.fasttab);
 
@@ -104,6 +105,34 @@ pub const UpdateQueue = struct {
             self.pending_result = null;
         }
     }
+
+    /// Wait for a result with timeout. Returns null if timeout expires or stop requested.
+    pub fn popBlocking(self: *UpdateQueue, timeout_ms: u64) ?RefreshResult {
+        const start = std.time.milliTimestamp();
+        const timeout_ns = timeout_ms * std.time.ns_per_ms;
+
+        while (true) {
+            // Check for result
+            if (self.pop()) |result| {
+                return result;
+            }
+
+            // Check for stop request
+            if (self.shouldStop()) {
+                return null;
+            }
+
+            // Check timeout
+            const elapsed = std.time.milliTimestamp() - start;
+            if (elapsed >= @as(i64, @intCast(timeout_ms))) {
+                return null;
+            }
+
+            // Sleep briefly before retrying
+            std.time.sleep(10 * std.time.ns_per_ms);
+            _ = timeout_ns; // Silence unused warning
+        }
+    }
 };
 
 pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void {
@@ -116,114 +145,96 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
 
     log.info("Background worker started", .{});
 
+    // Track known windows between refreshes
+    var known_windows = std.AutoHashMap(x11.xcb.xcb_window_t, void).init(allocator);
+    defer known_windows.deinit();
+
+    // Buffer for known window list
+    var known_list = std.ArrayList(x11.xcb.xcb_window_t).init(allocator);
+    defer known_list.deinit();
+
+    var is_first_scan = true;
+
     // Main worker loop
     while (!queue.shouldStop()) {
-        // Sleep for refresh interval
-        std.time.sleep(1 * std.time.ns_per_s);
+        // For first scan, don't wait - produce results immediately
+        if (!is_first_scan) {
+            std.time.sleep(1 * std.time.ns_per_s);
+        }
 
         if (queue.shouldStop()) break;
 
         const our_window_id = queue.getOurWindowId();
 
-        // Get current window list
-        const windows = x11.getWindowList(conn.conn, conn.root, conn.atoms) catch |err| {
-            log.warn("Background worker: Failed to get window list: {}", .{err});
+        // Build known window list for scanner
+        known_list.clearRetainingCapacity();
+        var known_iter = known_windows.keyIterator();
+        while (known_iter.next()) |key| {
+            known_list.append(key.*) catch {};
+        }
+
+        // Use window_scanner for parallel processing
+        var scan_result = window_scanner.scanAndProcess(allocator, &conn, .{
+            .exclude_window_id = our_window_id,
+            .known_windows = if (known_list.items.len > 0) known_list.items else null,
+            .parallel_processing = true,
+        }) catch |err| {
+            log.warn("Background worker: Scan failed: {}", .{err});
             continue;
         };
+        defer scan_result.deinit();
 
+        // Update known windows with current window list
+        known_windows.clearRetainingCapacity();
+        for (scan_result.window_ids.items) |wid| {
+            known_windows.put(wid, {}) catch {};
+        }
+
+        // Convert scan result to RefreshResult for the queue
         var result = RefreshResult.init(allocator);
         errdefer result.deinit();
 
-        // Build list of windows that should be included (before capture)
-        var windows_to_process = std.ArrayList(x11.xcb.xcb_window_t).init(allocator);
-        defer windows_to_process.deinit();
-
-        var total_windows: usize = 0;
-        var filtered_by_type: usize = 0;
-        var filtered_by_desktop: usize = 0;
-        for (windows) |window_id| {
-            total_windows += 1;
-            if (window_id == our_window_id) continue;
-
-            if (!x11.shouldShowWindow(conn.conn, window_id, conn.atoms)) {
-                filtered_by_type += 1;
-                continue;
-            }
-
-            // Filter by current desktop if enabled
-            if (!x11.isWindowOnCurrentDesktop(conn.conn, window_id, conn.root, conn.atoms)) {
-                filtered_by_desktop += 1;
-                continue;
-            }
-
-            // Add to processing list
-            windows_to_process.append(window_id) catch continue;
-
+        // Copy window IDs
+        for (scan_result.window_ids.items) |wid| {
+            result.current_window_ids.append(wid) catch {};
         }
 
-        // Now process each window and capture thumbnails
-        for (windows_to_process.items) |window_id| {
-            // First, verify the window actually exists by trying to get its title
-            const title = x11.getWindowTitle(allocator, conn.conn, window_id, conn.atoms);
+        // Convert ProcessedWindows to ThumbnailUpdates
+        for (scan_result.items.items) |*item| {
+            if (item.thumbnail) |thumb| {
+                // Duplicate title for the update (scanner will free its copy)
+                const title_copy = if (std.mem.eql(u8, item.title, "(unknown)"))
+                    item.title
+                else
+                    allocator.dupe(u8, item.title) catch "(unknown)";
 
-            // Try to capture the window
-            const raw_capture = x11.captureRawImage(allocator, conn.conn, window_id, title) catch |err| {
-                // If it's a geometry fetch error, this window likely doesn't exist anymore
-                // Don't add it to current_window_ids
-                if (err == x11.X11Error.GeometryFetchFailed) {
-                    log.debug("Background worker: Window {d} no longer exists, skipping", .{window_id});
-                    if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
+                // Duplicate thumbnail data (scanner will free its copy)
+                const data_copy = allocator.dupe(u8, thumb.data) catch continue;
+
+                result.updates.append(ThumbnailUpdate{
+                    .window_id = item.window_id,
+                    .title = title_copy,
+                    .thumbnail_data = data_copy,
+                    .thumbnail_width = thumb.width,
+                    .thumbnail_height = thumb.height,
+                    .allocator = allocator,
+                }) catch {
+                    allocator.free(data_copy);
+                    if (!std.mem.eql(u8, title_copy, "(unknown)")) {
+                        allocator.free(title_copy);
+                    }
                     continue;
-                }
-
-                // For other errors (e.g., minimized windows), still keep in current list
-                log.debug("Background worker: Failed to capture window {d}: {}", .{ window_id, err });
-                if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
-
-                // Add to current_window_ids so it doesn't get removed
-                result.current_window_ids.append(window_id) catch {};
-                continue;
-            };
-            defer allocator.free(raw_capture.data);
-
-            // Window captured successfully, add to current list
-            result.current_window_ids.append(window_id) catch continue;
-
-            // Skip processing minimized windows - they don't change visually
-            if (x11.isWindowMinimized(conn.conn, window_id, conn.atoms)) {
-                log.debug("Background worker: Skipping minimized window {d}", .{window_id});
-                if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
-                continue;
+                };
             }
-
-            const thumb = thumbnail.processRawCapture(&raw_capture, allocator) catch |err| {
-                log.debug("Background worker: Failed to process window {d}: {}", .{ window_id, err });
-                if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
-                continue;
-            };
-
-            result.updates.append(ThumbnailUpdate{
-                .window_id = window_id,
-                .title = title,
-                .thumbnail_data = thumb.data,
-                .thumbnail_width = thumb.width,
-                .thumbnail_height = thumb.height,
-                .allocator = allocator,
-            }) catch {
-                allocator.free(thumb.data);
-                if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
-                continue;
-            };
         }
 
         queue.push(result);
-        log.debug("Background worker: Scanned {d} windows, filtered {d} by type, {d} by desktop, included {d} in current list, captured {d} thumbnails", .{
-            total_windows,
-            filtered_by_type,
-            filtered_by_desktop,
-            result.current_window_ids.items.len,
-            result.updates.items.len,
+        log.debug("Background worker: {d} windows, {d} thumbnails", .{
+            scan_result.window_ids.items.len,
+            scan_result.items.items.len,
         });
+
+        is_first_scan = false;
     }
 
     log.info("Background worker stopped", .{});

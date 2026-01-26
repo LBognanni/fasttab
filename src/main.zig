@@ -1,8 +1,8 @@
 const std = @import("std");
 const x11 = @import("x11.zig");
-const thumbnail = @import("thumbnail.zig");
 const ui = @import("ui.zig");
 const worker = @import("worker.zig");
+const thumbnail = @import("thumbnail.zig");
 
 const rl = ui.rl;
 const log = std.log.scoped(.fasttab);
@@ -39,55 +39,36 @@ pub fn main() !void {
     _ = x11.xcb.xcb_change_window_attributes(conn.conn, conn.root, x11.xcb.XCB_CW_EVENT_MASK, &event_mask);
     conn.flush();
 
-    // Get window list
-    const windows = try x11.getWindowList(conn.conn, conn.root, conn.atoms);
+    // Create update queue and start background worker FIRST
+    // Worker is the sole owner of window scanning
+    var update_queue = worker.UpdateQueue{};
 
-    if (windows.len == 0) {
-        try stdout.print("No windows found.\n", .{});
+    const worker_thread = std.Thread.spawn(.{}, worker.backgroundWorker, .{ &update_queue, allocator }) catch |err| {
+        log.err("Failed to spawn background worker: {}", .{err});
+        return err;
+    };
+
+    try stdout.print("Waiting for initial window scan...\n", .{});
+
+    // Wait for initial result from worker (blocking with 10 second timeout)
+    var initial_result = update_queue.popBlocking(10000) orelse {
+        try stdout.print("No windows found (timeout waiting for worker).\n", .{});
+        update_queue.requestStop();
+        worker_thread.join();
         return;
-    }
+    };
+    defer initial_result.deinit();
 
-    // === PHASE 1: Capture raw images from X11 ===
-    var raw_captures = std.ArrayList(x11.RawCapture).init(allocator);
-    defer {
-        for (raw_captures.items) |*cap| {
-            cap.deinit();
-        }
-        raw_captures.deinit();
-    }
-
-    try stdout.print("Scanning {d} windows...\n", .{windows.len});
-
-    for (windows) |window_id| {
-        if (!x11.shouldShowWindow(conn.conn, window_id, conn.atoms)) {
-            continue;
-        }
-
-        // Filter by current desktop if enabled
-        if (!x11.isWindowOnCurrentDesktop(conn.conn, window_id, conn.root, conn.atoms)) {
-            continue;
-        }
-
-        const title = x11.getWindowTitle(allocator, conn.conn, window_id, conn.atoms);
-
-        var raw_capture = x11.captureRawImage(allocator, conn.conn, window_id, title) catch |err| {
-            log.warn("Failed to capture window {d}: {}", .{ window_id, err });
-            if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
-            continue;
-        };
-        errdefer raw_capture.deinit();
-
-        try raw_captures.append(raw_capture);
-    }
-
-    if (raw_captures.items.len == 0) {
+    if (initial_result.updates.items.len == 0) {
         try stdout.print("No windows could be captured.\n", .{});
+        update_queue.requestStop();
+        worker_thread.join();
         return;
     }
 
-    try stdout.print("Captured {d} raw images, processing with SIMD...\n", .{raw_captures.items.len});
+    try stdout.print("Found {d} windows.\n", .{initial_result.updates.items.len});
 
-    // === PHASE 2: Process raw captures in parallel ===
+    // Build initial window items from worker result
     var items = std.ArrayList(ui.WindowItem).init(allocator);
     defer {
         for (items.items) |*item| {
@@ -99,65 +80,30 @@ pub fn main() !void {
         items.deinit();
     }
 
-    try items.ensureTotalCapacity(raw_captures.items.len);
+    try items.ensureTotalCapacity(initial_result.updates.items.len);
 
-    const ProcessResult = struct {
-        thumb: ?thumbnail.Thumbnail,
-        capture_idx: usize,
-    };
+    for (initial_result.updates.items) |*update| {
+        const thumb = thumbnail.Thumbnail{
+            .data = update.thumbnail_data,
+            .width = update.thumbnail_width,
+            .height = update.thumbnail_height,
+            .allocator = update.allocator,
+        };
 
-    var results = try allocator.alloc(ProcessResult, raw_captures.items.len);
-    defer allocator.free(results);
+        items.appendAssumeCapacity(ui.WindowItem{
+            .id = update.window_id,
+            .title = update.title,
+            .thumbnail = thumb,
+            .texture = undefined,
+            .display_width = 0,
+            .display_height = 0,
+        });
 
-    for (results, 0..) |*r, idx| {
-        r.* = .{ .thumb = null, .capture_idx = idx };
-    }
+        try stdout.print("  {s} ({d}x{d})\n", .{ update.title, thumb.width, thumb.height });
 
-    const cpu_count = std.Thread.getCpuCount() catch 4;
-    const thread_count: u32 = @intCast(@max(1, @min(cpu_count, raw_captures.items.len)));
-
-    var pool: std.Thread.Pool = undefined;
-    try pool.init(.{
-        .allocator = allocator,
-        .n_jobs = thread_count,
-    });
-
-    for (raw_captures.items, 0..) |*capture, idx| {
-        try pool.spawn(struct {
-            fn work(cap: *const x11.RawCapture, res: *ProcessResult, alloc: std.mem.Allocator) void {
-                res.thumb = thumbnail.processRawCapture(cap, alloc) catch null;
-            }
-        }.work, .{ capture, &results[idx], allocator });
-    }
-
-    pool.deinit();
-
-    for (results, 0..) |result, idx| {
-        if (result.thumb) |thumb| {
-            const capture = &raw_captures.items[idx];
-            try stdout.print("  Processed: {s} ({d}x{d})\n", .{ capture.title, thumb.width, thumb.height });
-
-            const title_copy = if (std.mem.eql(u8, capture.title, "(unknown)"))
-                capture.title
-            else
-                try allocator.dupe(u8, capture.title);
-
-            items.appendAssumeCapacity(ui.WindowItem{
-                .id = capture.window_id,
-                .title = title_copy,
-                .thumbnail = thumb,
-                .texture = undefined,
-                .display_width = 0,
-                .display_height = 0,
-            });
-        } else {
-            log.warn("Failed to process window {d}", .{raw_captures.items[idx].window_id});
-        }
-    }
-
-    if (items.items.len == 0) {
-        try stdout.print("No windows could be captured.\n", .{});
-        return;
+        // Transfer ownership - prevent deinit from freeing
+        update.thumbnail_data = &[_]u8{};
+        update.title = "(unknown)";
     }
 
     // Calculate initial layout
@@ -172,15 +118,6 @@ pub fn main() !void {
 
     // Get mouse position BEFORE initializing raylib
     const mouse_pos = x11.getMousePosition(conn.conn, conn.root);
-
-    // Create update queue and start background worker BEFORE raylib initialization
-    var update_queue = worker.UpdateQueue{};
-    // We'll set our window ID after creating the window
-
-    const worker_thread = std.Thread.spawn(.{}, worker.backgroundWorker, .{ &update_queue, allocator }) catch |err| {
-        log.err("Failed to spawn background worker: {}", .{err});
-        return err;
-    };
 
     // In daemon mode, wait 2 seconds to demonstrate background thumbnailing
     if (daemon_mode) {
