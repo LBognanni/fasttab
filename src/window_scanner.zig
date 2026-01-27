@@ -9,6 +9,9 @@ pub const ScanOptions = struct {
     exclude_window_id: x11.xcb.xcb_window_t = 0,
     /// Windows we already have thumbnails for - used to skip re-capturing minimized windows
     known_windows: ?[]const x11.xcb.xcb_window_t = null,
+    /// When true, only capture NEW windows (skip all known windows, not just minimized)
+    /// When false, only skip minimized known windows (default behavior)
+    capture_only_new: bool = false,
     /// Enable parallel thumbnail processing using thread pool
     parallel_processing: bool = true,
     /// Maximum threads for parallel processing (null = auto-detect)
@@ -137,7 +140,12 @@ pub fn scanAndProcess(
         const is_minimized = x11.isWindowMinimized(conn.conn, window_id, conn.atoms);
         const is_known = known_set.contains(window_id);
 
-        // Skip re-capturing minimized windows we already know about
+        // When capture_only_new is true (window hidden), skip ALL known windows
+        // When false (window visible or first scan), only skip minimized known windows
+        if (options.capture_only_new and is_known) {
+            stats.skipped_minimized += 1; // reusing counter for skipped windows
+            continue;
+        }
         if (is_minimized and is_known) {
             stats.skipped_minimized += 1;
             continue;

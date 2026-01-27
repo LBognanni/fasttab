@@ -88,7 +88,7 @@ pub fn main() !void {
     }
 
     // Initialize the application
-    var application = try app.App.init(allocator, &initial_result, mouse_pos, daemon_mode);
+    var application = try app.App.init(allocator, &initial_result, mouse_pos, daemon_mode, &update_queue);
     defer application.deinit();
 
     // Find our own window ID

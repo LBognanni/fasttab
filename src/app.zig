@@ -41,6 +41,7 @@ pub const App = struct {
     window_close_time: ?i64,
     daemon_mode: bool,
     should_quit: bool,
+    update_queue: ?*worker.UpdateQueue,
 
     const Self = @This();
 
@@ -50,6 +51,7 @@ pub const App = struct {
         initial_result: *worker.RefreshResult,
         mouse_pos: x11.MousePosition,
         daemon_mode: bool,
+        update_queue: ?*worker.UpdateQueue,
     ) !Self {
         // Build initial window items from worker result
         var items = std.ArrayList(ui.WindowItem).init(allocator);
@@ -130,6 +132,7 @@ pub const App = struct {
             .window_close_time = null,
             .daemon_mode = daemon_mode,
             .should_quit = false,
+            .update_queue = update_queue,
         };
     }
 
@@ -245,6 +248,11 @@ pub const App = struct {
     fn hideWindow(self: *Self) void {
         log.debug("Hiding window", .{});
 
+        // Notify worker that window is hidden (optimize captures)
+        if (self.update_queue) |queue| {
+            queue.setWindowVisible(false);
+        }
+
         // Unload all textures before closing window
         for (self.items.items) |*item| {
             rl.UnloadTexture(item.texture);
@@ -259,6 +267,11 @@ pub const App = struct {
 
     fn showWindow(self: *Self) void {
         log.debug("Showing window with {d} items", .{self.items.items.len});
+
+        // Notify worker that window is visible (capture all windows)
+        if (self.update_queue) |queue| {
+            queue.setWindowVisible(true);
+        }
 
         // Recalculate layout in case windows changed
         self.current_layout = ui.calculateGridLayout(self.items.items, ui.THUMBNAIL_HEIGHT);

@@ -50,6 +50,7 @@ pub const UpdateQueue = struct {
     pending_result: ?RefreshResult = null,
     should_stop: bool = false,
     our_window_id: x11.xcb.xcb_window_t = 0,
+    window_visible: bool = true, // Whether the app window is currently visible
 
     pub fn push(self: *UpdateQueue, result: RefreshResult) void {
         self.mutex.lock();
@@ -94,6 +95,18 @@ pub const UpdateQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.our_window_id;
+    }
+
+    pub fn setWindowVisible(self: *UpdateQueue, visible: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.window_visible = visible;
+    }
+
+    pub fn isWindowVisible(self: *UpdateQueue) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.window_visible;
     }
 
     /// Wait for our window ID to be set (non-zero). Returns true if set, false if stop requested.
@@ -204,10 +217,22 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
             known_list.append(key.*) catch {};
         }
 
+        // Determine capture mode:
+        // - First scan: capture all windows
+        // - Window visible: capture all windows (to refresh thumbnails)
+        // - Window hidden: only capture NEW windows (idle optimization)
+        const window_visible = queue.isWindowVisible();
+        const capture_only_new = !is_first_scan and !window_visible;
+
+        if (capture_only_new) {
+            log.debug("Background worker: Hidden mode - only capturing new windows", .{});
+        }
+
         // Use window_scanner for parallel processing
         var scan_result = window_scanner.scanAndProcess(allocator, &conn, .{
             .exclude_window_id = our_window_id,
             .known_windows = if (known_list.items.len > 0) known_list.items else null,
+            .capture_only_new = capture_only_new,
             .parallel_processing = true,
         }) catch |err| {
             log.warn("Background worker: Scan failed: {}", .{err});
