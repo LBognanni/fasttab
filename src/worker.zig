@@ -96,6 +96,28 @@ pub const UpdateQueue = struct {
         return self.our_window_id;
     }
 
+    /// Wait for our window ID to be set (non-zero). Returns true if set, false if stop requested.
+    pub fn waitForOurWindowId(self: *UpdateQueue, timeout_ms: u64) bool {
+        const start = std.time.milliTimestamp();
+
+        while (true) {
+            if (self.getOurWindowId() != 0) {
+                return true;
+            }
+
+            if (self.shouldStop()) {
+                return false;
+            }
+
+            const elapsed = std.time.milliTimestamp() - start;
+            if (elapsed >= @as(i64, @intCast(timeout_ms))) {
+                return false;
+            }
+
+            std.time.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+
     /// Clean up any pending result that was never consumed
     pub fn deinit(self: *UpdateQueue) void {
         self.mutex.lock();
@@ -163,6 +185,15 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
         }
 
         if (queue.shouldStop()) break;
+
+        // After first scan, wait for our window ID to be set before continuing
+        // This prevents us from including the FastTab window in scan results
+        if (!is_first_scan and queue.getOurWindowId() == 0) {
+            log.debug("Background worker: Waiting for our window ID to be set...", .{});
+            if (!queue.waitForOurWindowId(10000)) {
+                log.warn("Background worker: Timeout waiting for window ID, continuing anyway", .{});
+            }
+        }
 
         const our_window_id = queue.getOurWindowId();
 
