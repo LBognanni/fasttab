@@ -2,31 +2,87 @@ const std = @import("std");
 const x11 = @import("x11.zig");
 const worker = @import("worker.zig");
 const app = @import("app.zig");
+const client = @import("client.zig");
+const socket = @import("socket.zig");
 
 const log = std.log.scoped(.fasttab);
 
 pub fn main() !void {
+    // Fast path: check for CLI commands before any heavy initialization
+    // This enables <5ms response time for show/index/hide commands
+    var args_iter = std.process.args();
+    _ = args_iter.next(); // skip program name
+
+    if (args_iter.next()) |cmd| {
+        if (std.mem.eql(u8, cmd, "show")) {
+            const ids = args_iter.next() orelse {
+                std.debug.print("Usage: fasttab show <window_ids>\n", .{});
+                std.process.exit(1);
+            };
+            client.sendShow(ids) catch |err| {
+                switch (err) {
+                    client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
+                    else => std.debug.print("Error: failed to send command\n", .{}),
+                }
+                std.process.exit(1);
+            };
+            return;
+        }
+        if (std.mem.eql(u8, cmd, "index")) {
+            const n = args_iter.next() orelse {
+                std.debug.print("Usage: fasttab index <n>\n", .{});
+                std.process.exit(1);
+            };
+            client.sendIndex(n) catch |err| {
+                switch (err) {
+                    client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
+                    else => std.debug.print("Error: failed to send command\n", .{}),
+                }
+                std.process.exit(1);
+            };
+            return;
+        }
+        if (std.mem.eql(u8, cmd, "hide")) {
+            client.sendHide() catch |err| {
+                switch (err) {
+                    client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
+                    else => std.debug.print("Error: failed to send command\n", .{}),
+                }
+                std.process.exit(1);
+            };
+            return;
+        }
+        if (std.mem.eql(u8, cmd, "daemon") or std.mem.eql(u8, cmd, "--daemon")) {
+            return runDaemon(true);
+        }
+        // Unknown command - fall through to daemon mode
+        std.debug.print("Unknown command: {s}\n", .{cmd});
+        std.debug.print("Usage: fasttab [daemon|show|index|hide]\n", .{});
+        std.process.exit(1);
+    }
+
+    // No arguments - run in non-daemon mode (legacy behavior)
+    return runDaemon(false);
+}
+
+/// Run the daemon (full initialization with X11, raylib, socket server)
+fn runDaemon(daemon_mode: bool) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
 
-    // Parse command-line arguments
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    _ = args.next(); // skip program name
-
-    var daemon_mode = false;
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--daemon") or std.mem.eql(u8, arg, "daemon")) {
-            daemon_mode = true;
-        }
-    }
-
     if (daemon_mode) {
         try stdout.print("Starting in daemon mode...\n", .{});
     }
+
+    // Initialize socket server (before any other resources for early binding)
+    var sock_server = socket.SocketServer.init(allocator) catch |err| {
+        log.err("Failed to initialize socket server: {}", .{err});
+        return err;
+    };
+    defer sock_server.deinit();
 
     // Connect to X11
     var conn = try x11.Connection.init();
@@ -127,8 +183,23 @@ pub fn main() !void {
         try stdout.print("Displaying {d} windows in switcher. Press ESC or close window to exit.\n", .{application.windowCount()});
     }
 
-    // Main loop
+    // Main loop with poll-based event handling
+    var pollfds = [_]std.posix.pollfd{
+        .{ .fd = sock_server.getFd(), .events = std.posix.POLL.IN, .revents = 0 },
+    };
+
     while (application.isRunning()) {
+        // Poll for socket events (16ms timeout ~= 60fps)
+        _ = std.posix.poll(&pollfds, 16) catch {};
+
+        // Check for socket commands
+        if (pollfds[0].revents & std.posix.POLL.IN != 0) {
+            if (sock_server.acceptAndRead()) |*parsed_cmd| {
+                defer @constCast(parsed_cmd).deinit(allocator);
+                handleSocketCommand(&application, parsed_cmd.command);
+            }
+        }
+
         // Poll update queue from background worker
         if (update_queue.pop()) |*update_result| {
             defer @constCast(update_result).deinit();
@@ -145,4 +216,22 @@ pub fn main() !void {
     update_queue.deinit();
 
     try stdout.print("Switcher closed.\n", .{});
+}
+
+/// Handle a command received from the socket
+fn handleSocketCommand(application: *app.App, cmd: socket.Command) void {
+    switch (cmd) {
+        .show => |ids| {
+            log.info("Socket command: SHOW with {d} windows", .{ids.len});
+            application.showWithWindows(ids);
+        },
+        .index => |idx| {
+            log.info("Socket command: INDEX {d}", .{idx});
+            application.setSelectedIndex(idx);
+        },
+        .hide => {
+            log.info("Socket command: HIDE", .{});
+            application.hideWindow();
+        },
+    }
 }

@@ -243,9 +243,57 @@ pub const App = struct {
         self.updateLayout();
     }
 
-    // === Private methods ===
+    // === Public control methods for socket commands ===
 
-    fn hideWindow(self: *Self) void {
+    /// Show the switcher with the specified window IDs in the given order
+    /// Windows not in the list are hidden; order determines display order
+    pub fn showWithWindows(self: *Self, ids: []const u32) void {
+        if (ids.len == 0) {
+            log.warn("showWithWindows called with empty list", .{});
+            return;
+        }
+
+        // Reorder items to match the specified order
+        var new_items = std.ArrayList(ui.WindowItem).init(self.allocator);
+        defer new_items.deinit();
+
+        for (ids) |target_id| {
+            for (self.items.items) |item| {
+                if (item.id == target_id) {
+                    new_items.append(item) catch continue;
+                    break;
+                }
+            }
+        }
+
+        // If we found matching windows, replace items with reordered list
+        if (new_items.items.len > 0) {
+            // Clear and replace
+            self.items.clearRetainingCapacity();
+            for (new_items.items) |item| {
+                self.items.append(item) catch continue;
+            }
+            self.selected_index = 0;
+            self.updateLayout();
+        }
+
+        // Show window if hidden
+        if (self.window_hidden) {
+            self.showWindow();
+        }
+    }
+
+    /// Set the selected index (for INDEX command)
+    pub fn setSelectedIndex(self: *Self, index: usize) void {
+        if (index < self.items.items.len) {
+            self.selected_index = index;
+        } else if (self.items.items.len > 0) {
+            self.selected_index = self.items.items.len - 1;
+        }
+    }
+
+    /// Hide the switcher window (public for socket commands)
+    pub fn hideWindow(self: *Self) void {
         log.debug("Hiding window", .{});
 
         // Notify worker that window is hidden (optimize captures)
@@ -265,7 +313,8 @@ pub const App = struct {
         self.window_close_time = std.time.milliTimestamp();
     }
 
-    fn showWindow(self: *Self) void {
+    /// Show the switcher window (public for socket commands)
+    pub fn showWindow(self: *Self) void {
         log.debug("Showing window with {d} items", .{self.items.items.len});
 
         // Notify worker that window is visible (capture all windows)
@@ -302,6 +351,8 @@ pub const App = struct {
         self.window_hidden = false;
         self.window_close_time = null;
     }
+
+    // === Private methods ===
 
     fn handleKeyboardInput(self: *Self) void {
         const count = self.items.items.len;
