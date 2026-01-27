@@ -3,9 +3,16 @@ const x11 = @import("x11.zig");
 const ui = @import("ui.zig");
 const worker = @import("worker.zig");
 const thumbnail = @import("thumbnail.zig");
+const nav = @import("navigation.zig");
 
 const rl = ui.rl;
 const log = std.log.scoped(.fasttab);
+
+// Re-export navigation functions for external use
+pub const moveSelectionRight = nav.moveSelectionRight;
+pub const moveSelectionLeft = nav.moveSelectionLeft;
+pub const moveSelectionDown = nav.moveSelectionDown;
+pub const moveSelectionUp = nav.moveSelectionUp;
 
 pub const AppError = error{
     NoWindows,
@@ -284,25 +291,20 @@ pub const App = struct {
     }
 
     fn handleKeyboardInput(self: *Self) void {
+        const count = self.items.items.len;
+        const cols = self.current_layout.columns;
+
         if (rl.IsKeyPressed(rl.KEY_RIGHT) or rl.IsKeyPressed(rl.KEY_TAB)) {
-            self.selected_index = (self.selected_index + 1) % self.items.items.len;
+            self.selected_index = nav.moveSelectionRight(self.selected_index, count);
         }
         if (rl.IsKeyPressed(rl.KEY_LEFT)) {
-            if (self.selected_index == 0) {
-                self.selected_index = self.items.items.len - 1;
-            } else {
-                self.selected_index -= 1;
-            }
+            self.selected_index = nav.moveSelectionLeft(self.selected_index, count);
         }
         if (rl.IsKeyPressed(rl.KEY_DOWN)) {
-            const cols = self.current_layout.columns;
-            self.selected_index = @min(self.selected_index + cols, self.items.items.len - 1);
+            self.selected_index = nav.moveSelectionDown(self.selected_index, cols, count);
         }
         if (rl.IsKeyPressed(rl.KEY_UP)) {
-            const cols = self.current_layout.columns;
-            if (self.selected_index >= cols) {
-                self.selected_index -= cols;
-            }
+            self.selected_index = nav.moveSelectionUp(self.selected_index, cols);
         }
     }
 

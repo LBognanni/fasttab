@@ -76,4 +76,51 @@ pub fn build(b: *std.Build) void {
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    // Pure logic unit tests (no X11/raylib dependencies)
+    // Each test file needs access to the modules it imports
+
+    // Thumbnail test
+    const thumbnail_test = b.addTest(.{
+        .root_source_file = b.path("src/tests/thumbnail_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    thumbnail_test.root_module.addImport("color", b.createModule(.{
+        .root_source_file = b.path("src/color.zig"),
+    }));
+    test_step.dependOn(&b.addRunArtifact(thumbnail_test).step);
+
+    // UI/Layout test
+    const ui_test = b.addTest(.{
+        .root_source_file = b.path("src/tests/ui_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ui_test.root_module.addImport("layout", b.createModule(.{
+        .root_source_file = b.path("src/layout.zig"),
+    }));
+    test_step.dependOn(&b.addRunArtifact(ui_test).step);
+
+    // Worker/Queue test
+    const worker_test = b.addTest(.{
+        .root_source_file = b.path("src/tests/worker_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    worker_test.root_module.addImport("queue", b.createModule(.{
+        .root_source_file = b.path("src/queue.zig"),
+    }));
+    test_step.dependOn(&b.addRunArtifact(worker_test).step);
+
+    // Navigation test
+    const navigation_test = b.addTest(.{
+        .root_source_file = b.path("src/tests/navigation_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    navigation_test.root_module.addImport("navigation", b.createModule(.{
+        .root_source_file = b.path("src/navigation.zig"),
+    }));
+    test_step.dependOn(&b.addRunArtifact(navigation_test).step);
 }

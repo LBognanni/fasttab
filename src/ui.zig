@@ -1,21 +1,24 @@
 const std = @import("std");
 const thumbnail = @import("thumbnail.zig");
 const x11 = @import("x11.zig");
+const layout_module = @import("layout.zig");
 
 pub const rl = @cImport({
     @cInclude("raylib.h");
 });
 
-// Visual design constants
-pub const THUMBNAIL_HEIGHT: u32 = 100;
-pub const SPACING: u32 = 12;
-pub const PADDING: u32 = 16;
+// Re-export constants from layout module
+pub const THUMBNAIL_HEIGHT = layout_module.THUMBNAIL_HEIGHT;
+pub const SPACING = layout_module.SPACING;
+pub const PADDING = layout_module.PADDING;
+pub const MAX_GRID_WIDTH = layout_module.MAX_GRID_WIDTH;
+pub const MAX_GRID_HEIGHT = layout_module.MAX_GRID_HEIGHT;
+pub const TITLE_FONT_SIZE = layout_module.TITLE_FONT_SIZE;
+pub const TITLE_SPACING = layout_module.TITLE_SPACING;
+
+// UI-only constants
 pub const CORNER_RADIUS: f32 = 12.0;
 pub const ITEM_CORNER_RADIUS: f32 = 4.0;
-pub const MAX_GRID_WIDTH: u32 = 1820;
-pub const MAX_GRID_HEIGHT: u32 = 980;
-pub const TITLE_FONT_SIZE: i32 = 14;
-pub const TITLE_SPACING: u32 = 8;
 pub const SELECTION_BORDER: u32 = 3;
 pub const BACKGROUND_COLOR = rl.Color{ .r = 0x22, .g = 0x22, .b = 0x22, .a = 217 };
 pub const HIGHLIGHT_COLOR = rl.Color{ .r = 0x3d, .g = 0xae, .b = 0xe9, .a = 255 };
@@ -31,21 +34,11 @@ pub const WindowItem = struct {
     display_height: u32,
 };
 
-pub const GridLayout = struct {
-    columns: u32,
-    rows: u32,
-    item_height: u32,
-    total_width: u32,
-    total_height: u32,
-};
+// Re-export GridLayout from layout module
+pub const GridLayout = layout_module.GridLayout;
 
-fn calculateItemWidth(thumb_width: u32, thumb_height: u32, target_height: u32) u32 {
-    if (thumb_height == 0) return target_height;
-    const aspect_ratio = @as(f32, @floatFromInt(thumb_width)) / @as(f32, @floatFromInt(thumb_height));
-    const width = @as(f32, @floatFromInt(target_height)) * aspect_ratio;
-    if (width < 1.0) return 1;
-    return @intFromFloat(width);
-}
+// Re-export pure layout functions
+pub const calculateItemWidth = layout_module.calculateItemWidth;
 
 pub fn calculateGridLayout(items: []WindowItem, target_height: u32) GridLayout {
     if (items.len == 0) {
