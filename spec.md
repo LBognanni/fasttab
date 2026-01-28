@@ -413,6 +413,19 @@ Window ID: 23456789
 
 ---
 
+### Milestone 6.5: Extra commands
+
+**Goal:** Add extra commands for testing and debugging.
+**Deliverable:** The CLI now supports:
+- `fasttab show` - connects to socket, sends SHOW with no window IDs
+- `fasttab next` - connects to socket, sends NEXT command
+- `fasttab prev` - connects to socket, sends PREV command
+
+The daemon is updated to handle these commands:
+- SHOW with no IDs shows all known windows in default order
+- NEXT increments the selection index (wraps around)
+- PREV decrements the selection index (wraps around)
+
 ### Milestone 7: Daemon Mode
 
 **Goal:** Run as a background service.

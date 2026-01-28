@@ -15,17 +15,25 @@ pub fn main() !void {
 
     if (args_iter.next()) |cmd| {
         if (std.mem.eql(u8, cmd, "show")) {
-            const ids = args_iter.next() orelse {
-                std.debug.print("Usage: fasttab show <window_ids>\n", .{});
-                std.process.exit(1);
-            };
-            client.sendShow(ids) catch |err| {
-                switch (err) {
-                    client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
-                    else => std.debug.print("Error: failed to send command\n", .{}),
-                }
-                std.process.exit(1);
-            };
+            // show with optional window IDs
+            if (args_iter.next()) |ids| {
+                client.sendShow(ids) catch |err| {
+                    switch (err) {
+                        client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
+                        else => std.debug.print("Error: failed to send command\n", .{}),
+                    }
+                    std.process.exit(1);
+                };
+            } else {
+                // No IDs - show all windows
+                client.sendShowAll() catch |err| {
+                    switch (err) {
+                        client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
+                        else => std.debug.print("Error: failed to send command\n", .{}),
+                    }
+                    std.process.exit(1);
+                };
+            }
             return;
         }
         if (std.mem.eql(u8, cmd, "index")) {
@@ -52,12 +60,32 @@ pub fn main() !void {
             };
             return;
         }
+        if (std.mem.eql(u8, cmd, "next")) {
+            client.sendNext() catch |err| {
+                switch (err) {
+                    client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
+                    else => std.debug.print("Error: failed to send command\n", .{}),
+                }
+                std.process.exit(1);
+            };
+            return;
+        }
+        if (std.mem.eql(u8, cmd, "prev")) {
+            client.sendPrev() catch |err| {
+                switch (err) {
+                    client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
+                    else => std.debug.print("Error: failed to send command\n", .{}),
+                }
+                std.process.exit(1);
+            };
+            return;
+        }
         if (std.mem.eql(u8, cmd, "daemon") or std.mem.eql(u8, cmd, "--daemon")) {
             return runDaemon(true);
         }
         // Unknown command - fall through to daemon mode
         std.debug.print("Unknown command: {s}\n", .{cmd});
-        std.debug.print("Usage: fasttab [daemon|show|index|hide]\n", .{});
+        std.debug.print("Usage: fasttab [daemon|show|index|hide|next|prev]\n", .{});
         std.process.exit(1);
     }
 
@@ -221,9 +249,14 @@ fn runDaemon(daemon_mode: bool) !void {
 /// Handle a command received from the socket
 fn handleSocketCommand(application: *app.App, cmd: socket.Command) void {
     switch (cmd) {
-        .show => |ids| {
-            log.info("Socket command: SHOW with {d} windows", .{ids.len});
-            application.showWithWindows(ids);
+        .show => |maybe_ids| {
+            if (maybe_ids) |ids| {
+                log.info("Socket command: SHOW with {d} windows", .{ids.len});
+                application.showWithWindows(ids);
+            } else {
+                log.info("Socket command: SHOW (all windows)", .{});
+                application.showAll();
+            }
         },
         .index => |idx| {
             log.info("Socket command: INDEX {d}", .{idx});
@@ -232,6 +265,14 @@ fn handleSocketCommand(application: *app.App, cmd: socket.Command) void {
         .hide => {
             log.info("Socket command: HIDE", .{});
             application.hideWindow();
+        },
+        .next => {
+            log.info("Socket command: NEXT", .{});
+            application.selectNext();
+        },
+        .prev => {
+            log.info("Socket command: PREV", .{});
+            application.selectPrev();
         },
     }
 }

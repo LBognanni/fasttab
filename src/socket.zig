@@ -15,12 +15,16 @@ pub const SocketError = error{
 
 /// Parsed socket command
 pub const Command = union(enum) {
-    /// Show switcher with specified window IDs in order
-    show: []const u32,
+    /// Show switcher with specified window IDs in order (null = show all)
+    show: ?[]const u32,
     /// Set selection to specified index
     index: usize,
     /// Hide the switcher window
     hide: void,
+    /// Move selection to next window (wraps around)
+    next: void,
+    /// Move selection to previous window (wraps around)
+    prev: void,
 };
 
 /// Unix socket server for receiving commands from CLI
@@ -114,7 +118,10 @@ pub const SocketServer = struct {
         }
 
         // Parse command type
-        if (std.mem.startsWith(u8, trimmed, "SHOW ")) {
+        if (std.mem.eql(u8, trimmed, "SHOW")) {
+            // SHOW with no IDs = show all windows
+            return ParsedCommand{ .command = .{ .show = null } };
+        } else if (std.mem.startsWith(u8, trimmed, "SHOW ")) {
             const ids_str = trimmed[5..];
             return self.parseShowCommand(ids_str);
         } else if (std.mem.startsWith(u8, trimmed, "INDEX ")) {
@@ -126,6 +133,10 @@ pub const SocketServer = struct {
             return ParsedCommand{ .command = .{ .index = idx } };
         } else if (std.mem.eql(u8, trimmed, "HIDE")) {
             return ParsedCommand{ .command = .{ .hide = {} } };
+        } else if (std.mem.eql(u8, trimmed, "NEXT")) {
+            return ParsedCommand{ .command = .{ .next = {} } };
+        } else if (std.mem.eql(u8, trimmed, "PREV")) {
+            return ParsedCommand{ .command = .{ .prev = {} } };
         }
 
         log.warn("Unknown command: {s}", .{trimmed});
@@ -159,7 +170,7 @@ pub const SocketServer = struct {
         }
 
         return ParsedCommand{
-            .command = .{ .show = ids },
+            .command = .{ .show = @as(?[]const u32, ids) },
             .owned_ids = ids,
         };
     }

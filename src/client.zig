@@ -19,6 +19,11 @@ pub fn sendShow(ids: []const u8) ClientError!void {
     try sendCommand(cmd);
 }
 
+/// Send SHOW command with no IDs (show all windows)
+pub fn sendShowAll() ClientError!void {
+    try sendCommand("SHOW\n");
+}
+
 /// Send INDEX command to set selection
 pub fn sendIndex(n: []const u8) ClientError!void {
     var buf: [64]u8 = undefined;
@@ -29,6 +34,16 @@ pub fn sendIndex(n: []const u8) ClientError!void {
 /// Send HIDE command to hide the switcher window
 pub fn sendHide() ClientError!void {
     try sendCommand("HIDE\n");
+}
+
+/// Send NEXT command to move selection forward
+pub fn sendNext() ClientError!void {
+    try sendCommand("NEXT\n");
+}
+
+/// Send PREV command to move selection backward
+pub fn sendPrev() ClientError!void {
+    try sendCommand("PREV\n");
 }
 
 /// Send a raw command to the daemon

@@ -186,16 +186,6 @@ pub const App = struct {
             }
         }
 
-        // In daemon mode, reopen window after delay
-        if (self.daemon_mode and self.window_hidden) {
-            if (self.window_close_time) |close_time| {
-                const elapsed = std.time.milliTimestamp() - close_time;
-                if (elapsed >= 4000) {
-                    self.showWindow();
-                }
-            }
-        }
-
         // Handle keyboard input (only when window is visible)
         if (!self.window_hidden and self.items.items.len > 0) {
             self.handleKeyboardInput();
@@ -289,6 +279,34 @@ pub const App = struct {
             self.selected_index = index;
         } else if (self.items.items.len > 0) {
             self.selected_index = self.items.items.len - 1;
+        }
+    }
+
+    /// Move selection to next window (wraps around)
+    pub fn selectNext(self: *Self) void {
+        if (self.items.items.len == 0) return;
+        self.selected_index = (self.selected_index + 1) % self.items.items.len;
+    }
+
+    /// Move selection to previous window (wraps around)
+    pub fn selectPrev(self: *Self) void {
+        if (self.items.items.len == 0) return;
+        if (self.selected_index == 0) {
+            self.selected_index = self.items.items.len - 1;
+        } else {
+            self.selected_index -= 1;
+        }
+    }
+
+    /// Show all known windows in default order
+    pub fn showAll(self: *Self) void {
+        // Reset selection to first item
+        self.selected_index = 0;
+        self.updateLayout();
+
+        // Show window if hidden
+        if (self.window_hidden) {
+            self.showWindow();
         }
     }
 
