@@ -14,7 +14,7 @@ const TestResult = struct {
 };
 
 // Use u32 as window ID type for testing
-const TestQueue = queue.Queue(TestResult, u32);
+const TestQueue = queue.Queue(TestResult);
 
 test "pop on empty queue returns null" {
     var q = TestQueue{};
@@ -74,53 +74,6 @@ test "shouldStop initially returns false" {
     defer q.deinit();
 
     try testing.expectEqual(false, q.shouldStop());
-}
-
-test "setOurWindowId and getOurWindowId" {
-    var q = TestQueue{};
-    defer q.deinit();
-
-    // Initially 0
-    try testing.expectEqual(@as(u32, 0), q.getOurWindowId());
-
-    q.setOurWindowId(12345);
-    try testing.expectEqual(@as(u32, 12345), q.getOurWindowId());
-
-    q.setOurWindowId(67890);
-    try testing.expectEqual(@as(u32, 67890), q.getOurWindowId());
-}
-
-test "waitForOurWindowId returns true when ID set" {
-    var q = TestQueue{};
-    defer q.deinit();
-
-    q.setOurWindowId(123);
-    const result = q.waitForOurWindowId(100);
-
-    try testing.expectEqual(true, result);
-}
-
-test "waitForOurWindowId returns false on timeout when ID not set" {
-    var q = TestQueue{};
-    defer q.deinit();
-
-    // ID is 0, should timeout
-    const start = std.time.milliTimestamp();
-    const result = q.waitForOurWindowId(50);
-    const elapsed = std.time.milliTimestamp() - start;
-
-    try testing.expectEqual(false, result);
-    try testing.expect(elapsed >= 50);
-}
-
-test "waitForOurWindowId returns false when stop requested" {
-    var q = TestQueue{};
-    defer q.deinit();
-
-    q.requestStop();
-    const result = q.waitForOurWindowId(1000);
-
-    try testing.expectEqual(false, result);
 }
 
 test "popBlocking returns null on timeout" {
@@ -191,7 +144,7 @@ const SimpleResult = struct {
     value: u32,
 };
 
-const SimpleQueue = queue.Queue(SimpleResult, u32);
+const SimpleQueue = queue.Queue(SimpleResult);
 
 test "queue works with type without deinit" {
     var q = SimpleQueue{};

@@ -38,10 +38,11 @@ pub const App = struct {
     font: rl.Font,
     monitor: MonitorInfo,
     window_hidden: bool,
-    window_close_time: ?i64,
     daemon_mode: bool,
     should_quit: bool,
     update_queue: ?*worker.UpdateQueue,
+    xcb_conn: *x11.xcb.xcb_connection_t,
+    xcb_root: x11.xcb.xcb_window_t,
 
     const Self = @This();
 
@@ -52,6 +53,8 @@ pub const App = struct {
         mouse_pos: x11.MousePosition,
         daemon_mode: bool,
         update_queue: ?*worker.UpdateQueue,
+        xcb_conn: *x11.xcb.xcb_connection_t,
+        xcb_root: x11.xcb.xcb_window_t,
     ) !Self {
         // Build initial window items from worker result
         var items = std.ArrayList(ui.WindowItem).init(allocator);
@@ -92,7 +95,7 @@ pub const App = struct {
         // Calculate initial layout
         const layout = ui.calculateGridLayout(items.items, ui.THUMBNAIL_HEIGHT);
 
-        // Initialize raylib window
+        // Create raylib window
         rl.SetConfigFlags(rl.FLAG_WINDOW_UNDECORATED | rl.FLAG_WINDOW_TRANSPARENT | rl.FLAG_WINDOW_TOPMOST);
         rl.SetTraceLogLevel(rl.LOG_WARNING);
         rl.InitWindow(@intCast(layout.total_width), @intCast(layout.total_height), "FastTab");
@@ -109,11 +112,10 @@ pub const App = struct {
         // Find monitor containing mouse cursor
         const monitor = findMonitorAtPosition(mouse_pos);
 
-        // Center window on the target monitor
+        // Non-daemon mode: center window on monitor
         const win_x = monitor.x + @divTrunc(monitor.width - @as(i32, @intCast(layout.total_width)), 2);
         const win_y = monitor.y + @divTrunc(monitor.height - @as(i32, @intCast(layout.total_height)), 2);
         rl.SetWindowPosition(win_x, win_y);
-
         log.info("App initialized: {d} windows, monitor {d} at ({d},{d})", .{
             items.items.len,
             monitor.index,
@@ -129,23 +131,22 @@ pub const App = struct {
             .font = font,
             .monitor = monitor,
             .window_hidden = false,
-            .window_close_time = null,
             .daemon_mode = daemon_mode,
             .should_quit = false,
             .update_queue = update_queue,
+            .xcb_conn = xcb_conn,
+            .xcb_root = xcb_root,
         };
     }
 
     /// Clean up all resources
     pub fn deinit(self: *Self) void {
-        // Unload resources (only if window is still open)
-        if (!self.window_hidden) {
-            for (self.items.items) |*item| {
-                rl.UnloadTexture(item.texture);
-            }
-            rl.UnloadFont(self.font);
-            rl.CloseWindow();
+        // Unload textures and close window (window stays open even when "hidden")
+        for (self.items.items) |*item| {
+            rl.UnloadTexture(item.texture);
         }
+        rl.UnloadFont(self.font);
+        rl.CloseWindow();
 
         // Free item data
         for (self.items.items) |*item| {
@@ -172,42 +173,79 @@ pub const App = struct {
         return self.current_layout;
     }
 
+    /// Get the X11 window ID of the raylib window
+    pub fn getWindowId(self: *const Self) x11.xcb.xcb_window_t {
+        _ = self;
+        const handle_ptr = rl.GetWindowHandle();
+        if (handle_ptr == null) {
+            log.err("GetWindowHandle returned null", .{});
+            return 0;
+        }
+
+        // Debug: print raw pointer and first bytes
+        const ptr_bytes: [*]const u8 = @ptrCast(handle_ptr);
+        log.debug("GetWindowHandle ptr: {*}, bytes: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}", .{
+            handle_ptr,
+            ptr_bytes[0],
+            ptr_bytes[1],
+            ptr_bytes[2],
+            ptr_bytes[3],
+            ptr_bytes[4],
+            ptr_bytes[5],
+            ptr_bytes[6],
+            ptr_bytes[7],
+        });
+
+        // Try reading as u32 (xcb_window_t size)
+        var window_id_32: u32 = 0;
+        @memcpy(std.mem.asBytes(&window_id_32), ptr_bytes[0..4]);
+        log.debug("As u32: {d}", .{window_id_32});
+
+        // Try reading as c_ulong (X11 Window type)
+        var window_id_64: c_ulong = 0;
+        @memcpy(std.mem.asBytes(&window_id_64), ptr_bytes[0..@sizeOf(c_ulong)]);
+        log.debug("As c_ulong: {d}", .{window_id_64});
+
+        if (window_id_32 != 0) {
+            return window_id_32;
+        }
+        return @intCast(window_id_64);
+    }
+
     /// Process one frame: handle input, check for window close, render
     pub fn update(self: *Self) void {
+        if (self.window_hidden) {
+            // In daemon mode with hidden window, skip input/rendering
+            std.time.sleep(16 * std.time.ns_per_ms);
+            return;
+        }
+
         // Check if window should close
-        if (!self.window_hidden) {
-            if (rl.WindowShouldClose() or (self.items.items.len > 0 and rl.IsKeyPressed(rl.KEY_ESCAPE))) {
-                if (self.daemon_mode) {
-                    self.hideWindow();
-                } else {
-                    self.should_quit = true;
-                    return;
-                }
+        if (rl.WindowShouldClose() or (self.items.items.len > 0 and rl.IsKeyPressed(rl.KEY_ESCAPE))) {
+            if (self.daemon_mode) {
+                log.info("Hiding window due ESC being pressed", .{});
+                self.hideWindow();
+            } else {
+                self.should_quit = true;
+                return;
             }
         }
 
-        // Handle keyboard input (only when window is visible)
-        if (!self.window_hidden and self.items.items.len > 0) {
-            self.handleKeyboardInput();
-        }
+        // Handle keyboard input
+        self.handleKeyboardInput();
 
         // Render or sleep
-        if (!self.window_hidden) {
-            self.render();
-        } else {
-            // In daemon mode with hidden window, sleep briefly to avoid busy loop
-            std.time.sleep(16 * std.time.ns_per_ms);
-        }
+        self.render();
     }
 
     /// Process an update from the background worker
     pub fn processWorkerUpdate(self: *Self, update_result: *worker.RefreshResult) void {
-        if (self.window_hidden) {
-            log.debug("Processing update while hidden: {d} current windows, {d} updates", .{
-                update_result.current_window_ids.items.len,
-                update_result.updates.items.len,
-            });
-        }
+        // if (self.window_hidden) {
+        //     log.debug("Processing update while hidden: {d} current windows, {d} updates", .{
+        //         update_result.current_window_ids.items.len,
+        //         update_result.updates.items.len,
+        //     });
+        // }
 
         // Build set of current window IDs
         var current_window_set = std.AutoHashMap(x11.xcb.xcb_window_t, void).init(self.allocator);
@@ -264,13 +302,9 @@ pub const App = struct {
                 self.items.append(item) catch continue;
             }
             self.selected_index = 0;
-            self.updateLayout();
         }
 
-        // Show window if hidden
-        if (self.window_hidden) {
-            self.showWindow();
-        }
+        self.showWindow();
     }
 
     /// Set the selected index (for INDEX command)
@@ -302,12 +336,7 @@ pub const App = struct {
     pub fn showAll(self: *Self) void {
         // Reset selection to first item
         self.selected_index = 0;
-        self.updateLayout();
-
-        // Show window if hidden
-        if (self.window_hidden) {
-            self.showWindow();
-        }
+        self.showWindow();
     }
 
     /// Hide the switcher window (public for socket commands)
@@ -319,16 +348,9 @@ pub const App = struct {
             queue.setWindowVisible(false);
         }
 
-        // Unload all textures before closing window
-        for (self.items.items) |*item| {
-            rl.UnloadTexture(item.texture);
-            item.texture = rl.Texture2D{};
-        }
-        rl.UnloadFont(self.font);
-        rl.CloseWindow();
+        rl.SetWindowState(rl.FLAG_WINDOW_HIDDEN);
 
         self.window_hidden = true;
-        self.window_close_time = std.time.milliTimestamp();
     }
 
     /// Show the switcher window (public for socket commands)
@@ -340,34 +362,30 @@ pub const App = struct {
             queue.setWindowVisible(true);
         }
 
-        // Recalculate layout in case windows changed
+        // Recalculate layout and resize window if needed
+        const prev_layout = self.current_layout;
         self.current_layout = ui.calculateGridLayout(self.items.items, ui.THUMBNAIL_HEIGHT);
 
-        // Reinitialize raylib window
-        rl.SetConfigFlags(rl.FLAG_WINDOW_UNDECORATED | rl.FLAG_WINDOW_TRANSPARENT | rl.FLAG_WINDOW_TOPMOST);
-        rl.SetTraceLogLevel(rl.LOG_WARNING);
-        rl.InitWindow(@intCast(self.current_layout.total_width), @intCast(self.current_layout.total_height), "FastTab");
-        rl.SetTargetFPS(60);
-
-        // Reload font
-        self.font = ui.loadSystemFont(ui.TITLE_FONT_SIZE * 2);
-
-        // Reload textures for all items
-        for (self.items.items) |*item| {
-            if (item.thumbnail.data.len > 0) {
-                item.texture = ui.loadTextureFromThumbnail(&item.thumbnail);
-            } else {
-                item.texture = rl.Texture2D{};
-            }
+        if (self.current_layout.total_width != prev_layout.total_width or
+            self.current_layout.total_height != prev_layout.total_height)
+        {
+            rl.SetWindowSize(@intCast(self.current_layout.total_width), @intCast(self.current_layout.total_height));
         }
+
+        // Query current mouse position and find monitor
+        const mouse_pos = x11.getMousePosition(self.xcb_conn, self.xcb_root);
+        self.monitor = findMonitorAtPosition(mouse_pos);
 
         // Center window on monitor
         const win_x = self.monitor.x + @divTrunc(self.monitor.width - @as(i32, @intCast(self.current_layout.total_width)), 2);
         const win_y = self.monitor.y + @divTrunc(self.monitor.height - @as(i32, @intCast(self.current_layout.total_height)), 2);
         rl.SetWindowPosition(win_x, win_y);
 
+        // Show the window and focus it
+        rl.ClearWindowState(rl.FLAG_WINDOW_HIDDEN);
+        rl.SetWindowFocused();
+
         self.window_hidden = false;
-        self.window_close_time = null;
     }
 
     // === Private methods ===
@@ -405,9 +423,6 @@ pub const App = struct {
         for (self.items.items, 0..) |item, idx| {
             if (!current_window_set.contains(item.id)) {
                 to_remove.append(idx) catch {};
-                if (self.window_hidden) {
-                    log.debug("Will remove window {d}: {s}", .{ item.id, item.title });
-                }
             }
         }
 
@@ -418,9 +433,7 @@ pub const App = struct {
             const idx = to_remove.items[remove_idx];
             const item = &self.items.items[idx];
 
-            if (!self.window_hidden) {
-                rl.UnloadTexture(item.texture);
-            }
+            rl.UnloadTexture(item.texture);
             item.thumbnail.deinit();
             if (!std.mem.eql(u8, item.title, "(unknown)")) {
                 self.allocator.free(item.title);
@@ -461,16 +474,13 @@ pub const App = struct {
             .allocator = upd.allocator,
         };
 
-        // Update thumbnail data
+        // Update thumbnail data and texture
         item.thumbnail.deinit();
         item.thumbnail = new_thumb;
 
-        // Only update texture if window is visible
-        if (!self.window_hidden) {
-            const new_texture = ui.loadTextureFromThumbnail(&new_thumb);
-            rl.UnloadTexture(item.texture);
-            item.texture = new_texture;
-        }
+        const new_texture = ui.loadTextureFromThumbnail(&new_thumb);
+        rl.UnloadTexture(item.texture);
+        item.texture = new_texture;
 
         // Transfer ownership
         upd.thumbnail_data = &[_]u8{};
@@ -484,11 +494,7 @@ pub const App = struct {
             .allocator = upd.allocator,
         };
 
-        // Only create texture if window is visible
-        const texture = if (!self.window_hidden)
-            ui.loadTextureFromThumbnail(&new_thumb)
-        else
-            rl.Texture2D{};
+        const texture = ui.loadTextureFromThumbnail(&new_thumb);
 
         const new_item = ui.WindowItem{
             .id = upd.window_id,
@@ -500,15 +506,11 @@ pub const App = struct {
         };
 
         self.items.append(new_item) catch {
-            if (!self.window_hidden) rl.UnloadTexture(texture);
+            rl.UnloadTexture(texture);
             return;
         };
 
-        if (self.window_hidden) {
-            log.debug("Added new window {d}: {s} (hidden)", .{ new_item.id, new_item.title });
-        } else {
-            log.debug("Added new window {d}: {s}", .{ new_item.id, new_item.title });
-        }
+        log.debug("Added new window {d}: {s}", .{ new_item.id, new_item.title });
 
         // Transfer ownership
         upd.thumbnail_data = &[_]u8{};

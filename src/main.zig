@@ -156,40 +156,48 @@ fn runDaemon(daemon_mode: bool) !void {
     // Get mouse position BEFORE initializing raylib
     const mouse_pos = x11.getMousePosition(conn.conn, conn.root);
 
-    // In daemon mode, wait before showing window
     if (daemon_mode) {
-        try stdout.print("Daemon mode: background worker running, waiting 2 seconds before showing window...\n", .{});
-        std.time.sleep(2 * std.time.ns_per_s);
-        try stdout.print("Initializing window...\n", .{});
-    }
+        // Daemon mode: window created but hidden
+        var application = try app.App.init(allocator, &initial_result, mouse_pos, daemon_mode, &update_queue, conn.conn, conn.root);
+        defer application.deinit();
+        application.hideWindow();
 
-    // Save window list before creating raylib window (to detect our own window ID)
-    const windows_before_raylib = try x11.getWindowList(conn.conn, conn.root, conn.atoms);
-    var pre_raylib_windows = std.AutoHashMap(x11.xcb.xcb_window_t, void).init(allocator);
-    defer pre_raylib_windows.deinit();
-    for (windows_before_raylib) |wid| {
-        try pre_raylib_windows.put(wid, {});
-    }
+        try stdout.print("Daemon mode: {d} windows tracked, waiting for commands...\n", .{application.windowCount()});
 
-    // Initialize the application
-    var application = try app.App.init(allocator, &initial_result, mouse_pos, daemon_mode, &update_queue);
-    defer application.deinit();
+        // Main loop with poll-based event handling
+        var pollfds = [_]std.posix.pollfd{
+            .{ .fd = sock_server.getFd(), .events = std.posix.POLL.IN, .revents = 0 },
+        };
 
-    // Find our own window ID
-    conn.flush();
-    std.time.sleep(50 * std.time.ns_per_ms);
-    const windows_after_raylib = x11.getWindowList(conn.conn, conn.root, conn.atoms) catch &[_]x11.xcb.xcb_window_t{};
-    var our_window_id: x11.xcb.xcb_window_t = 0;
-    for (windows_after_raylib) |wid| {
-        if (!pre_raylib_windows.contains(wid)) {
-            our_window_id = wid;
-            log.info("Detected our window ID: {d}", .{our_window_id});
-            break;
+        while (application.isRunning()) {
+            _ = std.posix.poll(&pollfds, 16) catch {};
+
+            if (pollfds[0].revents & std.posix.POLL.IN != 0) {
+                if (sock_server.acceptAndRead()) |*parsed_cmd| {
+                    defer @constCast(parsed_cmd).deinit(allocator);
+                    handleSocketCommand(&application, parsed_cmd.command);
+                }
+            }
+
+            if (update_queue.pop()) |*update_result| {
+                defer @constCast(update_result).deinit();
+                application.processWorkerUpdate(@constCast(update_result));
+            }
+
+            application.update();
         }
+
+        update_queue.requestStop();
+        worker_thread.join();
+        update_queue.deinit();
+
+        try stdout.print("Daemon stopped.\n", .{});
+        return;
     }
 
-    // Set our window ID in the update queue
-    update_queue.setOurWindowId(our_window_id);
+    // Non-daemon mode: window already visible
+    var application = try app.App.init(allocator, &initial_result, mouse_pos, daemon_mode, &update_queue, conn.conn, conn.root);
+    defer application.deinit();
 
     const layout = application.getLayout();
     try stdout.print("Grid layout: {d} cols x {d} rows, window size: {d}x{d}\n", .{
@@ -205,11 +213,7 @@ fn runDaemon(daemon_mode: bool) !void {
         application.monitor.index,
     });
 
-    if (daemon_mode) {
-        try stdout.print("Displaying {d} windows in switcher (daemon mode - closing window will keep process running).\n", .{application.windowCount()});
-    } else {
-        try stdout.print("Displaying {d} windows in switcher. Press ESC or close window to exit.\n", .{application.windowCount()});
-    }
+    try stdout.print("Displaying {d} windows in switcher. Press ESC or close window to exit.\n", .{application.windowCount()});
 
     // Main loop with poll-based event handling
     var pollfds = [_]std.posix.pollfd{

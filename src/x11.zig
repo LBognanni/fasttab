@@ -11,6 +11,49 @@ pub const xcb = @cImport({
 
 const log = std.log.scoped(.fasttab);
 
+// Cached current process PID (computed once)
+var cached_current_pid: ?std.posix.pid_t = null;
+
+fn getCurrentPid() std.posix.pid_t {
+    if (cached_current_pid) |pid| {
+        return pid;
+    }
+    const pid = std.os.linux.getpid();
+    cached_current_pid = pid;
+    return pid;
+}
+
+/// Cache for window -> PID mappings
+pub const PidCache = struct {
+    map: std.AutoHashMap(xcb.xcb_window_t, std.posix.pid_t),
+
+    pub fn init(allocator: std.mem.Allocator) PidCache {
+        return .{
+            .map = std.AutoHashMap(xcb.xcb_window_t, std.posix.pid_t).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *PidCache) void {
+        self.map.deinit();
+    }
+
+    pub fn get(self: *PidCache, window: xcb.xcb_window_t) ?std.posix.pid_t {
+        return self.map.get(window);
+    }
+
+    pub fn put(self: *PidCache, window: xcb.xcb_window_t, pid: std.posix.pid_t) void {
+        self.map.put(window, pid) catch {};
+    }
+
+    pub fn remove(self: *PidCache, window: xcb.xcb_window_t) void {
+        _ = self.map.remove(window);
+    }
+
+    pub fn clear(self: *PidCache) void {
+        self.map.clearRetainingCapacity();
+    }
+};
+
 pub const X11Error = error{
     ConnectionFailed,
     ConnectionError,
@@ -40,6 +83,7 @@ pub const Atoms = struct {
     net_wm_state_hidden: xcb.xcb_atom_t,
     net_current_desktop: xcb.xcb_atom_t,
     net_wm_desktop: xcb.xcb_atom_t,
+    net_wm_pid: xcb.xcb_atom_t,
 };
 
 pub const MousePosition = struct {
@@ -144,6 +188,7 @@ pub fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
         .net_wm_state_hidden = try internAtom(conn, "_NET_WM_STATE_HIDDEN"),
         .net_current_desktop = try internAtom(conn, "_NET_CURRENT_DESKTOP"),
         .net_wm_desktop = try internAtom(conn, "_NET_WM_DESKTOP"),
+        .net_wm_pid = try internAtom(conn, "_NET_WM_PID"),
     };
 }
 
@@ -457,4 +502,66 @@ pub fn captureRawImage(
         .depth = depth,
         .allocator = allocator,
     };
+}
+
+/// Get the PID of the process that owns a window (uncached version)
+fn getWindowPidUncached(conn: *xcb.xcb_connection_t, window: xcb.xcb_window_t, atoms: Atoms) ?std.posix.pid_t {
+    const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_pid, xcb.XCB_ATOM_CARDINAL, 0, 1);
+    const reply = xcb.xcb_get_property_reply(conn, cookie, null);
+    if (reply == null) {
+        return null;
+    }
+    defer std.c.free(reply);
+
+    const len = xcb.xcb_get_property_value_length(reply);
+    if (len < @sizeOf(u32)) {
+        return null;
+    }
+
+    const data: *const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
+    return @intCast(data.*);
+}
+
+/// Get the PID of the process that owns a window (cached version)
+pub fn getWindowPid(
+    conn: *xcb.xcb_connection_t,
+    window: xcb.xcb_window_t,
+    atoms: Atoms,
+    cache: ?*PidCache,
+) ?std.posix.pid_t {
+    // Check cache first
+    if (cache) |c| {
+        if (c.get(window)) |pid| {
+            return pid;
+        }
+    }
+
+    // Query X11
+    const pid = getWindowPidUncached(conn, window, atoms) orelse return null;
+
+    // Store in cache
+    if (cache) |c| {
+        c.put(window, pid);
+    }
+
+    return pid;
+}
+
+/// Check if a window was spawned by the current executable
+/// Compares the executable path of the window's process with the current process
+pub fn isCurrentExecutable(
+    conn: *xcb.xcb_connection_t,
+    window: xcb.xcb_window_t,
+    atoms: Atoms,
+    pidCache: ?*PidCache,
+) bool {
+    const window_pid = getWindowPid(conn, window, atoms, pidCache) orelse return false;
+    const current_pid = getCurrentPid();
+
+    // Quick check: same PID means same process
+    if (window_pid == current_pid) {
+        return true;
+    }
+
+    return false;
 }

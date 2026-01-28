@@ -5,8 +5,6 @@ const thumbnail = @import("thumbnail.zig");
 const log = std.log.scoped(.fasttab);
 
 pub const ScanOptions = struct {
-    /// Window ID to exclude from scanning (e.g., our own window)
-    exclude_window_id: x11.xcb.xcb_window_t = 0,
     /// Windows we already have thumbnails for - used to skip re-capturing minimized windows
     known_windows: ?[]const x11.xcb.xcb_window_t = null,
     /// When true, only capture NEW windows (skip all known windows, not just minimized)
@@ -77,11 +75,7 @@ const ProcessResult = struct {
 /// - Filters windows by type and current desktop
 /// - Captures thumbnails in parallel (if enabled)
 /// - Skips re-capturing minimized windows that are already known
-pub fn scanAndProcess(
-    allocator: std.mem.Allocator,
-    conn: *x11.Connection,
-    options: ScanOptions,
-) !ScanResult {
+pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, options: ScanOptions, pidCache: ?*x11.PidCache) !ScanResult {
     // Build a set of known windows for fast lookup
     var known_set = std.AutoHashMap(x11.xcb.xcb_window_t, void).init(allocator);
     defer known_set.deinit();
@@ -119,8 +113,9 @@ pub fn scanAndProcess(
     for (windows) |window_id| {
         stats.total += 1;
 
-        // Skip our own window
-        if (window_id == options.exclude_window_id) continue;
+        if (x11.isCurrentExecutable(conn.conn, window_id, conn.atoms, pidCache)) {
+            continue;
+        }
 
         // Filter by window type
         if (!x11.shouldShowWindow(conn.conn, window_id, conn.atoms)) {

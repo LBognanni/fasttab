@@ -49,7 +49,6 @@ pub const UpdateQueue = struct {
     mutex: std.Thread.Mutex = .{},
     pending_result: ?RefreshResult = null,
     should_stop: bool = false,
-    our_window_id: x11.xcb.xcb_window_t = 0,
     window_visible: bool = true, // Whether the app window is currently visible
 
     pub fn push(self: *UpdateQueue, result: RefreshResult) void {
@@ -85,18 +84,6 @@ pub const UpdateQueue = struct {
         return self.should_stop;
     }
 
-    pub fn setOurWindowId(self: *UpdateQueue, id: x11.xcb.xcb_window_t) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.our_window_id = id;
-    }
-
-    pub fn getOurWindowId(self: *UpdateQueue) x11.xcb.xcb_window_t {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.our_window_id;
-    }
-
     pub fn setWindowVisible(self: *UpdateQueue, visible: bool) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -107,28 +94,6 @@ pub const UpdateQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.window_visible;
-    }
-
-    /// Wait for our window ID to be set (non-zero). Returns true if set, false if stop requested.
-    pub fn waitForOurWindowId(self: *UpdateQueue, timeout_ms: u64) bool {
-        const start = std.time.milliTimestamp();
-
-        while (true) {
-            if (self.getOurWindowId() != 0) {
-                return true;
-            }
-
-            if (self.shouldStop()) {
-                return false;
-            }
-
-            const elapsed = std.time.milliTimestamp() - start;
-            if (elapsed >= @as(i64, @intCast(timeout_ms))) {
-                return false;
-            }
-
-            std.time.sleep(10 * std.time.ns_per_ms);
-        }
     }
 
     /// Clean up any pending result that was never consumed
@@ -189,6 +154,11 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
     defer known_list.deinit();
 
     var is_first_scan = true;
+    var pidCache = x11.PidCache.init(allocator);
+    defer pidCache.deinit();
+
+    const ourPid = std.os.linux.getpid();
+    log.debug("Background worker: Our PID is {d}", .{ourPid});
 
     // Main worker loop
     while (!queue.shouldStop()) {
@@ -198,17 +168,6 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
         }
 
         if (queue.shouldStop()) break;
-
-        // After first scan, wait for our window ID to be set before continuing
-        // This prevents us from including the FastTab window in scan results
-        if (!is_first_scan and queue.getOurWindowId() == 0) {
-            log.debug("Background worker: Waiting for our window ID to be set...", .{});
-            if (!queue.waitForOurWindowId(10000)) {
-                log.warn("Background worker: Timeout waiting for window ID, continuing anyway", .{});
-            }
-        }
-
-        const our_window_id = queue.getOurWindowId();
 
         // Build known window list for scanner
         known_list.clearRetainingCapacity();
@@ -224,17 +183,12 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
         const window_visible = queue.isWindowVisible();
         const capture_only_new = !is_first_scan and !window_visible;
 
-        if (capture_only_new) {
-            log.debug("Background worker: Hidden mode - only capturing new windows", .{});
-        }
-
         // Use window_scanner for parallel processing
         var scan_result = window_scanner.scanAndProcess(allocator, &conn, .{
-            .exclude_window_id = our_window_id,
             .known_windows = if (known_list.items.len > 0) known_list.items else null,
             .capture_only_new = capture_only_new,
             .parallel_processing = true,
-        }) catch |err| {
+        }, &pidCache) catch |err| {
             log.warn("Background worker: Scan failed: {}", .{err});
             continue;
         };
@@ -285,10 +239,10 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
         }
 
         queue.push(result);
-        log.debug("Background worker: {d} windows, {d} thumbnails", .{
-            scan_result.window_ids.items.len,
-            scan_result.items.items.len,
-        });
+        // log.debug("Background worker: {d} windows, {d} thumbnails", .{
+        //     scan_result.window_ids.items.len,
+        //     scan_result.items.items.len,
+        // });
 
         is_first_scan = false;
     }
