@@ -1,0 +1,16 @@
+{
+    "KPlugin": {
+        "Id": "fasttab",
+        "Name": "FastTab",
+        "Description": "High-performance window switcher with thumbnail previews",
+        "Icon": "preferences-system-windows",
+        "Authors": [
+            {
+                "Name": "FastTab"
+            }
+        ],
+        "License": "MIT",
+        "Version": "1.0"
+    },
+    "KPackageStructure": "KWin/WindowSwitcher"
+}

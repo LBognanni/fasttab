@@ -59,11 +59,13 @@ fasttab/
 │   └── stb_image_write.h     # STB header for PNG writing
 ├── lib/                      # Downloaded dependencies (gitignored)
 │   └── raylib-5.5_linux_amd64/
-├── qml/                      # (Future) KDE plugin
+├── qml/                      # KDE plugin (Milestone 8)
 │   └── fasttab/
-│       ├── metadata.json
+│       ├── metadata.desktop  # Plugin metadata (Plasma 5)
+│       ├── metadata.json     # Plugin metadata (Plasma 6)
 │       └── contents/ui/
-│           └── main.qml
+│           ├── main.qml      # Main QML (Plasma 5)
+│           └── main-plasma6.qml  # Plasma 6 version
 ├── build.zig                 # Zig build script
 ├── setup.sh                  # Developer setup script (downloads raylib)
 └── spec.md                   # Full project specification
