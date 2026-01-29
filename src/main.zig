@@ -2,115 +2,33 @@ const std = @import("std");
 const x11 = @import("x11.zig");
 const worker = @import("worker.zig");
 const app = @import("app.zig");
-const client = @import("client.zig");
-const socket = @import("socket.zig");
 
 const log = std.log.scoped(.fasttab);
 
 pub fn main() !void {
-    // Fast path: check for CLI commands before any heavy initialization
-    // This enables <5ms response time for show/index/hide commands
     var args_iter = std.process.args();
     _ = args_iter.next(); // skip program name
 
     if (args_iter.next()) |cmd| {
-        if (std.mem.eql(u8, cmd, "show")) {
-            // show with optional window IDs
-            if (args_iter.next()) |ids| {
-                client.sendShow(ids) catch |err| {
-                    switch (err) {
-                        client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
-                        else => std.debug.print("Error: failed to send command\n", .{}),
-                    }
-                    std.process.exit(1);
-                };
-            } else {
-                // No IDs - show all windows
-                client.sendShowAll() catch |err| {
-                    switch (err) {
-                        client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
-                        else => std.debug.print("Error: failed to send command\n", .{}),
-                    }
-                    std.process.exit(1);
-                };
-            }
-            return;
-        }
-        if (std.mem.eql(u8, cmd, "index")) {
-            const n = args_iter.next() orelse {
-                std.debug.print("Usage: fasttab index <n>\n", .{});
-                std.process.exit(1);
-            };
-            client.sendIndex(n) catch |err| {
-                switch (err) {
-                    client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
-                    else => std.debug.print("Error: failed to send command\n", .{}),
-                }
-                std.process.exit(1);
-            };
-            return;
-        }
-        if (std.mem.eql(u8, cmd, "hide")) {
-            client.sendHide() catch |err| {
-                switch (err) {
-                    client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
-                    else => std.debug.print("Error: failed to send command\n", .{}),
-                }
-                std.process.exit(1);
-            };
-            return;
-        }
-        if (std.mem.eql(u8, cmd, "next")) {
-            client.sendNext() catch |err| {
-                switch (err) {
-                    client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
-                    else => std.debug.print("Error: failed to send command\n", .{}),
-                }
-                std.process.exit(1);
-            };
-            return;
-        }
-        if (std.mem.eql(u8, cmd, "prev")) {
-            client.sendPrev() catch |err| {
-                switch (err) {
-                    client.ClientError.SocketNotFound => std.debug.print("Error: daemon not running (socket not found)\n", .{}),
-                    else => std.debug.print("Error: failed to send command\n", .{}),
-                }
-                std.process.exit(1);
-            };
-            return;
-        }
         if (std.mem.eql(u8, cmd, "daemon") or std.mem.eql(u8, cmd, "--daemon")) {
-            return runDaemon(true);
+            return runDaemon();
         }
-        // Unknown command - fall through to daemon mode
         std.debug.print("Unknown command: {s}\n", .{cmd});
-        std.debug.print("Usage: fasttab [daemon|show|index|hide|next|prev]\n", .{});
+        std.debug.print("Usage: fasttab [daemon]\n", .{});
         std.process.exit(1);
     }
 
-    // No arguments - run in non-daemon mode (legacy behavior)
-    return runDaemon(false);
+    // No arguments - run daemon
+    return runDaemon();
 }
 
-/// Run the daemon (full initialization with X11, raylib, socket server)
-fn runDaemon(daemon_mode: bool) !void {
+/// Run the daemon with XCB key grabbing
+fn runDaemon() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-
-    if (daemon_mode) {
-        try stdout.print("Starting in daemon mode...\n", .{});
-    }
-
-    // Initialize socket server (before any other resources for early binding)
-    var sock_server = socket.SocketServer.init(allocator) catch |err| {
-        log.err("Failed to initialize socket server: {}", .{err});
-        return err;
-    };
-    defer sock_server.deinit();
 
     // Connect to X11
     var conn = try x11.Connection.init();
@@ -120,6 +38,10 @@ fn runDaemon(daemon_mode: bool) !void {
     const event_mask = [_]u32{x11.xcb.XCB_EVENT_MASK_PROPERTY_CHANGE};
     _ = x11.xcb.xcb_change_window_attributes(conn.conn, conn.root, x11.xcb.XCB_CW_EVENT_MASK, &event_mask);
     conn.flush();
+
+    // Grab Alt+Tab passively
+    x11.grabAltTab(conn.conn, conn.root);
+    defer x11.ungrabAltTab(conn.conn, conn.root);
 
     // Create update queue and start background worker
     var update_queue = worker.UpdateQueue{};
@@ -156,80 +78,26 @@ fn runDaemon(daemon_mode: bool) !void {
     // Get mouse position BEFORE initializing raylib
     const mouse_pos = x11.getMousePosition(conn.conn, conn.root);
 
-    if (daemon_mode) {
-        // Daemon mode: window created but hidden
-        var application = try app.App.init(allocator, &initial_result, mouse_pos, daemon_mode, &update_queue, conn.conn, conn.root);
-        defer application.deinit();
-        application.hideWindow();
-
-        try stdout.print("Daemon mode: {d} windows tracked, waiting for commands...\n", .{application.windowCount()});
-
-        // Main loop with poll-based event handling
-        var pollfds = [_]std.posix.pollfd{
-            .{ .fd = sock_server.getFd(), .events = std.posix.POLL.IN, .revents = 0 },
-        };
-
-        while (application.isRunning()) {
-            _ = std.posix.poll(&pollfds, 16) catch {};
-
-            if (pollfds[0].revents & std.posix.POLL.IN != 0) {
-                if (sock_server.acceptAndRead()) |*parsed_cmd| {
-                    defer @constCast(parsed_cmd).deinit(allocator);
-                    handleSocketCommand(&application, parsed_cmd.command);
-                }
-            }
-
-            if (update_queue.pop()) |*update_result| {
-                defer @constCast(update_result).deinit();
-                application.processWorkerUpdate(@constCast(update_result));
-            }
-
-            application.update();
-        }
-
-        update_queue.requestStop();
-        worker_thread.join();
-        update_queue.deinit();
-
-        try stdout.print("Daemon stopped.\n", .{});
-        return;
-    }
-
-    // Non-daemon mode: window already visible
-    var application = try app.App.init(allocator, &initial_result, mouse_pos, daemon_mode, &update_queue, conn.conn, conn.root);
+    // Initialize app in daemon mode (window created but hidden)
+    var application = try app.App.init(allocator, &initial_result, mouse_pos, true, &update_queue, conn.conn, conn.root, conn.atoms);
     defer application.deinit();
+    application.hideWindow();
 
-    const layout = application.getLayout();
-    try stdout.print("Grid layout: {d} cols x {d} rows, window size: {d}x{d}\n", .{
-        layout.columns,
-        layout.rows,
-        layout.total_width,
-        layout.total_height,
-    });
+    try stdout.print("Daemon ready: {d} windows tracked, Alt+Tab grabbed.\n", .{application.windowCount()});
 
-    try stdout.print("Mouse at ({d}, {d}), using monitor {d}\n", .{
-        mouse_pos.x,
-        mouse_pos.y,
-        application.monitor.index,
-    });
-
-    try stdout.print("Displaying {d} windows in switcher. Press ESC or close window to exit.\n", .{application.windowCount()});
-
-    // Main loop with poll-based event handling
+    // Main loop: poll on XCB file descriptor
+    const xcb_fd = x11.getXcbFd(conn.conn);
     var pollfds = [_]std.posix.pollfd{
-        .{ .fd = sock_server.getFd(), .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = xcb_fd, .events = std.posix.POLL.IN, .revents = 0 },
     };
 
     while (application.isRunning()) {
-        // Poll for socket events (16ms timeout ~= 60fps)
+        // Poll for XCB events (16ms timeout ~= 60fps)
         _ = std.posix.poll(&pollfds, 16) catch {};
 
-        // Check for socket commands
+        // Process XCB events (key press/release)
         if (pollfds[0].revents & std.posix.POLL.IN != 0) {
-            if (sock_server.acceptAndRead()) |*parsed_cmd| {
-                defer @constCast(parsed_cmd).deinit(allocator);
-                handleSocketCommand(&application, parsed_cmd.command);
-            }
+            processXcbEvents(&application, conn.conn);
         }
 
         // Poll update queue from background worker
@@ -247,36 +115,50 @@ fn runDaemon(daemon_mode: bool) !void {
     worker_thread.join();
     update_queue.deinit();
 
-    try stdout.print("Switcher closed.\n", .{});
+    try stdout.print("Daemon stopped.\n", .{});
 }
 
-/// Handle a command received from the socket
-fn handleSocketCommand(application: *app.App, cmd: socket.Command) void {
-    switch (cmd) {
-        .show => |maybe_ids| {
-            if (maybe_ids) |ids| {
-                log.info("Socket command: SHOW with {d} windows", .{ids.len});
-                application.showWithWindows(ids);
-            } else {
-                log.info("Socket command: SHOW (all windows)", .{});
-                application.showAll();
-            }
-        },
-        .index => |idx| {
-            log.info("Socket command: INDEX {d}", .{idx});
-            application.setSelectedIndex(idx);
-        },
-        .hide => {
-            log.info("Socket command: HIDE", .{});
-            application.hideWindow();
-        },
-        .next => {
-            log.info("Socket command: NEXT", .{});
-            application.selectNext();
-        },
-        .prev => {
-            log.info("Socket command: PREV", .{});
-            application.selectPrev();
-        },
+/// Process all pending XCB events (key press/release)
+fn processXcbEvents(application: *app.App, conn: *x11.xcb.xcb_connection_t) void {
+    while (true) {
+        const event = x11.xcb.xcb_poll_for_event(conn);
+        if (event == null) break;
+        defer std.c.free(event);
+
+        const response_type = event.*.response_type & 0x7f;
+
+        switch (response_type) {
+            x11.xcb.XCB_KEY_PRESS => {
+                const key_event: *x11.xcb.xcb_key_press_event_t = @ptrCast(event);
+                const keysym = x11.keycodeToKeysym(conn, key_event.detail, 0);
+                const state_mask = key_event.state;
+
+                // Check for Shift via state mask or keysym
+                const is_shift = (state_mask & x11.MOD_SHIFT) != 0;
+
+                if (application.state == .idle) {
+                    // Idle: only respond to Alt+Tab / Alt+Shift+Tab
+                    if (keysym == x11.XK_Tab or keysym == x11.XK_ISO_Left_Tab) {
+                        application.handleAltTab(is_shift or keysym == x11.XK_ISO_Left_Tab);
+                    }
+                } else {
+                    // Switching: forward all key presses
+                    // For Tab with Shift held, also check ISO_Left_Tab
+                    const effective_keysym = if (keysym == x11.XK_Tab and is_shift)
+                        x11.XK_ISO_Left_Tab
+                    else
+                        keysym;
+                    _ = application.handleKeyEvent(effective_keysym, true, state_mask);
+                }
+            },
+            x11.xcb.XCB_KEY_RELEASE => {
+                const key_event: *x11.xcb.xcb_key_release_event_t = @ptrCast(event);
+                const keysym = x11.keycodeToKeysym(conn, key_event.detail, 0);
+                const state_mask = key_event.state;
+
+                _ = application.handleKeyEvent(keysym, false, state_mask);
+            },
+            else => {},
+        }
     }
 }

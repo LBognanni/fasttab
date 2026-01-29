@@ -7,9 +7,28 @@ pub const xcb = @cImport({
     @cInclude("xcb/xcb.h");
     @cInclude("xcb/composite.h");
     @cInclude("xcb/xcb_image.h");
+    @cInclude("xcb/xcb_keysyms.h");
 });
 
 const log = std.log.scoped(.fasttab);
+
+// Keysym constants (from X11/keysymdef.h)
+pub const XK_Tab = 0xff09;
+pub const XK_ISO_Left_Tab = 0xfe20;
+pub const XK_Alt_L = 0xffe9;
+pub const XK_Alt_R = 0xffea;
+pub const XK_Escape = 0xff1b;
+pub const XK_Return = 0xff0d;
+pub const XK_Left = 0xff51;
+pub const XK_Up = 0xff52;
+pub const XK_Right = 0xff53;
+pub const XK_Down = 0xff54;
+
+// Modifier masks (u16 to match xcb_grab_key modifiers parameter)
+pub const MOD_SHIFT: u16 = 1; // XCB_MOD_MASK_SHIFT
+pub const MOD_LOCK: u16 = 2; // XCB_MOD_MASK_LOCK (CapsLock)
+pub const MOD_ALT: u16 = 8; // XCB_MOD_MASK_1
+pub const MOD_MOD2: u16 = 16; // XCB_MOD_MASK_2 (NumLock typically)
 
 // Cached current process PID (computed once)
 var cached_current_pid: ?std.posix.pid_t = null;
@@ -84,6 +103,8 @@ pub const Atoms = struct {
     net_current_desktop: xcb.xcb_atom_t,
     net_wm_desktop: xcb.xcb_atom_t,
     net_wm_pid: xcb.xcb_atom_t,
+    net_client_list_stacking: xcb.xcb_atom_t,
+    net_active_window: xcb.xcb_atom_t,
 };
 
 pub const MousePosition = struct {
@@ -189,6 +210,8 @@ pub fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
         .net_current_desktop = try internAtom(conn, "_NET_CURRENT_DESKTOP"),
         .net_wm_desktop = try internAtom(conn, "_NET_WM_DESKTOP"),
         .net_wm_pid = try internAtom(conn, "_NET_WM_PID"),
+        .net_client_list_stacking = try internAtom(conn, "_NET_CLIENT_LIST_STACKING"),
+        .net_active_window = try internAtom(conn, "_NET_ACTIVE_WINDOW"),
     };
 }
 
@@ -564,4 +587,207 @@ pub fn isCurrentExecutable(
     }
 
     return false;
+}
+
+// === Key Grab Infrastructure ===
+
+/// Grab Alt+Tab and Alt+Shift+Tab passively on the root window.
+/// Each combo needs 4 grabs for NumLock/CapsLock variants.
+pub fn grabAltTab(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) void {
+    const key_symbols = xcb.xcb_key_symbols_alloc(conn);
+    if (key_symbols == null) {
+        log.err("Failed to allocate key symbols", .{});
+        return;
+    }
+    defer xcb.xcb_key_symbols_free(key_symbols);
+
+    // Modifier variants: bare, +CapsLock, +NumLock, +CapsLock+NumLock
+    const lock_variants = [_]u16{
+        0,
+        MOD_LOCK,
+        MOD_MOD2,
+        MOD_LOCK | MOD_MOD2,
+    };
+
+    // Grab Alt+Tab (4 lock variants)
+    const tab_codes = xcb.xcb_key_symbols_get_keycode(key_symbols, XK_Tab);
+    if (tab_codes) |codes| {
+        defer std.c.free(codes);
+        var i: usize = 0;
+        while (codes[i] != 0) : (i += 1) {
+            for (lock_variants) |lock| {
+                _ = xcb.xcb_grab_key(conn, 1, root, MOD_ALT | lock, codes[i], xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC);
+                // Also grab Alt+Shift+Tab
+                _ = xcb.xcb_grab_key(conn, 1, root, MOD_ALT | MOD_SHIFT | lock, codes[i], xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC);
+            }
+        }
+    }
+
+    // Grab Alt+Shift+ISO_Left_Tab (some keyboards send this instead of Shift+Tab)
+    const shift_tab_codes = xcb.xcb_key_symbols_get_keycode(key_symbols, XK_ISO_Left_Tab);
+    if (shift_tab_codes) |codes| {
+        defer std.c.free(codes);
+        var i: usize = 0;
+        while (codes[i] != 0) : (i += 1) {
+            for (lock_variants) |lock| {
+                _ = xcb.xcb_grab_key(conn, 1, root, MOD_ALT | lock, codes[i], xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC);
+                _ = xcb.xcb_grab_key(conn, 1, root, MOD_ALT | MOD_SHIFT | lock, codes[i], xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC);
+            }
+        }
+    }
+
+    _ = xcb.xcb_flush(conn);
+    log.info("Alt+Tab grabbed", .{});
+}
+
+/// Release all passive Alt+Tab key grabs.
+pub fn ungrabAltTab(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) void {
+    const key_symbols = xcb.xcb_key_symbols_alloc(conn);
+    if (key_symbols == null) return;
+    defer xcb.xcb_key_symbols_free(key_symbols);
+
+    const lock_variants = [_]u16{
+        0,
+        MOD_LOCK,
+        MOD_MOD2,
+        MOD_LOCK | MOD_MOD2,
+    };
+
+    const tab_codes = xcb.xcb_key_symbols_get_keycode(key_symbols, XK_Tab);
+    if (tab_codes) |codes| {
+        defer std.c.free(codes);
+        var i: usize = 0;
+        while (codes[i] != 0) : (i += 1) {
+            for (lock_variants) |lock| {
+                _ = xcb.xcb_ungrab_key(conn, codes[i], root, MOD_ALT | lock);
+                _ = xcb.xcb_ungrab_key(conn, codes[i], root, MOD_ALT | MOD_SHIFT | lock);
+            }
+        }
+    }
+
+    const shift_tab_codes = xcb.xcb_key_symbols_get_keycode(key_symbols, XK_ISO_Left_Tab);
+    if (shift_tab_codes) |codes| {
+        defer std.c.free(codes);
+        var i: usize = 0;
+        while (codes[i] != 0) : (i += 1) {
+            for (lock_variants) |lock| {
+                _ = xcb.xcb_ungrab_key(conn, codes[i], root, MOD_ALT | lock);
+                _ = xcb.xcb_ungrab_key(conn, codes[i], root, MOD_ALT | MOD_SHIFT | lock);
+            }
+        }
+    }
+
+    _ = xcb.xcb_flush(conn);
+    log.info("Alt+Tab ungrabbed", .{});
+}
+
+/// Actively grab the keyboard so ALL key events go to us during switching.
+pub fn grabKeyboard(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) bool {
+    const cookie = xcb.xcb_grab_keyboard(
+        conn,
+        1, // owner_events
+        root,
+        0, // XCB_CURRENT_TIME
+        xcb.XCB_GRAB_MODE_ASYNC,
+        xcb.XCB_GRAB_MODE_ASYNC,
+    );
+    const reply = xcb.xcb_grab_keyboard_reply(conn, cookie, null);
+    if (reply == null) {
+        log.err("Failed to grab keyboard (no reply)", .{});
+        return false;
+    }
+    defer std.c.free(reply);
+
+    if (reply.*.status != 0) { // XCB_GRAB_STATUS_SUCCESS
+        log.err("Failed to grab keyboard: status={d}", .{reply.*.status});
+        return false;
+    }
+
+    log.debug("Keyboard grabbed", .{});
+    return true;
+}
+
+/// Release the active keyboard grab.
+pub fn ungrabKeyboard(conn: *xcb.xcb_connection_t) void {
+    _ = xcb.xcb_ungrab_keyboard(conn, 0); // XCB_CURRENT_TIME
+    _ = xcb.xcb_flush(conn);
+    log.debug("Keyboard ungrabbed", .{});
+}
+
+/// Activate a window using _NET_ACTIVE_WINDOW client message.
+pub fn activateWindow(
+    conn: *xcb.xcb_connection_t,
+    root: xcb.xcb_window_t,
+    window: xcb.xcb_window_t,
+    atoms: Atoms,
+) void {
+    var event: xcb.xcb_client_message_event_t = std.mem.zeroes(xcb.xcb_client_message_event_t);
+    event.response_type = xcb.XCB_CLIENT_MESSAGE;
+    event.format = 32;
+    event.window = window;
+    event.type = atoms.net_active_window;
+    event.data.data32[0] = 2; // Source indication: pager
+    event.data.data32[1] = 0; // XCB_CURRENT_TIME
+    event.data.data32[2] = 0; // Currently active window (0 = none)
+
+    const mask: u32 = @bitCast(@as(c_int, xcb.XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY | xcb.XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT));
+    _ = xcb.xcb_send_event(
+        conn,
+        0,
+        root,
+        mask,
+        @ptrCast(&event),
+    );
+    _ = xcb.xcb_flush(conn);
+    log.debug("Activated window {d}", .{window});
+}
+
+/// Get the stacking window list (_NET_CLIENT_LIST_STACKING) as an owned slice.
+/// Caller must free the returned slice with the provided allocator.
+pub fn getStackingWindowList(
+    allocator: std.mem.Allocator,
+    conn: *xcb.xcb_connection_t,
+    root: xcb.xcb_window_t,
+    atoms: Atoms,
+) ![]xcb.xcb_window_t {
+    const cookie = xcb.xcb_get_property(
+        conn,
+        0,
+        root,
+        atoms.net_client_list_stacking,
+        xcb.XCB_ATOM_WINDOW,
+        0,
+        1024,
+    );
+    const reply = xcb.xcb_get_property_reply(conn, cookie, null);
+    if (reply == null) {
+        return X11Error.PropertyFetchFailed;
+    }
+    defer std.c.free(reply);
+
+    const len = xcb.xcb_get_property_value_length(reply);
+    if (len == 0) {
+        return allocator.alloc(xcb.xcb_window_t, 0);
+    }
+
+    const data: [*]const xcb.xcb_window_t = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
+    const count = @as(usize, @intCast(len)) / @sizeOf(xcb.xcb_window_t);
+
+    // Copy to owned slice (XCB reply buffer will be freed)
+    const result = try allocator.alloc(xcb.xcb_window_t, count);
+    @memcpy(result, data[0..count]);
+    return result;
+}
+
+/// Convert a keycode to a keysym using xcb-keysyms.
+pub fn keycodeToKeysym(conn: *xcb.xcb_connection_t, keycode: xcb.xcb_keycode_t, col: u16) xcb.xcb_keysym_t {
+    const key_symbols = xcb.xcb_key_symbols_alloc(conn);
+    if (key_symbols == null) return 0;
+    defer xcb.xcb_key_symbols_free(key_symbols);
+    return xcb.xcb_key_symbols_get_keysym(key_symbols, keycode, @intCast(col));
+}
+
+/// Get the XCB connection file descriptor for polling.
+pub fn getXcbFd(conn: *xcb.xcb_connection_t) std.posix.fd_t {
+    return xcb.xcb_get_file_descriptor(conn);
 }

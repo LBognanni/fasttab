@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("xcb");
     exe.linkSystemLibrary("xcb-composite");
     exe.linkSystemLibrary("xcb-image");
+    exe.linkSystemLibrary("xcb-keysyms");
 
     // Link raylib and its dependencies
     exe.linkSystemLibrary("raylib");
@@ -64,6 +65,7 @@ pub fn build(b: *std.Build) void {
     exe_unit_tests.linkSystemLibrary("xcb");
     exe_unit_tests.linkSystemLibrary("xcb-composite");
     exe_unit_tests.linkSystemLibrary("xcb-image");
+    exe_unit_tests.linkSystemLibrary("xcb-keysyms");
     exe_unit_tests.linkSystemLibrary("raylib");
     exe_unit_tests.linkSystemLibrary("GL");
     exe_unit_tests.linkSystemLibrary("m");

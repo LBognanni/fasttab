@@ -20,6 +20,12 @@ pub const AppError = error{
     OutOfMemory,
 };
 
+/// State machine for the Alt+Tab switcher
+pub const SwitcherState = enum {
+    idle,
+    switching,
+};
+
 /// Monitor information for window positioning
 pub const MonitorInfo = struct {
     index: i32,
@@ -43,6 +49,8 @@ pub const App = struct {
     update_queue: ?*worker.UpdateQueue,
     xcb_conn: *x11.xcb.xcb_connection_t,
     xcb_root: x11.xcb.xcb_window_t,
+    xcb_atoms: x11.Atoms,
+    state: SwitcherState,
 
     const Self = @This();
 
@@ -55,6 +63,7 @@ pub const App = struct {
         update_queue: ?*worker.UpdateQueue,
         xcb_conn: *x11.xcb.xcb_connection_t,
         xcb_root: x11.xcb.xcb_window_t,
+        xcb_atoms: x11.Atoms,
     ) !Self {
         // Build initial window items from worker result
         var items = std.ArrayList(ui.WindowItem).init(allocator);
@@ -136,6 +145,8 @@ pub const App = struct {
             .update_queue = update_queue,
             .xcb_conn = xcb_conn,
             .xcb_root = xcb_root,
+            .xcb_atoms = xcb_atoms,
+            .state = .idle,
         };
     }
 
@@ -212,29 +223,25 @@ pub const App = struct {
         return @intCast(window_id_64);
     }
 
-    /// Process one frame: handle input, check for window close, render
+    /// Process one frame: check for window close, render
     pub fn update(self: *Self) void {
         if (self.window_hidden) {
-            // In daemon mode with hidden window, skip input/rendering
+            // In daemon mode with hidden window, skip rendering
             std.time.sleep(16 * std.time.ns_per_ms);
             return;
         }
 
-        // Check if window should close
-        if (rl.WindowShouldClose() or (self.items.items.len > 0 and rl.IsKeyPressed(rl.KEY_ESCAPE))) {
+        // Check if window should close (fallback for window manager close)
+        if (rl.WindowShouldClose()) {
             if (self.daemon_mode) {
-                log.info("Hiding window due ESC being pressed", .{});
-                self.hideWindow();
+                self.cancelSwitching();
             } else {
                 self.should_quit = true;
                 return;
             }
         }
 
-        // Handle keyboard input
-        self.handleKeyboardInput();
-
-        // Render or sleep
+        // Render (all keyboard input is handled via XCB events)
         self.render();
     }
 
@@ -271,51 +278,6 @@ pub const App = struct {
         self.updateLayout();
     }
 
-    // === Public control methods for socket commands ===
-
-    /// Show the switcher with the specified window IDs in the given order
-    /// Windows not in the list are hidden; order determines display order
-    pub fn showWithWindows(self: *Self, ids: []const u32) void {
-        if (ids.len == 0) {
-            log.warn("showWithWindows called with empty list", .{});
-            return;
-        }
-
-        // Reorder items to match the specified order
-        var new_items = std.ArrayList(ui.WindowItem).init(self.allocator);
-        defer new_items.deinit();
-
-        for (ids) |target_id| {
-            for (self.items.items) |item| {
-                if (item.id == target_id) {
-                    new_items.append(item) catch continue;
-                    break;
-                }
-            }
-        }
-
-        // If we found matching windows, replace items with reordered list
-        if (new_items.items.len > 0) {
-            // Clear and replace
-            self.items.clearRetainingCapacity();
-            for (new_items.items) |item| {
-                self.items.append(item) catch continue;
-            }
-            self.selected_index = 0;
-        }
-
-        self.showWindow();
-    }
-
-    /// Set the selected index (for INDEX command)
-    pub fn setSelectedIndex(self: *Self, index: usize) void {
-        if (index < self.items.items.len) {
-            self.selected_index = index;
-        } else if (self.items.items.len > 0) {
-            self.selected_index = self.items.items.len - 1;
-        }
-    }
-
     /// Move selection to next window (wraps around)
     pub fn selectNext(self: *Self) void {
         if (self.items.items.len == 0) return;
@@ -332,14 +294,7 @@ pub const App = struct {
         }
     }
 
-    /// Show all known windows in default order
-    pub fn showAll(self: *Self) void {
-        // Reset selection to first item
-        self.selected_index = 0;
-        self.showWindow();
-    }
-
-    /// Hide the switcher window (public for socket commands)
+    /// Hide the switcher window
     pub fn hideWindow(self: *Self) void {
         log.debug("Hiding window", .{});
 
@@ -388,25 +343,181 @@ pub const App = struct {
         self.window_hidden = false;
     }
 
-    // === Private methods ===
+    // === Alt+Tab state machine ===
 
-    fn handleKeyboardInput(self: *Self) void {
-        const count = self.items.items.len;
-        const cols = self.current_layout.columns;
+    /// Handle initial Alt+Tab press: grab keyboard, reorder by stacking, show switcher.
+    pub fn handleAltTab(self: *Self, shift: bool) void {
+        if (self.state == .switching) {
+            // Already switching, treat as Tab press
+            if (shift) {
+                self.selectPrev();
+            } else {
+                self.selectNext();
+            }
+            return;
+        }
 
-        if (rl.IsKeyPressed(rl.KEY_RIGHT) or rl.IsKeyPressed(rl.KEY_TAB)) {
-            self.selected_index = nav.moveSelectionRight(self.selected_index, count);
+        // Grab the keyboard so we get all key events during switching
+        if (!x11.grabKeyboard(self.xcb_conn, self.xcb_root)) {
+            log.err("Could not grab keyboard, aborting Alt+Tab", .{});
+            return;
         }
-        if (rl.IsKeyPressed(rl.KEY_LEFT)) {
-            self.selected_index = nav.moveSelectionLeft(self.selected_index, count);
+
+        // Reorder items by stacking order (MRU)
+        self.reorderByStacking();
+
+        // Show the switcher
+        if (shift) {
+            // Shift+Tab: select last item
+            if (self.items.items.len > 0) {
+                self.selected_index = self.items.items.len - 1;
+            }
+        } else {
+            // Tab: select index 1 (previous window) if available
+            if (self.items.items.len > 1) {
+                self.selected_index = 1;
+            } else {
+                self.selected_index = 0;
+            }
         }
-        if (rl.IsKeyPressed(rl.KEY_DOWN)) {
-            self.selected_index = nav.moveSelectionDown(self.selected_index, cols, count);
+
+        self.showWindow();
+        self.state = .switching;
+        log.info("Alt+Tab switching started (shift={}, selected={d})", .{ shift, self.selected_index });
+    }
+
+    /// Handle a key event during switching.
+    /// Returns true if the event was consumed.
+    pub fn handleKeyEvent(self: *Self, keysym: u32, is_press: bool, state_mask: u16) bool {
+        _ = state_mask;
+
+        if (self.state != .switching) {
+            return false;
         }
-        if (rl.IsKeyPressed(rl.KEY_UP)) {
-            self.selected_index = nav.moveSelectionUp(self.selected_index, cols);
+
+        if (!is_press) {
+            // Key release: check for Alt release to confirm
+            if (keysym == x11.XK_Alt_L or keysym == x11.XK_Alt_R) {
+                self.confirmSwitching();
+                return true;
+            }
+            return false;
+        }
+
+        // Key press during switching
+        switch (keysym) {
+            x11.XK_Tab => {
+                self.selectNext();
+                return true;
+            },
+            x11.XK_ISO_Left_Tab => {
+                self.selectPrev();
+                return true;
+            },
+            x11.XK_Escape => {
+                self.cancelSwitching();
+                return true;
+            },
+            x11.XK_Return => {
+                self.confirmSwitching();
+                return true;
+            },
+            x11.XK_Right => {
+                self.selected_index = nav.moveSelectionRight(self.selected_index, self.items.items.len);
+                return true;
+            },
+            x11.XK_Left => {
+                self.selected_index = nav.moveSelectionLeft(self.selected_index, self.items.items.len);
+                return true;
+            },
+            x11.XK_Down => {
+                self.selected_index = nav.moveSelectionDown(self.selected_index, self.current_layout.columns, self.items.items.len);
+                return true;
+            },
+            x11.XK_Up => {
+                self.selected_index = nav.moveSelectionUp(self.selected_index, self.current_layout.columns);
+                return true;
+            },
+            else => return false,
         }
     }
+
+    /// Confirm switching: activate selected window, ungrab keyboard, hide
+    pub fn confirmSwitching(self: *Self) void {
+        if (self.state != .switching) return;
+
+        // Activate the selected window
+        if (self.items.items.len > 0 and self.selected_index < self.items.items.len) {
+            const selected_id = self.items.items[self.selected_index].id;
+            x11.activateWindow(self.xcb_conn, self.xcb_root, selected_id, self.xcb_atoms);
+            log.info("Confirmed: activating window {d}", .{selected_id});
+        }
+
+        x11.ungrabKeyboard(self.xcb_conn);
+        self.hideWindow();
+        self.state = .idle;
+    }
+
+    /// Cancel switching: ungrab keyboard, hide (no activation)
+    pub fn cancelSwitching(self: *Self) void {
+        if (self.state != .switching) return;
+
+        log.info("Switching cancelled", .{});
+        x11.ungrabKeyboard(self.xcb_conn);
+        self.hideWindow();
+        self.state = .idle;
+    }
+
+    /// Reorder internal items to match stacking order (reversed = MRU first)
+    fn reorderByStacking(self: *Self) void {
+        const stacking = x11.getStackingWindowList(self.allocator, self.xcb_conn, self.xcb_root, self.xcb_atoms) catch |err| {
+            log.warn("Could not get stacking list: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(stacking);
+
+        if (stacking.len == 0) return;
+
+        // Build a new ordering: stacking list reversed (topmost = MRU = first)
+        var new_items = std.ArrayList(ui.WindowItem).init(self.allocator);
+        defer new_items.deinit();
+        new_items.ensureTotalCapacity(self.items.items.len) catch return;
+
+        // Walk stacking list in reverse (topmost first)
+        var si: usize = stacking.len;
+        while (si > 0) {
+            si -= 1;
+            const stacking_id = stacking[si];
+            for (self.items.items) |item| {
+                if (item.id == stacking_id) {
+                    new_items.appendAssumeCapacity(item);
+                    break;
+                }
+            }
+        }
+
+        // Add any items that weren't in the stacking list (shouldn't happen normally)
+        for (self.items.items) |item| {
+            var found = false;
+            for (new_items.items) |new_item| {
+                if (new_item.id == item.id) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                new_items.append(item) catch continue;
+            }
+        }
+
+        // Replace items list (shallow copy, no memory to free since items are shared)
+        self.items.clearRetainingCapacity();
+        for (new_items.items) |item| {
+            self.items.append(item) catch continue;
+        }
+    }
+
+    // === Private methods ===
 
     fn render(self: *Self) void {
         rl.BeginDrawing();
