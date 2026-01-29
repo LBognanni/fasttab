@@ -740,6 +740,7 @@ pub fn activateWindow(
         mask,
         @ptrCast(&event),
     );
+    _ = xcb.xcb_set_input_focus(conn, xcb.XCB_INPUT_FOCUS_POINTER_ROOT, window, xcb.XCB_CURRENT_TIME);
     _ = xcb.xcb_flush(conn);
     log.debug("Activated window {d}", .{window});
 }
