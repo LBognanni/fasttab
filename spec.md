@@ -277,7 +277,7 @@ Window ID: 23456789
 
 ---
 
-### Milestone 5: Global Key Grabbing
+### Milestone 5: Global Key Grabbing ✅
 
 **Goal:** Grab Alt+Tab globally and handle the full switching lifecycle.
 
@@ -302,7 +302,7 @@ Window ID: 23456789
 
 ---
 
-### Milestone 6: Cleanup
+### Milestone 6: Cleanup ✅
 
 **Goal:** Remove legacy socket/CLI/QML code.
 
