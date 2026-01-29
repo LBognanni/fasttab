@@ -867,7 +867,7 @@ pub fn getWindowIcon(
     target_size: u32,
 ) ?IconData {
     // _NET_WM_ICON can be very large (multiple icons at various sizes)
-    const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_icon, xcb.XCB_ATOM_CARDINAL, 0, 65536);
+    const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_icon, xcb.XCB_ATOM_CARDINAL, 0, std.math.maxInt(u32));
     const reply = xcb.xcb_get_property_reply(conn, cookie, null);
     if (reply == null) {
         return null;
