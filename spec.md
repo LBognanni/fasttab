@@ -6,17 +6,18 @@
 
 ## Overview
 
-FastTab is a high-performance window switcher for KDE Plasma on X11. It consists of two components:
+FastTab is a high-performance window switcher for X11 desktops. It is a standalone daemon written in Zig that:
 
-1. **FastTab Daemon** — A background service written in Zig that tracks open windows, maintains a cache of window thumbnails, and renders a fast thumbnail-based switcher UI on demand.
+1. **Pre-caches window thumbnails** in the background using XComposite, so the switcher displays instantly
+2. **Grabs Alt+Tab globally** via XCB passive key grabs, handling the full switching lifecycle
+3. **Renders a thumbnail grid** using raylib, with MRU window ordering
+4. **Activates windows** directly via `_NET_ACTIVE_WINDOW` client messages
 
-2. **QML Stub** — A minimal KDE task switcher plugin that integrates with KWin's Alt+Tab system. It displays nothing visually but forwards keyboard events to the daemon and triggers window activation through KWin.
-
-### Why This Architecture?
+### Why Standalone?
 
 KDE's built-in task switchers render thumbnails on demand when Alt+Tab is pressed, which introduces latency. FastTab pre-caches thumbnails in the background so the switcher can display instantly by blitting existing images rather than capturing windows at display time.
 
-The QML stub exists solely to integrate with KWin's keyboard handling. KWin grabs the keyboard when a task switcher activates, so rather than fighting for the grab, the stub acts as a relay — receiving key events from KWin and forwarding them to the daemon.
+Rather than integrating as a KWin plugin (which adds complexity and limits portability), FastTab grabs Alt+Tab directly at the X11 level. This makes it work with any X11 window manager, not just KWin.
 
 ---
 
@@ -37,41 +38,24 @@ The QML stub exists solely to integrate with KWin's keyboard handling. KWin grab
 │                                       │                        │
 │                                       ▼                        │
 │  ┌──────────────────┐     ┌─────────────────────────────────┐  │
-│  │   Socket Server  │     │       Switcher Renderer         │  │
+│  │   Key Grabber    │     │       Switcher Renderer         │  │
 │  │                  │     │                                 │  │
-│  │  - Unix socket   │────▶│  - raylib window               │  │
-│  │  - Receives cmds │     │  - Grid layout                 │  │
-│  │  - No response   │     │  - Selection highlight         │  │
+│  │  - Alt+Tab grab  │────▶│  - raylib window               │  │
+│  │  - XCB key evts  │     │  - Grid layout                 │  │
+│  │  - State machine │     │  - Selection highlight         │  │
 │  └──────────────────┘     └─────────────────────────────────┘  │
-│           ▲                                                    │
-└───────────│────────────────────────────────────────────────────┘
-            │
-            │ Unix Socket (send command, disconnect)
-            │
-┌───────────▼────────────────────────────────────────────────────┐
-│                      FastTab CLI                               │
-├────────────────────────────────────────────────────────────────┤
-│  fasttab show <ids>   - Send SHOW command to daemon            │
-│  fasttab index <n>    - Send INDEX command to daemon           │
-│  fasttab hide         - Send HIDE command to daemon            │
-│                                                                │
-│  Lightweight: no X11 or raylib initialization                  │
-│  Connects to socket, sends one line, exits                     │
+│                                       │                        │
+│                                       ▼                        │
+│                           ┌───────────────────────┐            │
+│                           │  Window Activation    │            │
+│                           │  _NET_ACTIVE_WINDOW   │            │
+│                           └───────────────────────┘            │
 └────────────────────────────────────────────────────────────────┘
-            ▲
-            │
-            │ Process invocation (Qt.createProcess or similar)
-            │
-┌───────────┴────────────────────────────────────────────────────┐
-│                         QML Stub                               │
-├────────────────────────────────────────────────────────────────┤
-│  - Registered as KDE task switcher                             │
-│  - Renders nothing (1x1 transparent)                           │
-│  - Invokes `fasttab show` on activation                        │
-│  - Invokes `fasttab index` on selection change                 │
-│  - Invokes `fasttab hide` on dismissal                         │
-│  - Tells KWin to activate selected window                      │
-└────────────────────────────────────────────────────────────────┘
+
+Key Flow:
+  Alt+Tab pressed → passive grab triggers → active keyboard grab
+  → show switcher (MRU order) → Tab/Shift+Tab cycles selection
+  → Alt released → activate window → ungrab → hide switcher
 ```
 
 ---
@@ -83,9 +67,9 @@ The QML stub exists solely to integrate with KWin's keyboard handling. KWin grab
 #### Technology Stack
 
 - **Language:** Zig
-- **X11 Binding:** XCB via Zig's @cImport (xcb, xcb-composite, xcb-image)
+- **X11 Binding:** XCB via Zig's @cImport (xcb, xcb-composite, xcb-image, xcb-keysyms)
 - **Rendering:** raylib (provides window creation, OpenGL context, texture rendering, text drawing)
-- **IPC:** Unix domain socket with text-based protocol
+- **Input:** XCB passive key grab (Alt+Tab) + active keyboard grab during switching
 
 #### Responsibilities
 
@@ -100,12 +84,24 @@ The QML stub exists solely to integrate with KWin's keyboard handling. KWin grab
    - Refresh thumbnails periodically (initial implementation: polling)
    - Scale thumbnails to target height of 256 pixels, preserving aspect ratio
 
-3. **Socket Server**
-   - Listen on a Unix domain socket
-   - Accept commands from CLI invocations
-   - No responses needed (unidirectional)
+3. **Global Key Grabbing**
+   - Grab Alt+Tab and Alt+Shift+Tab on root window (passive grab via `xcb_grab_key`)
+   - Handle NumLock/CapsLock modifier variants (4 grabs per key combo)
+   - On Alt+Tab: acquire active keyboard grab (`xcb_grab_keyboard`) for all subsequent keys
+   - Process Tab, Shift+Tab, arrow keys, Enter, ESC during active grab
+   - On Alt release: activate selected window and release grab
+   - On ESC: cancel without activating
 
-4. **Switcher Rendering**
+4. **Window Ordering (MRU)**
+   - Query `_NET_CLIENT_LIST_STACKING` for stacking order
+   - Reverse stacking order to get MRU (most recently used) ordering
+   - On initial Alt+Tab, select index 1 (the previously focused window)
+
+5. **Window Activation**
+   - Send `_NET_ACTIVE_WINDOW` client message to root window (source=2 pager)
+   - Works with any EWMH-compliant window manager
+
+6. **Switcher Rendering**
    - Create a borderless, always-on-top window using raylib
    - Position window centered on the monitor containing the mouse cursor
    - Render cached thumbnails in a grid layout
@@ -118,122 +114,29 @@ The initial implementation uses periodic polling to refresh thumbnails. A future
 
 ---
 
-### QML Stub
-
-#### Technology Stack
-
-- **Language:** QML with minimal JavaScript
-- **Integration:** KWin TabBox plugin system
-
-#### Responsibilities
-
-1. **KWin Integration**
-   - Register as a valid task switcher in KDE System Settings
-   - Receive activation when user presses Alt+Tab
-
-2. **Command Invocation**
-   - On activation: invoke `fasttab show <window_ids>` with window list from KWin
-   - On currentIndex change: invoke `fasttab index <n>`
-   - On dismissal: invoke `fasttab hide`
-
-3. **Window Activation**
-   - Use KWin's model to activate the selected window (KWin handles this, not the daemon)
-
----
-
 ## Command-Line Interface
-
-The FastTab binary operates in two modes:
-
-1. **Daemon mode** — Long-running background process that tracks windows, caches thumbnails, and renders the switcher
-2. **Command mode** — Short-lived invocations that send commands to the daemon
 
 ### Usage
 
 ```
-fasttab daemon              # Start the background daemon
-fasttab show <id1,id2,...>  # Show switcher with specified windows
-fasttab index <n>           # Update selection to index n
-fasttab hide                # Hide the switcher
+fasttab                     # Start the daemon
+fasttab daemon              # Same as above
 ```
 
-### Commands
-
-#### fasttab daemon
-
-Starts the background daemon. This process:
+The daemon:
 - Connects to X11 and initializes XComposite
+- Grabs Alt+Tab globally via XCB passive key grab
 - Begins tracking windows and caching thumbnails
-- Initializes raylib (but doesn't show a window yet)
-- Listens on a Unix socket for commands
-- Runs until terminated
+- Initializes raylib (hidden until Alt+Tab is pressed)
+- Handles all input via XCB key events
+- Runs until terminated (SIGTERM/SIGINT)
 
 Should be started once at login (e.g., via autostart, systemd user unit, or KDE autostart).
 
-#### fasttab show \<window_ids\>
+### Prerequisites
 
-Shows the switcher with the specified windows.
-
-- `window_ids`: Comma-separated list of X11 window IDs (decimal)
-- Order determines display order (first = top-left)
-- Only these windows are shown, even if daemon knows about others
-- First window in list is initially selected (index 0)
-
-**Example:**
-```bash
-fasttab show 12345678,23456789,34567890
-```
-
-#### fasttab index \<n\>
-
-Updates the selection highlight.
-
-- `n`: Zero-based index into the window list from the last `show` command
-
-**Example:**
-```bash
-fasttab index 2
-```
-
-#### fasttab hide
-
-Hides the switcher window. Sent when:
-- User dismisses switcher (Escape, focus lost)
-- User confirms selection (the QML stub handles activation, then hides)
-
-### Internal Protocol
-
-Commands communicate with the daemon over a Unix domain socket.
-
-**Socket path:** `/tmp/fasttab.sock` (or `$XDG_RUNTIME_DIR/fasttab.sock` if available)
-
-**Protocol:** Each command connects, sends a single line, and disconnects. No response is expected.
-
-```
-SHOW <id1>,<id2>,<id3>\n
-INDEX <n>\n
-HIDE\n
-```
-
-The protocol is unidirectional (client to daemon only). KWin handles window activation, so the daemon never needs to respond.
-
-### Startup Time Requirements
-
-The `show`, `index`, and `hide` commands are in the critical path of Alt+Tab interaction. They must be extremely fast.
-
-**These commands must NOT:**
-- Initialize raylib or any graphics
-- Connect to X11
-- Load configuration files
-- Perform any unnecessary work
-
-**These commands ONLY:**
-1. Parse arguments
-2. Connect to Unix socket
-3. Send message (single write)
-4. Exit
-
-The binary should have two completely separate code paths: the full daemon initialization path, and the minimal CLI client path.
+- Disable the window manager's Alt+Tab shortcut before starting FastTab. For KWin: System Settings → Shortcuts → KWin → "Walk Through Windows" → remove shortcut.
+- The XCB key grab acts as a singleton mechanism — a second FastTab instance's grab will fail.
 
 ---
 
@@ -286,7 +189,7 @@ The binary should have two completely separate code paths: the full daemon initi
 
 ## Milestones
 
-### Milestone 1: Window List
+### Milestone 1: Window List ✅
 
 **Goal:** Verify we can enumerate open windows using XCB.
 
@@ -309,7 +212,7 @@ Window ID: 23456789
 
 ---
 
-### Milestone 2: Thumbnail Capture
+### Milestone 2: Thumbnail Capture ✅
 
 **Goal:** Verify we can capture window contents using XComposite.
 
@@ -327,7 +230,7 @@ Window ID: 23456789
 
 ---
 
-### Milestone 3: Display Window with Thumbnails
+### Milestone 3: Display Window with Thumbnails ✅
 
 **Goal:** Render cached thumbnails in a raylib window.
 
@@ -342,7 +245,7 @@ Window ID: 23456789
 
 ---
 
-### Milestone 4: Live Updates
+### Milestone 4: Live Updates ✅
 
 **Goal:** Keep the window list and thumbnails updated while running.
 
@@ -359,7 +262,7 @@ Window ID: 23456789
 
 ---
 
-### Milestone 4.5: Daemon Mode
+### Milestone 4.5: Daemon Mode ✅
 **Goal:** Refactor program to run as a background daemon.
 
 **Deliverable:** The program will now run as a long-lived background process:
@@ -374,104 +277,40 @@ Window ID: 23456789
 
 ---
 
-### Milestone 5: Socket Server
+### Milestone 5: Global Key Grabbing
 
-**Goal:** Accept commands over Unix socket.
+**Goal:** Grab Alt+Tab globally and handle the full switching lifecycle.
 
 **Deliverable:** The daemon now:
-- Listens on `/tmp/fasttab.sock`
-- Accepts SHOW, INDEX, HIDE commands
-- Shows/hides the switcher window accordingly
-- Prints received commands to stdout for debugging
+- Grabs Alt+Tab and Alt+Shift+Tab on the root window via `xcb_grab_key`
+- On Alt+Tab: acquires active keyboard grab, shows switcher with MRU-ordered windows
+- On Tab (while holding Alt): cycles selection forward
+- On Shift+Tab: cycles selection backward
+- On Alt release: activates the selected window via `_NET_ACTIVE_WINDOW` and hides
+- On ESC: cancels without activating
+- Arrow keys navigate the grid during switching
 
 **Technical notes:**
-- Create Unix domain socket, bind, listen
-- Add socket file descriptor to event loop
-- Parse incoming messages according to protocol spec
-- When SHOW received: display the switcher with the specified windows in the specified order
-- When INDEX received: update selection highlight
-- When HIDE received: hide the switcher window
+- Link `xcb-keysyms` library for keysym-to-keycode conversion
+- Passive grab with `xcb_grab_key` on root window catches initial Alt+Tab
+- Active grab with `xcb_grab_keyboard` captures all subsequent key events
+- Must grab with 4 modifier variants per combo (bare, +CapsLock, +NumLock, +both)
+- Poll XCB file descriptor in event loop for key press/release events
+- MRU ordering via `_NET_CLIENT_LIST_STACKING` (reversed = most recently used first)
+- Window activation via `_NET_ACTIVE_WINDOW` client message (source=2 pager)
+- User must disable window manager's Alt+Tab shortcut first
 
 ---
 
-### Milestone 6: CLI Commands
+### Milestone 6: Cleanup
 
-**Goal:** Implement the command-line interface for sending commands.
+**Goal:** Remove legacy socket/CLI/QML code.
 
-**Deliverable:** The same binary now supports:
-- `fasttab daemon` — starts the daemon (existing behavior)
-- `fasttab show <ids>` — connects to socket, sends SHOW, exits
-- `fasttab index <n>` — connects to socket, sends INDEX, exits
-- `fasttab hide` — connects to socket, sends HIDE, exits
-
-**Technical notes:**
-- CLI commands must not initialize raylib or X11
-- CLI commands have a completely separate code path from daemon mode
-- Parse argv to determine mode before any heavy initialization
-- CLI commands should complete in under 5ms
-- After this milestone, the daemon is feature-complete for standalone testing
-
----
-
-### Milestone 6.5: Extra commands
-
-**Goal:** Add extra commands for testing and debugging.
-**Deliverable:** The CLI now supports:
-- `fasttab show` - connects to socket, sends SHOW with no window IDs
-- `fasttab next` - connects to socket, sends NEXT command
-- `fasttab prev` - connects to socket, sends PREV command
-
-The daemon is updated to handle these commands:
-- SHOW with no IDs shows all known windows in default order
-- NEXT increments the selection index (wraps around)
-- PREV decrements the selection index (wraps around)
-
-### Milestone 7: Daemon Mode
-
-**Goal:** Run as a background service.
-
-**Deliverable:** The program can:
-- Run in foreground (for debugging) or daemonize
-- Handle SIGTERM gracefully (clean up socket, exit)
-- Log to stderr or a log file
-- Reconnect to X11 if connection lost (optional)
-
-**Command line:**
-```
-fasttab daemon              # Run in foreground
-fasttab daemon --fork       # Daemonize
-fasttab --help              # Show usage
-```
-
----
-
-### Milestone 8: QML Stub
-
-**Goal:** Integrate with KDE's task switcher system.
-
-**Deliverable:** A KDE task switcher plugin that:
-- Appears in System Settings → Window Management → Task Switcher
-- When selected and activated via Alt+Tab:
-  - Invokes `fasttab show <window_ids>` with window list from KWin
-  - Invokes `fasttab index <n>` as user navigates
-  - Invokes `fasttab hide` when dismissed
-  - Activates the selected window via KWin's model
-
-**File structure:**
-```
-~/.local/share/kwin/tabbox/fasttab/
-├── metadata.json
-└── contents/
-    └── ui/
-        └── main.qml
-```
-
-**Technical notes:**
-- Use KWin.TabBoxSwitcher as root element for integration
-- Render nothing visually (1x1 transparent item or empty)
-- Use Qt.createProcess() or Process QML type to invoke fasttab commands
-- Build comma-separated window ID list from tabBox.model
-- Watch currentIndex changes to send index updates
+**Deliverable:**
+- Delete `src/socket.zig`, `src/client.zig`, `qml/` directory
+- Simplify `main.zig` to only accept `fasttab` or `fasttab daemon`
+- Remove all socket-related code from the event loop
+- Update documentation
 
 ---
 
@@ -481,7 +320,6 @@ fasttab --help              # Show usage
 
 **Deliverables:**
 - Handle monitors being added/removed
-- Handle daemon not running (QML stub shows error or falls back)
 - Handle rapid Alt+Tab presses (debounce or queue)
 - Handle windows with no title gracefully
 - Handle windows that refuse to provide thumbnails (use placeholder)
@@ -498,7 +336,7 @@ fasttab --help              # Show usage
 xcb
 xcb-composite
 xcb-image
-xcb-util        (optional, for convenience functions)
+xcb-keysyms     (for keysym-to-keycode conversion)
 ```
 
 ### Key Functions
@@ -538,9 +376,33 @@ xcb_get_image(conn, XCB_IMAGE_FORMAT_Z_PIXMAP, pixmap, x, y, w, h, mask) -> pixe
 ```
 xcb_poll_for_event(conn) -> xcb_generic_event_t*
 // Check event->response_type for:
+//   XCB_KEY_PRESS - key pressed (passive/active grab)
+//   XCB_KEY_RELEASE - key released (detect Alt release)
 //   XCB_PROPERTY_NOTIFY - window property changed
 //   XCB_DESTROY_NOTIFY - window destroyed
 //   XCB_CREATE_NOTIFY - window created
+```
+
+**Key Grabbing:**
+```
+xcb_grab_key(conn, owner_events, root, modifiers, keycode, ptr_mode, kbd_mode)
+xcb_ungrab_key(conn, keycode, root, modifiers)
+xcb_grab_keyboard(conn, owner_events, root, time, ptr_mode, kbd_mode) -> status
+xcb_ungrab_keyboard(conn, time)
+```
+
+**Key Symbols (xcb-keysyms):**
+```
+xcb_key_symbols_alloc(conn) -> xcb_key_symbols_t*
+xcb_key_symbols_get_keycode(syms, keysym) -> xcb_keycode_t*
+xcb_key_symbols_get_keysym(syms, keycode, col) -> xcb_keysym_t
+xcb_key_symbols_free(syms)
+```
+
+**Window Activation:**
+```
+// Send _NET_ACTIVE_WINDOW client message to root window
+xcb_send_event(conn, propagate, root, event_mask, event)
 ```
 
 ---
@@ -588,45 +450,3 @@ Image image = {
 Texture2D texture = LoadTextureFromImage(image);
 ```
 
----
-
-## Appendix C: Process Invocation in QML
-
-QML can invoke external processes using the `Process` type or `Qt.createQmlObject`. Example approach:
-
-```qml
-import QtQuick 2.15
-import org.kde.kwin 3.0 as KWin
-
-KWin.TabBoxSwitcher {
-    id: tabBox
-    
-    // Invisible - render nothing
-    Item { width: 1; height: 1 }
-    
-    Component.onCompleted: {
-        var ids = [];
-        for (var i = 0; i < tabBox.model.count; i++) {
-            ids.push(tabBox.model.data(tabBox.model.index(i, 0), /* wId role */));
-        }
-        // Invoke: fasttab show id1,id2,id3
-        executable.exec("fasttab", ["show", ids.join(",")]);
-    }
-    
-    Component.onDestruction: {
-        executable.exec("fasttab", ["hide"]);
-    }
-    
-    onCurrentIndexChanged: {
-        executable.exec("fasttab", ["index", currentIndex.toString()]);
-    }
-}
-```
-
-**Note:** The exact mechanism for process invocation depends on what's available in the KWin/Qt environment. Options include:
-
-- `Qt.labs.platform` Process type
-- Custom C++ helper registered as a QML type (minimal, just wraps QProcess)
-- KDE-specific APIs if available
-
-The developer should investigate what's available in the target KDE Plasma version.
