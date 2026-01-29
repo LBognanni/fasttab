@@ -105,6 +105,7 @@ pub const Atoms = struct {
     net_wm_pid: xcb.xcb_atom_t,
     net_client_list_stacking: xcb.xcb_atom_t,
     net_active_window: xcb.xcb_atom_t,
+    net_wm_icon: xcb.xcb_atom_t,
 };
 
 pub const MousePosition = struct {
@@ -212,6 +213,7 @@ pub fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
         .net_wm_pid = try internAtom(conn, "_NET_WM_PID"),
         .net_client_list_stacking = try internAtom(conn, "_NET_CLIENT_LIST_STACKING"),
         .net_active_window = try internAtom(conn, "_NET_ACTIVE_WINDOW"),
+        .net_wm_icon = try internAtom(conn, "_NET_WM_ICON"),
     };
 }
 
@@ -790,4 +792,136 @@ pub fn keycodeToKeysym(conn: *xcb.xcb_connection_t, keycode: xcb.xcb_keycode_t, 
 /// Get the XCB connection file descriptor for polling.
 pub fn getXcbFd(conn: *xcb.xcb_connection_t) std.posix.fd_t {
     return xcb.xcb_get_file_descriptor(conn);
+}
+
+/// Raw icon data from _NET_WM_ICON (ARGB u32 pixels)
+pub const IconData = struct {
+    data: []u32,
+    width: u32,
+    height: u32,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *IconData) void {
+        self.allocator.free(self.data);
+    }
+};
+
+/// Get the WM_CLASS of a window (returns the class name, the second null-terminated string).
+/// Caller must free the returned slice if it is not "(unknown)".
+pub fn getWindowClass(
+    allocator: std.mem.Allocator,
+    conn: *xcb.xcb_connection_t,
+    window: xcb.xcb_window_t,
+    atoms: Atoms,
+) []const u8 {
+    const cookie = xcb.xcb_get_property(conn, 0, window, atoms.wm_class, xcb.XCB_ATOM_STRING, 0, 256);
+    const reply = xcb.xcb_get_property_reply(conn, cookie, null);
+    if (reply == null) {
+        return "(unknown)";
+    }
+    defer std.c.free(reply);
+
+    const len: usize = @intCast(xcb.xcb_get_property_value_length(reply));
+    if (len == 0) {
+        return "(unknown)";
+    }
+
+    const data: [*]const u8 = @ptrCast(xcb.xcb_get_property_value(reply));
+    const bytes = data[0..len];
+
+    // WM_CLASS is two null-terminated strings: instance\0class\0
+    // Find the first null to skip instance name
+    var first_null: ?usize = null;
+    for (bytes, 0..) |b, i| {
+        if (b == 0) {
+            first_null = i;
+            break;
+        }
+    }
+
+    if (first_null) |pos| {
+        if (pos + 1 < len) {
+            const class_start = pos + 1;
+            // Find end of class string (next null or end of data)
+            var class_end = class_start;
+            while (class_end < len and bytes[class_end] != 0) {
+                class_end += 1;
+            }
+            if (class_end > class_start) {
+                return allocator.dupe(u8, bytes[class_start..class_end]) catch "(unknown)";
+            }
+        }
+    }
+
+    return "(unknown)";
+}
+
+/// Get the best icon from _NET_WM_ICON closest to target_size.
+/// Returns null if no icon is available. Caller owns the returned IconData.
+pub fn getWindowIcon(
+    allocator: std.mem.Allocator,
+    conn: *xcb.xcb_connection_t,
+    window: xcb.xcb_window_t,
+    atoms: Atoms,
+    target_size: u32,
+) ?IconData {
+    // _NET_WM_ICON can be very large (multiple icons at various sizes)
+    const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_icon, xcb.XCB_ATOM_CARDINAL, 0, 65536);
+    const reply = xcb.xcb_get_property_reply(conn, cookie, null);
+    if (reply == null) {
+        return null;
+    }
+    defer std.c.free(reply);
+
+    const byte_len: usize = @intCast(xcb.xcb_get_property_value_length(reply));
+    const u32_count = byte_len / @sizeOf(u32);
+    if (u32_count < 3) { // Need at least width + height + 1 pixel
+        return null;
+    }
+
+    const data: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
+    const values = data[0..u32_count];
+
+    // Walk through icon entries to find the one closest to target_size
+    var best_offset: ?usize = null;
+    var best_width: u32 = 0;
+    var best_height: u32 = 0;
+    var best_diff: u32 = std.math.maxInt(u32);
+
+    var offset: usize = 0;
+    while (offset + 2 <= u32_count) {
+        const w = values[offset];
+        const h = values[offset + 1];
+        const pixel_count: usize = @as(usize, w) * @as(usize, h);
+
+        if (w == 0 or h == 0 or offset + 2 + pixel_count > u32_count) {
+            break;
+        }
+
+        // Prefer closest to target, favor larger over smaller
+        const size = @max(w, h);
+        const diff = if (size >= target_size) size - target_size else (target_size - size) * 2;
+        if (best_offset == null or diff < best_diff) {
+            best_offset = offset;
+            best_width = w;
+            best_height = h;
+            best_diff = diff;
+        }
+
+        offset += 2 + pixel_count;
+    }
+
+    if (best_offset) |bo| {
+        const pixel_count: usize = @as(usize, best_width) * @as(usize, best_height);
+        const icon_pixels = allocator.alloc(u32, pixel_count) catch return null;
+        @memcpy(icon_pixels, values[bo + 2 .. bo + 2 + pixel_count]);
+        return IconData{
+            .data = icon_pixels,
+            .width = best_width,
+            .height = best_height,
+            .allocator = allocator,
+        };
+    }
+
+    return null;
 }

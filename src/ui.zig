@@ -24,12 +24,18 @@ pub const BACKGROUND_COLOR = rl.Color{ .r = 0x22, .g = 0x22, .b = 0x22, .a = 217
 pub const HIGHLIGHT_COLOR = rl.Color{ .r = 0x3d, .g = 0xae, .b = 0xe9, .a = 255 };
 pub const TITLE_COLOR = rl.Color{ .r = 255, .g = 255, .b = 255, .a = 255 };
 
+// Icon overlay constants
+pub const ICON_HEIGHT_RATIO: f32 = 0.25;
+pub const ICON_BOTTOM_OVERHANG: f32 = 0.05;
+
 // Item holding window data for rendering
 pub const WindowItem = struct {
     id: x11.xcb.xcb_window_t,
     title: []const u8,
     thumbnail: thumbnail.Thumbnail,
     texture: rl.Texture2D,
+    icon_texture: ?rl.Texture2D,
+    wm_class: []const u8,
     display_width: u32,
     display_height: u32,
 };
@@ -257,6 +263,28 @@ pub fn renderSwitcher(items: []WindowItem, selected_index: usize, font: rl.Font)
                 .height = @floatFromInt(item.texture.height),
             };
             rl.DrawTexturePro(item.texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+
+            // Draw icon overlay at bottom-center of thumbnail
+            if (item.icon_texture) |icon_tex| {
+                const thumb_h: f32 = @floatFromInt(item.display_height);
+                const thumb_w: f32 = @floatFromInt(item.display_width);
+                const icon_size = thumb_h * ICON_HEIGHT_RATIO;
+                const icon_x = x + (thumb_w - icon_size) / 2.0;
+                const icon_y = y + thumb_h - icon_size + (thumb_h * ICON_BOTTOM_OVERHANG);
+                const icon_src = rl.Rectangle{
+                    .x = 0,
+                    .y = 0,
+                    .width = @floatFromInt(icon_tex.width),
+                    .height = @floatFromInt(icon_tex.height),
+                };
+                const icon_dst = rl.Rectangle{
+                    .x = icon_x,
+                    .y = icon_y,
+                    .width = icon_size,
+                    .height = icon_size,
+                };
+                rl.DrawTexturePro(icon_tex, icon_src, icon_dst, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+            }
 
             const title_y = y + @as(f32, @floatFromInt(item.display_height + TITLE_SPACING));
             drawTruncatedText(font, item.title, x, title_y, @floatFromInt(TITLE_FONT_SIZE), @floatFromInt(item.display_width), TITLE_COLOR);

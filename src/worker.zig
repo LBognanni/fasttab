@@ -11,6 +11,10 @@ pub const ThumbnailUpdate = struct {
     thumbnail_data: []u8,
     thumbnail_width: u32,
     thumbnail_height: u32,
+    icon_data: ?[]u8,
+    icon_width: u32,
+    icon_height: u32,
+    wm_class: []const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ThumbnailUpdate) void {
@@ -19,6 +23,12 @@ pub const ThumbnailUpdate = struct {
         }
         if (!std.mem.eql(u8, self.title, "(unknown)")) {
             self.allocator.free(self.title);
+        }
+        if (self.icon_data) |icon| {
+            self.allocator.free(icon);
+        }
+        if (!std.mem.eql(u8, self.wm_class, "(unknown)")) {
+            self.allocator.free(self.wm_class);
         }
     }
 };
@@ -135,6 +145,37 @@ pub const UpdateQueue = struct {
     }
 };
 
+/// Fetch icon from X11, process it, and store in cache. Returns cached thumbnail on success.
+fn fetchAndCacheIcon(
+    allocator: std.mem.Allocator,
+    conn: *x11.Connection,
+    window_id: x11.xcb.xcb_window_t,
+    wm_class: []const u8,
+    icon_cache: *std.StringHashMap(thumbnail.Thumbnail),
+) ?thumbnail.Thumbnail {
+    var icon_raw = x11.getWindowIcon(allocator, conn.conn, window_id, conn.atoms, thumbnail.ICON_SIZE) orelse return null;
+    defer icon_raw.deinit();
+
+    const icon_thumb = thumbnail.processIconArgb(icon_raw.data, icon_raw.width, icon_raw.height, allocator) catch return null;
+
+    // Make a copy for the cache (icon_thumb.data will be the canonical cached copy)
+    const cache_key = allocator.dupe(u8, wm_class) catch {
+        var t = icon_thumb;
+        t.deinit();
+        return null;
+    };
+
+    icon_cache.put(cache_key, icon_thumb) catch {
+        allocator.free(cache_key);
+        var t = icon_thumb;
+        t.deinit();
+        return null;
+    };
+
+    // Return the cached entry (the cache now owns the data)
+    return icon_cache.get(wm_class);
+}
+
 pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void {
     // Create our own X11 connection (X11 is not thread-safe)
     var conn = x11.Connection.init() catch |err| {
@@ -156,6 +197,18 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
     var is_first_scan = true;
     var pidCache = x11.PidCache.init(allocator);
     defer pidCache.deinit();
+
+    // Icon cache: WM_CLASS -> processed icon thumbnail (raw RGBA data)
+    var icon_cache = std.StringHashMap(thumbnail.Thumbnail).init(allocator);
+    defer {
+        var ic_iter = icon_cache.iterator();
+        while (ic_iter.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            var thumb = entry.value_ptr.*;
+            thumb.deinit();
+        }
+        icon_cache.deinit();
+    }
 
     const ourPid = std.os.linux.getpid();
     log.debug("Background worker: Our PID is {d}", .{ourPid});
@@ -221,17 +274,63 @@ pub fn backgroundWorker(queue: *UpdateQueue, allocator: std.mem.Allocator) void 
                 // Duplicate thumbnail data (scanner will free its copy)
                 const data_copy = allocator.dupe(u8, thumb.data) catch continue;
 
+                // Get WM_CLASS for this window
+                const wm_class = x11.getWindowClass(allocator, conn.conn, item.window_id, conn.atoms);
+                defer {
+                    if (!std.mem.eql(u8, wm_class, "(unknown)")) {
+                        allocator.free(wm_class);
+                    }
+                }
+
+                // Look up or fetch icon for this WM_CLASS
+                var icon_data_copy: ?[]u8 = null;
+                var icon_w: u32 = 0;
+                var icon_h: u32 = 0;
+
+                if (!std.mem.eql(u8, wm_class, "(unknown)")) {
+                    if (icon_cache.get(wm_class)) |cached_icon| {
+                        // Cache hit: send a copy of the cached icon data
+                        icon_data_copy = allocator.dupe(u8, cached_icon.data) catch null;
+                        icon_w = cached_icon.width;
+                        icon_h = cached_icon.height;
+                    } else {
+                        // Cache miss: fetch from X11 and process
+                        const icon_opt = fetchAndCacheIcon(allocator, &conn, item.window_id, wm_class, &icon_cache);
+                        if (icon_opt) |cached| {
+                            icon_data_copy = allocator.dupe(u8, cached.data) catch null;
+                            icon_w = cached.width;
+                            icon_h = cached.height;
+                        }
+                    }
+                }
+
+                // Duplicate wm_class for the update
+                const wm_class_copy = if (std.mem.eql(u8, wm_class, "(unknown)"))
+                    wm_class
+                else
+                    allocator.dupe(u8, wm_class) catch "(unknown)";
+
                 result.updates.append(ThumbnailUpdate{
                     .window_id = item.window_id,
                     .title = title_copy,
                     .thumbnail_data = data_copy,
                     .thumbnail_width = thumb.width,
                     .thumbnail_height = thumb.height,
+                    .icon_data = icon_data_copy,
+                    .icon_width = icon_w,
+                    .icon_height = icon_h,
+                    .wm_class = wm_class_copy,
                     .allocator = allocator,
                 }) catch {
                     allocator.free(data_copy);
                     if (!std.mem.eql(u8, title_copy, "(unknown)")) {
                         allocator.free(title_copy);
+                    }
+                    if (icon_data_copy) |idc| {
+                        allocator.free(idc);
+                    }
+                    if (!std.mem.eql(u8, wm_class_copy, "(unknown)")) {
+                        allocator.free(wm_class_copy);
                     }
                     continue;
                 };

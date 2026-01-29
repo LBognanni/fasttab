@@ -51,6 +51,7 @@ pub const App = struct {
     xcb_root: x11.xcb.xcb_window_t,
     xcb_atoms: x11.Atoms,
     state: SwitcherState,
+    icon_texture_cache: std.StringHashMap(rl.Texture2D),
 
     const Self = @This();
 
@@ -79,6 +80,9 @@ pub const App = struct {
 
         try items.ensureTotalCapacity(initial_result.updates.items.len);
 
+        // Build icon texture cache from initial updates
+        var icon_texture_cache = std.StringHashMap(rl.Texture2D).init(allocator);
+
         for (initial_result.updates.items) |*upd| {
             const thumb = thumbnail.Thumbnail{
                 .data = upd.thumbnail_data,
@@ -92,6 +96,8 @@ pub const App = struct {
                 .title = upd.title,
                 .thumbnail = thumb,
                 .texture = undefined,
+                .icon_texture = null,
+                .wm_class = upd.wm_class,
                 .display_width = 0,
                 .display_height = 0,
             });
@@ -99,6 +105,7 @@ pub const App = struct {
             // Transfer ownership - prevent deinit from freeing
             upd.thumbnail_data = &[_]u8{};
             upd.title = "(unknown)";
+            upd.wm_class = "(unknown)";
         }
 
         // Calculate initial layout
@@ -113,9 +120,41 @@ pub const App = struct {
         // Load system font
         const font = ui.loadSystemFont(ui.TITLE_FONT_SIZE * 2);
 
-        // Load textures from thumbnails
+        // Load textures from thumbnails and icons
         for (items.items) |*item| {
             item.texture = ui.loadTextureFromThumbnail(&item.thumbnail);
+        }
+
+        // Process icon data from initial updates (textures must be created after InitWindow)
+        for (initial_result.updates.items, 0..) |*upd, i| {
+            if (upd.icon_data) |icon_data| {
+                const wm_class = items.items[i].wm_class;
+                if (!std.mem.eql(u8, wm_class, "(unknown)") and !icon_texture_cache.contains(wm_class)) {
+                    const icon_thumb = thumbnail.Thumbnail{
+                        .data = icon_data,
+                        .width = upd.icon_width,
+                        .height = upd.icon_height,
+                        .allocator = upd.allocator,
+                    };
+                    const icon_tex = ui.loadTextureFromThumbnail(&icon_thumb);
+                    const cache_key = allocator.dupe(u8, wm_class) catch continue;
+                    icon_texture_cache.put(cache_key, icon_tex) catch {
+                        allocator.free(cache_key);
+                        rl.UnloadTexture(icon_tex);
+                        continue;
+                    };
+                }
+                // Free the icon data - we've uploaded it to GPU
+                upd.allocator.free(icon_data);
+                upd.icon_data = null;
+            }
+        }
+
+        // Assign icon textures to items from cache
+        for (items.items) |*item| {
+            if (!std.mem.eql(u8, item.wm_class, "(unknown)")) {
+                item.icon_texture = icon_texture_cache.get(item.wm_class);
+            }
         }
 
         // Find monitor containing mouse cursor
@@ -147,6 +186,7 @@ pub const App = struct {
             .xcb_root = xcb_root,
             .xcb_atoms = xcb_atoms,
             .state = .idle,
+            .icon_texture_cache = icon_texture_cache,
         };
     }
 
@@ -155,7 +195,17 @@ pub const App = struct {
         // Unload textures and close window (window stays open even when "hidden")
         for (self.items.items) |*item| {
             rl.UnloadTexture(item.texture);
+            // Don't unload icon_texture here - it's shared via icon_texture_cache
         }
+
+        // Unload icon textures from cache
+        var icon_iter = self.icon_texture_cache.iterator();
+        while (icon_iter.next()) |entry| {
+            rl.UnloadTexture(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.icon_texture_cache.deinit();
+
         rl.UnloadFont(self.font);
         rl.CloseWindow();
 
@@ -164,6 +214,9 @@ pub const App = struct {
             item.thumbnail.deinit();
             if (!std.mem.eql(u8, item.title, "(unknown)")) {
                 self.allocator.free(item.title);
+            }
+            if (!std.mem.eql(u8, item.wm_class, "(unknown)")) {
+                self.allocator.free(item.wm_class);
             }
         }
         self.items.deinit();
@@ -545,9 +598,13 @@ pub const App = struct {
             const item = &self.items.items[idx];
 
             rl.UnloadTexture(item.texture);
+            // Don't unload icon_texture - shared via cache
             item.thumbnail.deinit();
             if (!std.mem.eql(u8, item.title, "(unknown)")) {
                 self.allocator.free(item.title);
+            }
+            if (!std.mem.eql(u8, item.wm_class, "(unknown)")) {
+                self.allocator.free(item.wm_class);
             }
             _ = self.items.orderedRemove(idx);
             log.debug("Removed window at index {d}", .{idx});
@@ -595,6 +652,11 @@ pub const App = struct {
 
         // Transfer ownership
         upd.thumbnail_data = &[_]u8{};
+
+        // Update icon if missing
+        if (item.icon_texture == null) {
+            self.processIconForItem(item, upd);
+        }
     }
 
     fn addNewWindow(self: *Self, upd: *worker.ThumbnailUpdate) void {
@@ -607,17 +669,25 @@ pub const App = struct {
 
         const texture = ui.loadTextureFromThumbnail(&new_thumb);
 
-        const new_item = ui.WindowItem{
+        var new_item = ui.WindowItem{
             .id = upd.window_id,
             .title = upd.title,
             .thumbnail = new_thumb,
             .texture = texture,
+            .icon_texture = null,
+            .wm_class = upd.wm_class,
             .display_width = 0,
             .display_height = 0,
         };
 
+        // Process icon for this new item
+        self.processIconForItem(&new_item, upd);
+
         self.items.append(new_item) catch {
             rl.UnloadTexture(texture);
+            if (!std.mem.eql(u8, new_item.wm_class, "(unknown)")) {
+                self.allocator.free(new_item.wm_class);
+            }
             return;
         };
 
@@ -626,6 +696,45 @@ pub const App = struct {
         // Transfer ownership
         upd.thumbnail_data = &[_]u8{};
         upd.title = "(unknown)";
+        upd.wm_class = "(unknown)";
+    }
+
+    /// Process icon data from a ThumbnailUpdate and assign icon_texture to item.
+    /// Checks the icon_texture_cache first, then creates from icon_data if available.
+    fn processIconForItem(self: *Self, item: *ui.WindowItem, upd: *worker.ThumbnailUpdate) void {
+        const wm_class = item.wm_class;
+        if (std.mem.eql(u8, wm_class, "(unknown)")) return;
+
+        // Check cache first
+        if (self.icon_texture_cache.get(wm_class)) |cached_tex| {
+            item.icon_texture = cached_tex;
+            return;
+        }
+
+        // Create from icon_data if available
+        if (upd.icon_data) |icon_data| {
+            const icon_thumb = thumbnail.Thumbnail{
+                .data = icon_data,
+                .width = upd.icon_width,
+                .height = upd.icon_height,
+                .allocator = upd.allocator,
+            };
+            const icon_tex = ui.loadTextureFromThumbnail(&icon_thumb);
+            const cache_key = self.allocator.dupe(u8, wm_class) catch {
+                rl.UnloadTexture(icon_tex);
+                return;
+            };
+            self.icon_texture_cache.put(cache_key, icon_tex) catch {
+                self.allocator.free(cache_key);
+                rl.UnloadTexture(icon_tex);
+                return;
+            };
+            item.icon_texture = icon_tex;
+
+            // Free the icon data - uploaded to GPU
+            upd.allocator.free(icon_data);
+            upd.icon_data = null;
+        }
     }
 
     fn updateLayout(self: *Self) void {
