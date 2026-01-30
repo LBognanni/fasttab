@@ -1,4 +1,5 @@
 const std = @import("std");
+const desktop_icon = @import("desktop_icon.zig");
 
 // Feature flags
 pub const FILTER_BY_CURRENT_DESKTOP = true;
@@ -866,63 +867,96 @@ pub fn getWindowIcon(
     atoms: Atoms,
     target_size: u32,
 ) ?IconData {
-    // _NET_WM_ICON can be very large (multiple icons at various sizes)
-    const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_icon, xcb.XCB_ATOM_CARDINAL, 0, std.math.maxInt(u32));
-    const reply = xcb.xcb_get_property_reply(conn, cookie, null);
-    if (reply == null) {
-        return null;
-    }
-    defer std.c.free(reply);
+    // 1. Try _NET_WM_ICON (preferred as it's provided by the app itself)
+    const net_icon = blk: {
+        const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_icon, xcb.XCB_ATOM_CARDINAL, 0, std.math.maxInt(u32));
+        const reply = xcb.xcb_get_property_reply(conn, cookie, null);
+        if (reply == null) break :blk null;
+        defer std.c.free(reply);
 
-    const byte_len: usize = @intCast(xcb.xcb_get_property_value_length(reply));
-    const u32_count = byte_len / @sizeOf(u32);
-    if (u32_count < 3) { // Need at least width + height + 1 pixel
-        return null;
-    }
-
-    const data: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
-    const values = data[0..u32_count];
-
-    // Walk through icon entries to find the one closest to target_size
-    var best_offset: ?usize = null;
-    var best_width: u32 = 0;
-    var best_height: u32 = 0;
-    var best_diff: u32 = std.math.maxInt(u32);
-
-    var offset: usize = 0;
-    while (offset + 2 <= u32_count) {
-        const w = values[offset];
-        const h = values[offset + 1];
-        const pixel_count: usize = @as(usize, w) * @as(usize, h);
-
-        if (w == 0 or h == 0 or offset + 2 + pixel_count > u32_count) {
-            break;
+        const byte_len: usize = @intCast(xcb.xcb_get_property_value_length(reply));
+        const u32_count = byte_len / @sizeOf(u32);
+        if (u32_count < 3) { // Need at least width + height + 1 pixel
+            break :blk null;
         }
 
-        // Prefer closest to target, favor larger over smaller
-        const size = @max(w, h);
-        const diff = if (size >= target_size) size - target_size else (target_size - size) * 2;
-        if (best_offset == null or diff < best_diff) {
-            best_offset = offset;
-            best_width = w;
-            best_height = h;
-            best_diff = diff;
+        const data: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
+        const values = data[0..u32_count];
+
+        // Walk through icon entries to find the one closest to target_size
+        var best_offset: ?usize = null;
+        var best_width: u32 = 0;
+        var best_height: u32 = 0;
+        var best_diff: u32 = std.math.maxInt(u32);
+
+        var offset: usize = 0;
+        while (offset + 2 <= u32_count) {
+            const w = values[offset];
+            const h = values[offset + 1];
+            const pixel_count: usize = @as(usize, w) * @as(usize, h);
+
+            if (w == 0 or h == 0 or offset + 2 + pixel_count > u32_count) {
+                break;
+            }
+
+            // Prefer closest to target, favor larger over smaller
+            const size = @max(w, h);
+            const diff = if (size >= target_size) size - target_size else (target_size - size) * 2;
+            if (best_offset == null or diff < best_diff) {
+                best_offset = offset;
+                best_width = w;
+                best_height = h;
+                best_diff = diff;
+            }
+
+            offset += 2 + pixel_count;
         }
 
-        offset += 2 + pixel_count;
+        if (best_offset) |bo| {
+            const pixel_count: usize = @as(usize, best_width) * @as(usize, best_height);
+            const icon_pixels = allocator.alloc(u32, pixel_count) catch break :blk null;
+            @memcpy(icon_pixels, values[bo + 2 .. bo + 2 + pixel_count]);
+            break :blk IconData{
+                .data = icon_pixels,
+                .width = best_width,
+                .height = best_height,
+                .allocator = allocator,
+            };
+        }
+        break :blk null;
+    };
+
+    if (net_icon) |icon| return icon;
+
+    // 2. Fallback: Try .desktop file
+    const class_name = getWindowClass(allocator, conn, window, atoms);
+    defer if (!std.mem.eql(u8, class_name, "(unknown)")) allocator.free(class_name);
+    
+    if (std.mem.eql(u8, class_name, "(unknown)")) return null;
+
+    var icon_result = desktop_icon.getAppIcon(allocator, class_name, target_size) catch |err| {
+        log.warn("Failed to get desktop icon for {s}: {}", .{class_name, err});
+        return null;
+    };
+    defer icon_result.deinit();
+
+    const pixel_count = @as(usize, @intCast(icon_result.width)) * @as(usize, @intCast(icon_result.height));
+    const icon_pixels = allocator.alloc(u32, pixel_count) catch return null;
+    
+    // Convert RGBA (STB) to ARGB (X11/Internal)
+    for (0..pixel_count) |i| {
+        const r = icon_result.pixels[i*4 + 0];
+        const g = icon_result.pixels[i*4 + 1];
+        const b = icon_result.pixels[i*4 + 2];
+        const a = icon_result.pixels[i*4 + 3];
+        
+        icon_pixels[i] = (@as(u32, a) << 24) | (@as(u32, r) << 16) | (@as(u32, g) << 8) | @as(u32, b);
     }
 
-    if (best_offset) |bo| {
-        const pixel_count: usize = @as(usize, best_width) * @as(usize, best_height);
-        const icon_pixels = allocator.alloc(u32, pixel_count) catch return null;
-        @memcpy(icon_pixels, values[bo + 2 .. bo + 2 + pixel_count]);
-        return IconData{
-            .data = icon_pixels,
-            .width = best_width,
-            .height = best_height,
-            .allocator = allocator,
-        };
-    }
-
-    return null;
+    return IconData{
+        .data = icon_pixels,
+        .width = @intCast(icon_result.width),
+        .height = @intCast(icon_result.height),
+        .allocator = allocator,
+    };
 }

@@ -184,12 +184,12 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
 
     // Second pass: process captures into thumbnails
     if (capture_tasks.items.len == 0) {
-        log.debug("Scanner: {d} total, {d} filtered by type, {d} by desktop, {d} skipped minimized, 0 to process", .{
-            stats.total,
-            stats.filtered_by_type,
-            stats.filtered_by_desktop,
-            stats.skipped_minimized,
-        });
+        // log.debug("Scanner: {d} total, {d} filtered by type, {d} by desktop, {d} skipped minimized, 0 to process", .{
+        //     stats.total,
+        //     stats.filtered_by_type,
+        //     stats.filtered_by_desktop,
+        //     stats.skipped_minimized,
+        // });
         return result;
     }
 
@@ -268,13 +268,13 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
         }
     }
 
-    log.debug("Scanner: {d} total, {d} filtered by type, {d} by desktop, {d} skipped minimized, {d} captured", .{
-        stats.total,
-        stats.filtered_by_type,
-        stats.filtered_by_desktop,
-        stats.skipped_minimized,
-        result.items.items.len,
-    });
+    // log.debug("Scanner: {d} total, {d} filtered by type, {d} by desktop, {d} skipped minimized, {d} captured", .{
+    //     stats.total,
+    //     stats.filtered_by_type,
+    //     stats.filtered_by_desktop,
+    //     stats.skipped_minimized,
+    //     result.items.items.len,
+    // });
 
     return result;
 }

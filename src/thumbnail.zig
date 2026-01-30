@@ -3,7 +3,6 @@ const x11 = @import("x11.zig");
 const color = @import("color.zig");
 
 const stb = @cImport({
-    @cInclude("stb_image_write.h");
     @cInclude("stb_image_resize2.h");
 });
 

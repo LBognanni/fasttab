@@ -72,7 +72,7 @@ fn runDaemon() !void {
     try stdout.print("Found {d} windows.\n", .{initial_result.updates.items.len});
 
     for (initial_result.updates.items) |update| {
-        try stdout.print("  {s} ({d}x{d})\n", .{ update.title, update.thumbnail_width, update.thumbnail_height });
+        try stdout.print(" {x} {s} ({d}x{d})\n", .{ update.window_id, update.title, update.thumbnail_width, update.thumbnail_height });
     }
 
     // Get mouse position BEFORE initializing raylib
