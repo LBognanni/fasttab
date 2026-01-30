@@ -36,12 +36,18 @@ pub fn getAppIcon(allocator: mem.Allocator, app_name: []const u8, target_size: u
 }
 
 fn findIconNameFromDesktop(allocator: mem.Allocator, app_name: []const u8) !?[]const u8 {
+    const home = std.posix.getenv("HOME") orelse "";
+    const user_apps = try std.fs.path.join(allocator, &[_][]const u8{ home, ".local/share/applications" });
+    defer allocator.free(user_apps);
+
     const search_paths = [_][]const u8{
         "/usr/share/applications",
-        "~/.local/share/applications", // Note: would need full home path expansion in prod
+        user_apps,
     };
 
     for (search_paths) |base| {
+        if (!fs.path.isAbsolute(base)) continue;
+
         var dir = fs.openDirAbsolute(base, .{}) catch continue;
         defer dir.close();
 
