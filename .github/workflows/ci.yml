@@ -62,6 +62,21 @@ jobs:
       - name: Build Release
         run: zig build -Doptimize=ReleaseSafe
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Generate Changelog
+        id: generate_log
+        run: |
+          CHANGELOG=$(python .github/scripts/collate_commits.py)
+          {
+            echo 'changelog_content<<EOF'
+            echo "$CHANGELOG"
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+
       - name: Bump version and push tag
         id: tag_version
         uses: mathieudutour/github-tag-action@v6.1
@@ -73,5 +88,5 @@ jobs:
         with:
           tag_name: ${{ steps.tag_version.outputs.new_tag }}
           name: Release ${{ steps.tag_version.outputs.new_tag }}
-          body: ${{ steps.tag_version.outputs.changelog }}
+          body: ${{ steps.generate_log.outputs.changelog_content }}
           files: zig-out/bin/fasttab
