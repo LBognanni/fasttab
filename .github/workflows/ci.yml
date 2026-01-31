@@ -43,7 +43,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Check for changes
+        id: check_changes
+        run: python .github/scripts/should_release.py
+
       - name: Install system dependencies
+        if: steps.check_changes.outputs.should_release == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -52,23 +62,22 @@ jobs:
             libxcb1-dev libxcb-composite0-dev libxcb-image0-dev libxcb-keysyms1-dev
 
       - name: Setup Zig
+        if: steps.check_changes.outputs.should_release == 'true'
         uses: mlugg/setup-zig@v2
         with:
           version: 0.14.0
 
       - name: Download dependencies
+        if: steps.check_changes.outputs.should_release == 'true'
         run: chmod +x ./setup.sh && ./setup.sh
 
       - name: Build Release
+        if: steps.check_changes.outputs.should_release == 'true'
         run: zig build -Doptimize=ReleaseSafe
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
 
       - name: Generate Changelog
         id: generate_log
+        if: steps.check_changes.outputs.should_release == 'true'
         run: |
           CHANGELOG=$(python .github/scripts/collate_commits.py)
           {
@@ -79,11 +88,13 @@ jobs:
 
       - name: Bump version and push tag
         id: tag_version
+        if: steps.check_changes.outputs.should_release == 'true'
         uses: mathieudutour/github-tag-action@v6.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create Release
+        if: steps.check_changes.outputs.should_release == 'true'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.tag_version.outputs.new_tag }}
