@@ -86,7 +86,8 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
     }
 
     // Get current window list from X11
-    const windows = try x11.getWindowList(conn.conn, conn.root, conn.atoms);
+    const windows = try x11.getWindowList(allocator, conn.conn, conn.root, conn.atoms);
+    defer allocator.free(windows);
 
     var result = ScanResult.init(allocator);
     errdefer result.deinit();
@@ -156,7 +157,9 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
                 _ = result.window_ids.pop();
                 if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
                 log.debug("Window {x} no longer exists", .{window_id});
-                continue;
+                if (!is_known) {
+                    continue;
+                }
             }
 
             // For other errors, keep window in list but mark capture as failed

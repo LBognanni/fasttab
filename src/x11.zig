@@ -229,7 +229,7 @@ pub fn initComposite(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) X11Err
     defer std.c.free(reply);
 }
 
-pub fn getWindowList(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t, atoms: Atoms) X11Error![]xcb.xcb_window_t {
+pub fn getWindowList(allocator: std.mem.Allocator, conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t, atoms: Atoms) (X11Error || std.mem.Allocator.Error)![]xcb.xcb_window_t {
     const cookie = xcb.xcb_get_property(
         conn,
         0,
@@ -247,12 +247,16 @@ pub fn getWindowList(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t, atoms:
 
     const len = xcb.xcb_get_property_value_length(reply);
     if (len == 0) {
-        return &[_]xcb.xcb_window_t{};
+        return allocator.alloc(xcb.xcb_window_t, 0);
     }
 
-    const data: [*]xcb.xcb_window_t = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
+    const data: [*]const xcb.xcb_window_t = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
     const count = @as(usize, @intCast(len)) / @sizeOf(xcb.xcb_window_t);
-    return data[0..count];
+
+    // Copy to owned slice (XCB reply buffer will be freed by defer above)
+    const result = try allocator.alloc(xcb.xcb_window_t, count);
+    @memcpy(result, data[0..count]);
+    return result;
 }
 
 pub fn getWindowTitle(
@@ -449,6 +453,7 @@ pub fn captureRawImage(
     const geom_cookie = xcb.xcb_get_geometry(conn, window);
     const geom_reply = xcb.xcb_get_geometry_reply(conn, geom_cookie, null);
     if (geom_reply == null) {
+        log.err("Failed to get geometry for window {x} ({s})", .{ window, title });
         return X11Error.GeometryFetchFailed;
     }
     defer std.c.free(geom_reply);
