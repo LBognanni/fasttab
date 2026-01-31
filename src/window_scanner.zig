@@ -103,30 +103,18 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
         capture_tasks.deinit();
     }
 
-    var stats = struct {
-        total: usize = 0,
-        filtered_by_type: usize = 0,
-        filtered_by_desktop: usize = 0,
-        skipped_minimized: usize = 0,
-        capture_failed: usize = 0,
-    }{};
-
     for (windows) |window_id| {
-        stats.total += 1;
-
         if (x11.isCurrentExecutable(conn.conn, window_id, conn.atoms, pidCache)) {
             continue;
         }
 
         // Filter by window type
         if (!x11.shouldShowWindow(conn.conn, window_id, conn.atoms)) {
-            stats.filtered_by_type += 1;
             continue;
         }
 
         // Filter by current desktop
         if (!x11.isWindowOnCurrentDesktop(conn.conn, window_id, conn.root, conn.atoms)) {
-            stats.filtered_by_desktop += 1;
             continue;
         }
 
@@ -139,11 +127,9 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
         // When capture_only_new is true (window hidden), skip ALL known windows
         // When false (window visible or first scan), only skip minimized known windows
         if (options.capture_only_new and is_known) {
-            stats.skipped_minimized += 1; // reusing counter for skipped windows
             continue;
         }
         if (is_minimized and is_known) {
-            stats.skipped_minimized += 1;
             continue;
         }
 
@@ -163,7 +149,6 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
             }
 
             // For other errors, keep window in list but mark capture as failed
-            stats.capture_failed += 1;
             log.debug("Failed to capture window {x}: {}", .{ window_id, err });
 
             try capture_tasks.append(.{
@@ -187,12 +172,6 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
 
     // Second pass: process captures into thumbnails
     if (capture_tasks.items.len == 0) {
-        // log.debug("Scanner: {d} total, {d} filtered by type, {d} by desktop, {d} skipped minimized, 0 to process", .{
-        //     stats.total,
-        //     stats.filtered_by_type,
-        //     stats.filtered_by_desktop,
-        //     stats.skipped_minimized,
-        // });
         return result;
     }
 
@@ -270,14 +249,6 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
             task.title = "(unknown)";
         }
     }
-
-    // log.debug("Scanner: {d} total, {d} filtered by type, {d} by desktop, {d} skipped minimized, {d} captured", .{
-    //     stats.total,
-    //     stats.filtered_by_type,
-    //     stats.filtered_by_desktop,
-    //     stats.skipped_minimized,
-    //     result.items.items.len,
-    // });
 
     return result;
 }

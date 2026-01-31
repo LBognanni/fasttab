@@ -174,28 +174,6 @@ pub const App = struct {
         return self.current_layout;
     }
 
-    /// Get the X11 window ID of the raylib window
-    pub fn getWindowId(self: *const Self) x11.xcb.xcb_window_t {
-        _ = self;
-        const handle_ptr = rl.GetWindowHandle();
-        if (handle_ptr == null) {
-            log.err("GetWindowHandle returned null", .{});
-            return 0;
-        }
-
-        // Try reading as u32 (xcb_window_t size)
-        var window_id_32: u32 = 0;
-        @memcpy(std.mem.asBytes(&window_id_32), @as([*]const u8, @ptrCast(handle_ptr))[0..4]);
-
-        if (window_id_32 != 0) {
-            return window_id_32;
-        }
-        // Fallback for 64-bit systems where Window is unsigned long
-        var window_id_64: c_ulong = 0;
-        @memcpy(std.mem.asBytes(&window_id_64), @as([*]const u8, @ptrCast(handle_ptr))[0..@sizeOf(c_ulong)]);
-        return @intCast(window_id_64);
-    }
-
     /// Process one frame: check for window close, render
     pub fn update(self: *Self) void {
         if (self.window_hidden) {
@@ -515,9 +493,7 @@ pub const App = struct {
     }
 
     /// Handle a key event during switching.
-    pub fn handleKeyEvent(self: *Self, keysym: u32, is_press: bool, state_mask: u16) bool {
-        _ = state_mask;
-
+    pub fn handleKeyEvent(self: *Self, keysym: u32, is_press: bool) bool {
         if (self.state != .switching) {
             return false;
         }

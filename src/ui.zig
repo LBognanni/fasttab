@@ -31,14 +31,14 @@ pub const ICON_BOTTOM_OVERHANG: f32 = 0.05;
 // Item holding window data for rendering
 pub const DisplayWindow = struct {
     id: x11.xcb.xcb_window_t,
-    title: []const u8,               // owned
-    thumbnail_texture: rl.Texture2D,  // GPU handle
-    icon_texture: ?rl.Texture2D,      // non-owning copy from icon_texture_cache
-    icon_id: []const u8,              // owned (WM_CLASS)
+    title: []const u8, // owned
+    thumbnail_texture: rl.Texture2D, // GPU handle
+    icon_texture: ?rl.Texture2D, // non-owning copy from icon_texture_cache
+    icon_id: []const u8, // owned (WM_CLASS)
     title_version: u32,
     thumbnail_version: u32,
-    source_width: u32,                // original thumbnail width (for layout)
-    source_height: u32,               // original thumbnail height (for layout)
+    source_width: u32, // original thumbnail width (for layout)
+    source_height: u32, // original thumbnail height (for layout)
     display_width: u32,
     display_height: u32,
 };
@@ -60,14 +60,10 @@ pub fn calculateGridLayout(items: []DisplayWindow, target_height: u32) GridLayou
         };
     }
 
-    var max_item_width: u32 = 0;
     var total_item_width: u32 = 0;
     for (items) |*item| {
         item.display_height = target_height;
         item.display_width = calculateItemWidth(item.source_width, item.source_height, target_height);
-        if (item.display_width > max_item_width) {
-            max_item_width = item.display_width;
-        }
         total_item_width += item.display_width;
     }
 
@@ -138,7 +134,7 @@ pub fn calculateRowWidth(items: []DisplayWindow, start_idx: u32, count: u32) u32
 }
 
 pub fn getItemAtPosition(items: []DisplayWindow, layout: GridLayout, mouse_pos: rl.Vector2) ?usize {
-     if (items.len == 0) return null;
+    if (items.len == 0) return null;
 
     const item_full_height = layout.item_height + TITLE_SPACING + @as(u32, @intCast(TITLE_FONT_SIZE));
 
@@ -154,12 +150,12 @@ pub fn getItemAtPosition(items: []DisplayWindow, layout: GridLayout, mouse_pos: 
         var col: u32 = 0;
         while (col < items_in_row) : (col += 1) {
             const item = &items[item_idx];
-            
+
             const hit_rect = rl.Rectangle{
-                 .x = x - @as(f32, @floatFromInt(SELECTION_BORDER)),
-                 .y = y - @as(f32, @floatFromInt(SELECTION_BORDER)),
-                 .width = @as(f32, @floatFromInt(item.display_width + 2 * SELECTION_BORDER)),
-                 .height = @as(f32, @floatFromInt(item_full_height + 2 * SELECTION_BORDER)),
+                .x = x - @as(f32, @floatFromInt(SELECTION_BORDER)),
+                .y = y - @as(f32, @floatFromInt(SELECTION_BORDER)),
+                .width = @as(f32, @floatFromInt(item.display_width + 2 * SELECTION_BORDER)),
+                .height = @as(f32, @floatFromInt(item_full_height + 2 * SELECTION_BORDER)),
             };
 
             if (rl.CheckCollisionPointRec(mouse_pos, hit_rect)) {

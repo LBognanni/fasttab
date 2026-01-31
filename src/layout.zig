@@ -44,14 +44,10 @@ pub fn calculateGridLayoutGeneric(items: []LayoutItem, target_height: u32) GridL
         };
     }
 
-    var max_item_width: u32 = 0;
     var total_item_width: u32 = 0;
     for (items) |*item| {
         item.display_height = target_height;
         item.display_width = calculateItemWidth(item.thumb_width, item.thumb_height, target_height);
-        if (item.display_width > max_item_width) {
-            max_item_width = item.display_width;
-        }
         total_item_width += item.display_width;
     }
 

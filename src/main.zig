@@ -132,15 +132,14 @@ fn processXcbEvents(application: *app.App, conn: *x11.xcb.xcb_connection_t) void
                         x11.XK_ISO_Left_Tab
                     else
                         keysym;
-                    _ = application.handleKeyEvent(effective_keysym, true, state_mask);
+                    _ = application.handleKeyEvent(effective_keysym, true);
                 }
             },
             x11.xcb.XCB_KEY_RELEASE => {
                 const key_event: *x11.xcb.xcb_key_release_event_t = @ptrCast(event);
                 const keysym = x11.keycodeToKeysym(conn, key_event.detail, 0);
-                const state_mask = key_event.state;
 
-                _ = application.handleKeyEvent(keysym, false, state_mask);
+                _ = application.handleKeyEvent(keysym, false);
             },
             else => {},
         }

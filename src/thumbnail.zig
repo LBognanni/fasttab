@@ -8,9 +8,6 @@ const stb = @cImport({
 
 const log = std.log.scoped(.fasttab);
 
-// Re-export for backwards compatibility
-pub const convertBgraToRgbaSimd = color.convertBgraToRgbaSimd;
-
 pub const Thumbnail = struct {
     data: []u8,
     width: u32,
@@ -41,7 +38,7 @@ pub fn processRawCapture(capture: *const x11.RawCapture, allocator: std.mem.Allo
 
     // Convert BGRA to RGBA using SIMD (if 32-bit depth)
     if (bytes_per_pixel == 4 and capture.data.len >= pixel_count * 4) {
-        convertBgraToRgbaSimd(capture.data[0 .. pixel_count * 4], src_rgba);
+        color.convertBgraToRgbaSimd(capture.data[0 .. pixel_count * 4], src_rgba);
     } else {
         // Fallback for non-32bit formats
         var i: usize = 0;
@@ -144,22 +141,4 @@ pub fn processIconArgb(icon_data: []const u32, src_width: u32, src_height: u32, 
         .height = ICON_SIZE,
         .allocator = allocator,
     };
-}
-
-pub fn saveThumbnailPNG(thumbnail: Thumbnail, window_id: x11.xcb.xcb_window_t) !void {
-    var filename_buf: [256]u8 = undefined;
-    const filename = try std.fmt.bufPrintZ(&filename_buf, "window_{d}.png", .{window_id});
-
-    const result = stb.stbi_write_png(
-        filename.ptr,
-        @intCast(thumbnail.width),
-        @intCast(thumbnail.height),
-        4,
-        thumbnail.data.ptr,
-        @intCast(thumbnail.width * 4),
-    );
-    if (result == 0) {
-        log.err("Failed to write PNG for window {x}", .{window_id});
-        return error.PNGWriteFailed;
-    }
 }

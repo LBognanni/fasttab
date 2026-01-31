@@ -165,7 +165,7 @@ pub const Connection = struct {
         }
 
         const atoms = try initAtoms(conn.?);
-        try initComposite(conn.?, screen.*.root);
+        try initComposite(conn.?);
 
         return Connection{
             .conn = conn.?,
@@ -218,9 +218,7 @@ pub fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
     };
 }
 
-pub fn initComposite(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) X11Error!void {
-    _ = root;
-
+pub fn initComposite(conn: *xcb.xcb_connection_t) X11Error!void {
     const cookie = xcb.xcb_composite_query_version(conn, 0, 4);
     const reply = xcb.xcb_composite_query_version_reply(conn, cookie, null);
     if (reply == null) {
