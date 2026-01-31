@@ -202,7 +202,7 @@ pub const App = struct {
 
         // Handle mouse input - only after the mouse has moved from its initial position
         const mouse_pos = rl.GetMousePosition();
-        const mouse_moved = mouse_pos.x != self.last_mouse_pos.x or mouse_pos.y != self.last_mouse_pos.y;
+        const mouse_moved = @abs(mouse_pos.x - self.last_mouse_pos.x) > 2 or @abs(mouse_pos.y - self.last_mouse_pos.y) > 2;
         self.last_mouse_pos = mouse_pos;
         if (mouse_moved) {
             if (ui.getItemAtPosition(self.items.items, self.current_layout, mouse_pos)) |idx| {
