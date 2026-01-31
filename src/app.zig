@@ -460,21 +460,17 @@ pub const App = struct {
             queue.setWindowVisible(true);
         }
 
-        // Recalculate layout and resize window if needed
-        const prev_layout = self.current_layout;
+        // Recalculate layout
         self.current_layout = ui.calculateBestLayout(self.items.items);
-
-        if (self.current_layout.total_width != prev_layout.total_width or
-            self.current_layout.total_height != prev_layout.total_height)
-        {
-            rl.SetWindowSize(@intCast(self.current_layout.total_width), @intCast(self.current_layout.total_height));
-        }
 
         // Query current mouse position and find monitor
         const mouse_pos = x11.getMousePosition(self.xcb_conn, self.xcb_root);
         self.monitor = findMonitorAtPosition(mouse_pos);
 
         rl.ClearWindowState(rl.FLAG_WINDOW_HIDDEN);
+
+        // Set size after showing - SetWindowSize on a hidden window may not take effect
+        rl.SetWindowSize(@intCast(self.current_layout.total_width), @intCast(self.current_layout.total_height));
 
         const win_x = self.monitor.x + @divTrunc(self.monitor.width - @as(i32, @intCast(self.current_layout.total_width)), 2);
         const win_y = self.monitor.y + @divTrunc(self.monitor.height - @as(i32, @intCast(self.current_layout.total_height)), 2);
