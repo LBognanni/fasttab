@@ -31,18 +31,18 @@ Rather than integrating as a KWin plugin (which adds complexity and limits porta
 │  ┌──────────────────┐     ┌─────────────────────────────────┐  │
 │  │  Window Tracker  │     │       Thumbnail Cache           │  │
 │  │                  │     │                                 │  │
-│  │  - X11 events    │────▶│  - XComposite capture          │  │
-│  │  - _NET_CLIENT   │     │  - Periodic refresh            │  │
-│  │    _LIST         │     │  - In-memory RGBA buffers      │  │
+│  │  - X11 events    │────▶│  - XComposite capture           │  │
+│  │  - _NET_CLIENT   │     │  - Periodic refresh             │  │
+│  │    _LIST         │     │  - In-memory RGBA buffers       │  │
 │  └──────────────────┘     └─────────────────────────────────┘  │
 │                                       │                        │
 │                                       ▼                        │
 │  ┌──────────────────┐     ┌─────────────────────────────────┐  │
 │  │   Key Grabber    │     │       Switcher Renderer         │  │
 │  │                  │     │                                 │  │
-│  │  - Alt+Tab grab  │────▶│  - raylib window               │  │
-│  │  - XCB key evts  │     │  - Grid layout                 │  │
-│  │  - State machine │     │  - Selection highlight         │  │
+│  │  - Alt+Tab grab  │────▶│  - raylib window                │  │
+│  │  - XCB key evts  │     │  - Grid layout                  │  │
+│  │  - State machine │     │  - Selection highlight          │  │
 │  └──────────────────┘     └─────────────────────────────────┘  │
 │                                       │                        │
 │                                       ▼                        │
