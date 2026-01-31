@@ -29,13 +29,16 @@ pub const ICON_HEIGHT_RATIO: f32 = 0.25;
 pub const ICON_BOTTOM_OVERHANG: f32 = 0.05;
 
 // Item holding window data for rendering
-pub const WindowItem = struct {
+pub const DisplayWindow = struct {
     id: x11.xcb.xcb_window_t,
-    title: []const u8,
-    thumbnail: thumbnail.Thumbnail,
-    texture: rl.Texture2D,
-    icon_texture: ?rl.Texture2D,
-    wm_class: []const u8,
+    title: []const u8, // owned
+    thumbnail_texture: rl.Texture2D, // GPU handle
+    icon_texture: ?rl.Texture2D, // non-owning copy from icon_texture_cache
+    icon_id: []const u8, // owned (WM_CLASS)
+    title_version: u32,
+    thumbnail_version: u32,
+    source_width: u32, // original thumbnail width (for layout)
+    source_height: u32, // original thumbnail height (for layout)
     display_width: u32,
     display_height: u32,
 };
@@ -46,7 +49,7 @@ pub const GridLayout = layout_module.GridLayout;
 // Re-export pure layout functions
 pub const calculateItemWidth = layout_module.calculateItemWidth;
 
-pub fn calculateGridLayout(items: []WindowItem, target_height: u32) GridLayout {
+pub fn calculateGridLayout(items: []DisplayWindow, target_height: u32) GridLayout {
     if (items.len == 0) {
         return GridLayout{
             .columns = 0,
@@ -61,7 +64,7 @@ pub fn calculateGridLayout(items: []WindowItem, target_height: u32) GridLayout {
     var total_item_width: u32 = 0;
     for (items) |*item| {
         item.display_height = target_height;
-        item.display_width = calculateItemWidth(item.thumbnail.width, item.thumbnail.height, target_height);
+        item.display_width = calculateItemWidth(item.source_width, item.source_height, target_height);
         if (item.display_width > max_item_width) {
             max_item_width = item.display_width;
         }
@@ -111,7 +114,7 @@ pub fn calculateGridLayout(items: []WindowItem, target_height: u32) GridLayout {
     };
 }
 
-pub fn calculateRowWidth(items: []WindowItem, start_idx: u32, count: u32) u32 {
+pub fn calculateRowWidth(items: []DisplayWindow, start_idx: u32, count: u32) u32 {
     var width: u32 = 0;
     const end = @min(start_idx + count, @as(u32, @intCast(items.len)));
     var i = start_idx;
@@ -205,7 +208,7 @@ fn drawTruncatedText(font: rl.Font, text: []const u8, x: f32, y: f32, font_size:
     rl.DrawTextEx(font, text_ptr, rl.Vector2{ .x = text_x, .y = y }, font_size, spacing, color);
 }
 
-pub fn renderSwitcher(items: []WindowItem, selected_index: usize, font: rl.Font) void {
+pub fn renderSwitcher(items: []DisplayWindow, selected_index: usize, font: rl.Font) void {
     if (items.len == 0) return;
 
     var layout = calculateGridLayout(items, THUMBNAIL_HEIGHT);
@@ -259,10 +262,10 @@ pub fn renderSwitcher(items: []WindowItem, selected_index: usize, font: rl.Font)
             const source_rect = rl.Rectangle{
                 .x = 0,
                 .y = 0,
-                .width = @floatFromInt(item.texture.width),
-                .height = @floatFromInt(item.texture.height),
+                .width = @floatFromInt(item.thumbnail_texture.width),
+                .height = @floatFromInt(item.thumbnail_texture.height),
             };
-            rl.DrawTexturePro(item.texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+            rl.DrawTexturePro(item.thumbnail_texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
 
             // Draw icon overlay at bottom-center of thumbnail
             if (item.icon_texture) |icon_tex| {

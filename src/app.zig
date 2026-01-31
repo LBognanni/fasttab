@@ -38,7 +38,7 @@ pub const MonitorInfo = struct {
 /// Application state encapsulating all raylib window and UI management
 pub const App = struct {
     allocator: std.mem.Allocator,
-    items: std.ArrayList(ui.WindowItem),
+    items: std.ArrayList(ui.DisplayWindow),
     selected_index: usize,
     current_layout: ui.GridLayout,
     font: rl.Font,
@@ -46,7 +46,8 @@ pub const App = struct {
     window_hidden: bool,
     daemon_mode: bool,
     should_quit: bool,
-    update_queue: ?*worker.UpdateQueue,
+    update_queue: ?*worker.TaskQueue,
+    temp_tasks: std.ArrayList(worker.UpdateTask),
     xcb_conn: *x11.xcb.xcb_connection_t,
     xcb_root: x11.xcb.xcb_window_t,
     xcb_atoms: x11.Atoms,
@@ -58,145 +59,83 @@ pub const App = struct {
     /// Initialize the application with items from the worker
     pub fn init(
         allocator: std.mem.Allocator,
-        initial_result: *worker.RefreshResult,
-        mouse_pos: x11.MousePosition,
+        task_queue: *worker.TaskQueue,
         daemon_mode: bool,
-        update_queue: ?*worker.UpdateQueue,
         xcb_conn: *x11.xcb.xcb_connection_t,
         xcb_root: x11.xcb.xcb_window_t,
         xcb_atoms: x11.Atoms,
     ) !Self {
-        // Build initial window items from worker result
-        var items = std.ArrayList(ui.WindowItem).init(allocator);
-        errdefer {
-            for (items.items) |*item| {
-                item.thumbnail.deinit();
-                if (!std.mem.eql(u8, item.title, "(unknown)")) {
-                    allocator.free(item.title);
-                }
-            }
-            items.deinit();
-        }
+        // Create empty items list and caches
+        const items = std.ArrayList(ui.DisplayWindow).init(allocator);
+        const icon_texture_cache = std.StringHashMap(rl.Texture2D).init(allocator);
+        const temp_tasks = std.ArrayList(worker.UpdateTask).init(allocator);
 
-        try items.ensureTotalCapacity(initial_result.updates.items.len);
-
-        // Build icon texture cache from initial updates
-        var icon_texture_cache = std.StringHashMap(rl.Texture2D).init(allocator);
-
-        for (initial_result.updates.items) |*upd| {
-            const thumb = thumbnail.Thumbnail{
-                .data = upd.thumbnail_data,
-                .width = upd.thumbnail_width,
-                .height = upd.thumbnail_height,
-                .allocator = upd.allocator,
-            };
-
-            items.appendAssumeCapacity(ui.WindowItem{
-                .id = upd.window_id,
-                .title = upd.title,
-                .thumbnail = thumb,
-                .texture = undefined,
-                .icon_texture = null,
-                .wm_class = upd.wm_class,
-                .display_width = 0,
-                .display_height = 0,
-            });
-
-            // Transfer ownership - prevent deinit from freeing
-            upd.thumbnail_data = &[_]u8{};
-            upd.title = "(unknown)";
-            upd.wm_class = "(unknown)";
-        }
-
-        // Calculate initial layout
-        const layout = ui.calculateGridLayout(items.items, ui.THUMBNAIL_HEIGHT);
-
-        // Create raylib window
-        rl.SetConfigFlags(rl.FLAG_WINDOW_UNDECORATED | rl.FLAG_WINDOW_TRANSPARENT | rl.FLAG_WINDOW_TOPMOST);
+        // Create raylib window (hidden initially)
+        rl.SetConfigFlags(rl.FLAG_WINDOW_UNDECORATED | rl.FLAG_WINDOW_TRANSPARENT | rl.FLAG_WINDOW_TOPMOST | rl.FLAG_WINDOW_HIDDEN);
         rl.SetTraceLogLevel(rl.LOG_WARNING);
-        rl.InitWindow(@intCast(layout.total_width), @intCast(layout.total_height), "FastTab");
+        // Initial size doesn't matter much as it starts hidden and resizes on show
+        rl.InitWindow(800, 600, "FastTab");
         rl.SetTargetFPS(60);
 
         // Load system font
         const font = ui.loadSystemFont(ui.TITLE_FONT_SIZE * 2);
 
-        // Load textures from thumbnails and icons
-        for (items.items) |*item| {
-            item.texture = ui.loadTextureFromThumbnail(&item.thumbnail);
-        }
+        // Default layout
+        const layout = ui.GridLayout{
+            .columns = 0,
+            .rows = 0,
+            .item_height = ui.THUMBNAIL_HEIGHT,
+            .total_width = ui.PADDING * 2,
+            .total_height = ui.PADDING * 2,
+        };
 
-        // Process icon data from initial updates (textures must be created after InitWindow)
-        for (initial_result.updates.items, 0..) |*upd, i| {
-            if (upd.icon_data) |icon_data| {
-                const wm_class = items.items[i].wm_class;
-                if (!std.mem.eql(u8, wm_class, "(unknown)") and !icon_texture_cache.contains(wm_class)) {
-                    const icon_thumb = thumbnail.Thumbnail{
-                        .data = icon_data,
-                        .width = upd.icon_width,
-                        .height = upd.icon_height,
-                        .allocator = upd.allocator,
-                    };
-                    const icon_tex = ui.loadTextureFromThumbnail(&icon_thumb);
-                    const cache_key = allocator.dupe(u8, wm_class) catch continue;
-                    icon_texture_cache.put(cache_key, icon_tex) catch {
-                        allocator.free(cache_key);
-                        rl.UnloadTexture(icon_tex);
-                        continue;
-                    };
-                }
-                // Free the icon data - we've uploaded it to GPU
-                upd.allocator.free(icon_data);
-                upd.icon_data = null;
-            }
-        }
+        // Default monitor (updated on show)
+        const monitor = MonitorInfo{
+            .index = 0,
+            .x = 0,
+            .y = 0,
+            .width = 1920,
+            .height = 1080,
+        };
 
-        // Assign icon textures to items from cache
-        for (items.items) |*item| {
-            if (!std.mem.eql(u8, item.wm_class, "(unknown)")) {
-                item.icon_texture = icon_texture_cache.get(item.wm_class);
-            }
-        }
-
-        // Find monitor containing mouse cursor
-        const monitor = findMonitorAtPosition(mouse_pos);
-
-        // Non-daemon mode: center window on monitor
-        const win_x = monitor.x + @divTrunc(monitor.width - @as(i32, @intCast(layout.total_width)), 2);
-        const win_y = monitor.y + @divTrunc(monitor.height - @as(i32, @intCast(layout.total_height)), 2);
-        rl.SetWindowPosition(win_x, win_y);
-        log.info("App initialized: {d} windows, monitor {d} at ({d},{d})", .{
-            items.items.len,
-            monitor.index,
-            monitor.x,
-            monitor.y,
-        });
-
-        return Self{
+        var self = Self{
             .allocator = allocator,
             .items = items,
             .selected_index = 0,
             .current_layout = layout,
             .font = font,
             .monitor = monitor,
-            .window_hidden = false,
+            .window_hidden = true,
             .daemon_mode = daemon_mode,
             .should_quit = false,
-            .update_queue = update_queue,
+            .update_queue = task_queue,
+            .temp_tasks = temp_tasks,
             .xcb_conn = xcb_conn,
             .xcb_root = xcb_root,
             .xcb_atoms = xcb_atoms,
             .state = .idle,
             .icon_texture_cache = icon_texture_cache,
         };
+
+        // Process initial tasks
+        self.drainUpdateQueue();
+
+        log.info("App initialized: {d} windows tracked", .{self.items.items.len});
+
+        return self;
     }
 
     /// Clean up all resources
     pub fn deinit(self: *Self) void {
-        // Unload textures and close window (window stays open even when "hidden")
+        // Unload textures and close window
         for (self.items.items) |*item| {
-            rl.UnloadTexture(item.texture);
+            rl.UnloadTexture(item.thumbnail_texture);
             // Don't unload icon_texture here - it's shared via icon_texture_cache
+            // Free owned fields
+            self.allocator.free(item.title);
+            self.allocator.free(item.icon_id);
         }
+        self.items.deinit();
 
         // Unload icon textures from cache
         var icon_iter = self.icon_texture_cache.iterator();
@@ -206,20 +145,14 @@ pub const App = struct {
         }
         self.icon_texture_cache.deinit();
 
+        // Clean up temp tasks
+        for (self.temp_tasks.items) |*task| {
+            task.deinit();
+        }
+        self.temp_tasks.deinit();
+
         rl.UnloadFont(self.font);
         rl.CloseWindow();
-
-        // Free item data
-        for (self.items.items) |*item| {
-            item.thumbnail.deinit();
-            if (!std.mem.eql(u8, item.title, "(unknown)")) {
-                self.allocator.free(item.title);
-            }
-            if (!std.mem.eql(u8, item.wm_class, "(unknown)")) {
-                self.allocator.free(item.wm_class);
-            }
-        }
-        self.items.deinit();
     }
 
     /// Check if the app should continue running
@@ -246,33 +179,16 @@ pub const App = struct {
             return 0;
         }
 
-        // Debug: print raw pointer and first bytes
-        const ptr_bytes: [*]const u8 = @ptrCast(handle_ptr);
-        log.debug("GetWindowHandle ptr: {*}, bytes: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}", .{
-            handle_ptr,
-            ptr_bytes[0],
-            ptr_bytes[1],
-            ptr_bytes[2],
-            ptr_bytes[3],
-            ptr_bytes[4],
-            ptr_bytes[5],
-            ptr_bytes[6],
-            ptr_bytes[7],
-        });
-
         // Try reading as u32 (xcb_window_t size)
         var window_id_32: u32 = 0;
-        @memcpy(std.mem.asBytes(&window_id_32), ptr_bytes[0..4]);
-        log.debug("As u32: {d}", .{window_id_32});
-
-        // Try reading as c_ulong (X11 Window type)
-        var window_id_64: c_ulong = 0;
-        @memcpy(std.mem.asBytes(&window_id_64), ptr_bytes[0..@sizeOf(c_ulong)]);
-        log.debug("As c_ulong: {d}", .{window_id_64});
+        @memcpy(std.mem.asBytes(&window_id_32), @as([*]const u8, @ptrCast(handle_ptr))[0..4]);
 
         if (window_id_32 != 0) {
             return window_id_32;
         }
+        // Fallback for 64-bit systems where Window is unsigned long
+        var window_id_64: c_ulong = 0;
+        @memcpy(std.mem.asBytes(&window_id_64), @as([*]const u8, @ptrCast(handle_ptr))[0..@sizeOf(c_ulong)]);
         return @intCast(window_id_64);
     }
 
@@ -284,7 +200,7 @@ pub const App = struct {
             return;
         }
 
-        // Check if window should close (fallback for window manager close)
+        // Check if window should close
         if (rl.WindowShouldClose()) {
             if (self.daemon_mode) {
                 self.cancelSwitching();
@@ -294,46 +210,179 @@ pub const App = struct {
             }
         }
 
-        // Render (all keyboard input is handled via XCB events)
+        // Render
         self.render();
     }
 
-    /// Process an update from the background worker
-    pub fn processWorkerUpdate(self: *Self, update_result: *worker.RefreshResult) void {
-        // if (self.window_hidden) {
-        //     log.debug("Processing update while hidden: {d} current windows, {d} updates", .{
-        //         update_result.current_window_ids.items.len,
-        //         update_result.updates.items.len,
-        //     });
-        // }
+    pub fn drainUpdateQueue(self: *Self) void {
+        const queue = self.update_queue orelse return;
 
-        // Build set of current window IDs
-        var current_window_set = std.AutoHashMap(x11.xcb.xcb_window_t, void).init(self.allocator);
-        defer current_window_set.deinit();
-        for (update_result.current_window_ids.items) |wid| {
-            current_window_set.put(wid, {}) catch {};
+        // Move tasks to temp buffer
+        _ = queue.drainAll(&self.temp_tasks);
+        if (self.temp_tasks.items.len == 0) return;
+
+        var any_changes = false;
+
+        for (self.temp_tasks.items) |*task| {
+            any_changes = true;
+            switch (task.*) {
+                .window_added => |*data| {
+                    // Upload thumbnail
+                    const thumb = thumbnail.Thumbnail{
+                        .data = data.thumbnail_data,
+                        .width = data.thumbnail_width,
+                        .height = data.thumbnail_height,
+                        .allocator = data.allocator,
+                    };
+                    const texture = ui.loadTextureFromThumbnail(&thumb);
+
+                    // Look up icon
+                    var icon_tex: ?rl.Texture2D = null;
+                    if (self.icon_texture_cache.get(data.icon_id)) |tex| {
+                        icon_tex = tex;
+                    }
+
+                    // Create display window (taking ownership of title and icon_id)
+                    const new_item = ui.DisplayWindow{
+                        .id = data.window_id,
+                        .title = data.title,
+                        .thumbnail_texture = texture,
+                        .icon_texture = icon_tex,
+                        .icon_id = data.icon_id,
+                        .title_version = data.title_version,
+                        .thumbnail_version = data.thumbnail_version,
+                        .source_width = data.thumbnail_width,
+                        .source_height = data.thumbnail_height,
+                        .display_width = 0,
+                        .display_height = 0,
+                    };
+
+                    self.items.append(new_item) catch {
+                        rl.UnloadTexture(texture);
+                        // Free the strings since we failed to append
+                        self.allocator.free(data.title);
+                        self.allocator.free(data.icon_id);
+                        continue;
+                    };
+
+                    // Clear ownership from task
+                    data.title = &[_]u8{};
+                    data.icon_id = &[_]u8{};
+                    // thumbnail_data is also owned by task, but we uploaded it and don't need it anymore.
+                    data.allocator.free(data.thumbnail_data);
+                    data.thumbnail_data = &[_]u8{};
+                },
+
+                .window_removed => |*data| {
+                    for (self.items.items, 0..) |*item, i| {
+                        if (item.id == data.window_id) {
+                            rl.UnloadTexture(item.thumbnail_texture);
+                            self.allocator.free(item.title);
+                            self.allocator.free(item.icon_id);
+                            _ = self.items.orderedRemove(i);
+                            break;
+                        }
+                    }
+                },
+
+                .thumbnail_updated => |*data| {
+                    for (self.items.items) |*item| {
+                        if (item.id == data.window_id) {
+                            if (data.thumbnail_version > item.thumbnail_version) {
+                                rl.UnloadTexture(item.thumbnail_texture);
+                                const thumb = thumbnail.Thumbnail{
+                                    .data = data.thumbnail_data,
+                                    .width = data.thumbnail_width,
+                                    .height = data.thumbnail_height,
+                                    .allocator = data.allocator,
+                                };
+                                item.thumbnail_texture = ui.loadTextureFromThumbnail(&thumb);
+                                item.thumbnail_version = data.thumbnail_version;
+                                item.source_width = data.thumbnail_width;
+                                item.source_height = data.thumbnail_height;
+                            }
+                            break;
+                        }
+                    }
+                    // Free pixel data
+                    data.allocator.free(data.thumbnail_data);
+                    data.thumbnail_data = &[_]u8{};
+                },
+
+                .title_updated => |*data| {
+                    var found = false;
+                    for (self.items.items) |*item| {
+                        if (item.id == data.window_id) {
+                            found = true;
+                            if (data.title_version > item.title_version) {
+                                self.allocator.free(item.title);
+                                item.title = data.title;
+                                item.title_version = data.title_version;
+                                // Clear from task
+                                data.title = &[_]u8{};
+                            }
+                            break;
+                        }
+                    }
+                    if (!found or data.title.len > 0) {
+                        // If not used, free it
+                        if (data.title.len > 0) data.allocator.free(data.title);
+                        data.title = &[_]u8{};
+                    }
+                },
+
+                .icon_added => |*data| {
+                    const thumb = thumbnail.Thumbnail{
+                        .data = data.icon_data,
+                        .width = data.icon_width,
+                        .height = data.icon_height,
+                        .allocator = data.allocator,
+                    };
+                    const texture = ui.loadTextureFromThumbnail(&thumb);
+
+                    self.icon_texture_cache.put(data.icon_id, texture) catch {
+                        rl.UnloadTexture(texture);
+                        data.allocator.free(data.icon_id);
+                        data.allocator.free(data.icon_data);
+                        data.icon_id = &[_]u8{};
+                        data.icon_data = &[_]u8{};
+                        continue;
+                    };
+
+                    // Update all items that use this icon
+                    for (self.items.items) |*item| {
+                        if (std.mem.eql(u8, item.icon_id, data.icon_id)) {
+                            item.icon_texture = texture;
+                        }
+                    }
+
+                    // Clear ownership from task
+                    // icon_id is now owned by map key
+                    data.icon_id = &[_]u8{};
+                    // icon_data uploaded to GPU, free it
+                    data.allocator.free(data.icon_data);
+                    data.icon_data = &[_]u8{};
+                },
+            }
         }
 
-        log.debug("Current window set is {d} windows; processing {d} updates", .{
-            current_window_set.count(),
-            update_result.updates.items.len,
-        });
-
-        // Find and remove closed windows
-        self.removeClosedWindows(&current_window_set);
-
-        // Process updates for existing and new windows
-        self.applyWindowUpdates(update_result);
-
-        // Adjust selected index
-        if (self.items.items.len == 0) {
-            self.selected_index = 0;
-        } else if (self.selected_index >= self.items.items.len) {
-            self.selected_index = self.items.items.len - 1;
+        // Clean up tasks
+        for (self.temp_tasks.items) |*task| {
+            task.deinit();
         }
+        self.temp_tasks.clearRetainingCapacity();
 
-        // Recalculate and update layout
-        self.updateLayout();
+        if (any_changes) {
+            // Adjust selected index if out of bounds
+            if (self.items.items.len == 0) {
+                self.selected_index = 0;
+            } else if (self.selected_index >= self.items.items.len) {
+                self.selected_index = self.items.items.len - 1;
+            }
+
+            // Recalculate layout
+            self.updateLayout();
+        }
     }
 
     /// Move selection to next window (wraps around)
@@ -356,7 +405,7 @@ pub const App = struct {
     pub fn hideWindow(self: *Self) void {
         log.debug("Hiding window", .{});
 
-        // Notify worker that window is hidden (optimize captures)
+        // Notify worker that window is hidden
         if (self.update_queue) |queue| {
             queue.setWindowVisible(false);
         }
@@ -370,7 +419,7 @@ pub const App = struct {
     pub fn showWindow(self: *Self) void {
         log.debug("Showing window with {d} items", .{self.items.items.len});
 
-        // Notify worker that window is visible (capture all windows)
+        // Notify worker that window is visible
         if (self.update_queue) |queue| {
             queue.setWindowVisible(true);
         }
@@ -402,10 +451,9 @@ pub const App = struct {
 
     // === Alt+Tab state machine ===
 
-    /// Handle initial Alt+Tab press: grab keyboard, reorder by stacking, show switcher.
+    /// Handle initial Alt+Tab press
     pub fn handleAltTab(self: *Self, shift: bool) void {
         if (self.state == .switching) {
-            // Already switching, treat as Tab press
             if (shift) {
                 self.selectPrev();
             } else {
@@ -414,23 +462,18 @@ pub const App = struct {
             return;
         }
 
-        // Grab the keyboard so we get all key events during switching
         if (!x11.grabKeyboard(self.xcb_conn, self.xcb_root)) {
             log.err("Could not grab keyboard, aborting Alt+Tab", .{});
             return;
         }
 
-        // Reorder items by stacking order (MRU)
         self.reorderByStacking();
 
-        // Show the switcher
         if (shift) {
-            // Shift+Tab: select last item
             if (self.items.items.len > 0) {
                 self.selected_index = self.items.items.len - 1;
             }
         } else {
-            // Tab: select index 1 (previous window) if available
             if (self.items.items.len > 1) {
                 self.selected_index = 1;
             } else {
@@ -444,7 +487,6 @@ pub const App = struct {
     }
 
     /// Handle a key event during switching.
-    /// Returns true if the event was consumed.
     pub fn handleKeyEvent(self: *Self, keysym: u32, is_press: bool, state_mask: u16) bool {
         _ = state_mask;
 
@@ -453,7 +495,6 @@ pub const App = struct {
         }
 
         if (!is_press) {
-            // Key release: check for Alt release to confirm
             if (keysym == x11.XK_Alt_L or keysym == x11.XK_Alt_R) {
                 self.confirmSwitching();
                 return true;
@@ -461,7 +502,6 @@ pub const App = struct {
             return false;
         }
 
-        // Key press during switching
         switch (keysym) {
             x11.XK_Tab => {
                 self.selectNext();
@@ -499,11 +539,10 @@ pub const App = struct {
         }
     }
 
-    /// Confirm switching: activate selected window, ungrab keyboard, hide
+    /// Confirm switching
     pub fn confirmSwitching(self: *Self) void {
         if (self.state != .switching) return;
 
-        // Activate the selected window
         if (self.items.items.len > 0 and self.selected_index < self.items.items.len) {
             const selected_id = self.items.items[self.selected_index].id;
             x11.activateWindow(self.xcb_conn, self.xcb_root, selected_id, self.xcb_atoms);
@@ -515,7 +554,7 @@ pub const App = struct {
         self.state = .idle;
     }
 
-    /// Cancel switching: ungrab keyboard, hide (no activation)
+    /// Cancel switching
     pub fn cancelSwitching(self: *Self) void {
         if (self.state != .switching) return;
 
@@ -535,12 +574,10 @@ pub const App = struct {
 
         if (stacking.len == 0) return;
 
-        // Build a new ordering: stacking list reversed (topmost = MRU = first)
-        var new_items = std.ArrayList(ui.WindowItem).init(self.allocator);
+        var new_items = std.ArrayList(ui.DisplayWindow).init(self.allocator);
         defer new_items.deinit();
         new_items.ensureTotalCapacity(self.items.items.len) catch return;
 
-        // Walk stacking list in reverse (topmost first)
         var si: usize = stacking.len;
         while (si > 0) {
             si -= 1;
@@ -553,7 +590,6 @@ pub const App = struct {
             }
         }
 
-        // Add any items that weren't in the stacking list (shouldn't happen normally)
         for (self.items.items) |item| {
             var found = false;
             for (new_items.items) |new_item| {
@@ -567,7 +603,6 @@ pub const App = struct {
             }
         }
 
-        // Replace items list (shallow copy, no memory to free since items are shared)
         self.items.clearRetainingCapacity();
         for (new_items.items) |item| {
             self.items.append(item) catch continue;
@@ -587,170 +622,11 @@ pub const App = struct {
         rl.EndDrawing();
     }
 
-    fn removeClosedWindows(self: *Self, current_window_set: *std.AutoHashMap(x11.xcb.xcb_window_t, void)) void {
-        // Find windows to remove
-        var to_remove = std.ArrayList(usize).init(self.allocator);
-        defer to_remove.deinit();
-
-        for (self.items.items, 0..) |item, idx| {
-            if (!current_window_set.contains(item.id)) {
-                to_remove.append(idx) catch {};
-            }
-        }
-
-        // Remove in reverse order to maintain indices
-        var remove_idx: usize = to_remove.items.len;
-        while (remove_idx > 0) {
-            remove_idx -= 1;
-            const idx = to_remove.items[remove_idx];
-            const item = &self.items.items[idx];
-
-            rl.UnloadTexture(item.texture);
-            // Don't unload icon_texture - shared via cache
-            item.thumbnail.deinit();
-            if (!std.mem.eql(u8, item.title, "(unknown)")) {
-                self.allocator.free(item.title);
-            }
-            if (!std.mem.eql(u8, item.wm_class, "(unknown)")) {
-                self.allocator.free(item.wm_class);
-            }
-            _ = self.items.orderedRemove(idx);
-            log.debug("Removed window at index {d}", .{idx});
-        }
-    }
-
-    fn applyWindowUpdates(self: *Self, update_result: *worker.RefreshResult) void {
-        for (update_result.updates.items) |*upd| {
-            // Find existing item
-            var found_idx: ?usize = null;
-            for (self.items.items, 0..) |item, idx| {
-                if (item.id == upd.window_id) {
-                    found_idx = idx;
-                    break;
-                }
-            }
-
-            if (found_idx) |idx| {
-                // Update existing window
-                self.updateExistingWindow(idx, upd);
-            } else {
-                // Add new window
-                self.addNewWindow(upd);
-            }
-        }
-    }
-
-    fn updateExistingWindow(self: *Self, idx: usize, upd: *worker.ThumbnailUpdate) void {
-        const item = &self.items.items[idx];
-
-        const new_thumb = thumbnail.Thumbnail{
-            .data = upd.thumbnail_data,
-            .width = upd.thumbnail_width,
-            .height = upd.thumbnail_height,
-            .allocator = upd.allocator,
-        };
-
-        // Update thumbnail data and texture
-        item.thumbnail.deinit();
-        item.thumbnail = new_thumb;
-
-        const new_texture = ui.loadTextureFromThumbnail(&new_thumb);
-        rl.UnloadTexture(item.texture);
-        item.texture = new_texture;
-
-        // Transfer ownership
-        upd.thumbnail_data = &[_]u8{};
-
-        // Update icon if missing
-        if (item.icon_texture == null) {
-            self.processIconForItem(item, upd);
-        }
-    }
-
-    fn addNewWindow(self: *Self, upd: *worker.ThumbnailUpdate) void {
-        const new_thumb = thumbnail.Thumbnail{
-            .data = upd.thumbnail_data,
-            .width = upd.thumbnail_width,
-            .height = upd.thumbnail_height,
-            .allocator = upd.allocator,
-        };
-
-        const texture = ui.loadTextureFromThumbnail(&new_thumb);
-
-        var new_item = ui.WindowItem{
-            .id = upd.window_id,
-            .title = upd.title,
-            .thumbnail = new_thumb,
-            .texture = texture,
-            .icon_texture = null,
-            .wm_class = upd.wm_class,
-            .display_width = 0,
-            .display_height = 0,
-        };
-
-        // Process icon for this new item
-        self.processIconForItem(&new_item, upd);
-
-        self.items.append(new_item) catch {
-            rl.UnloadTexture(texture);
-            if (!std.mem.eql(u8, new_item.wm_class, "(unknown)")) {
-                self.allocator.free(new_item.wm_class);
-            }
-            return;
-        };
-
-        log.debug("Added new window {x}: {s}", .{ new_item.id, new_item.title });
-
-        // Transfer ownership
-        upd.thumbnail_data = &[_]u8{};
-        upd.title = "(unknown)";
-        upd.wm_class = "(unknown)";
-    }
-
-    /// Process icon data from a ThumbnailUpdate and assign icon_texture to item.
-    /// Checks the icon_texture_cache first, then creates from icon_data if available.
-    fn processIconForItem(self: *Self, item: *ui.WindowItem, upd: *worker.ThumbnailUpdate) void {
-        const wm_class = item.wm_class;
-        if (std.mem.eql(u8, wm_class, "(unknown)")) return;
-
-        // Check cache first
-        if (self.icon_texture_cache.get(wm_class)) |cached_tex| {
-            item.icon_texture = cached_tex;
-            return;
-        }
-
-        // Create from icon_data if available
-        if (upd.icon_data) |icon_data| {
-            const icon_thumb = thumbnail.Thumbnail{
-                .data = icon_data,
-                .width = upd.icon_width,
-                .height = upd.icon_height,
-                .allocator = upd.allocator,
-            };
-            const icon_tex = ui.loadTextureFromThumbnail(&icon_thumb);
-            const cache_key = self.allocator.dupe(u8, wm_class) catch {
-                rl.UnloadTexture(icon_tex);
-                return;
-            };
-            self.icon_texture_cache.put(cache_key, icon_tex) catch {
-                self.allocator.free(cache_key);
-                rl.UnloadTexture(icon_tex);
-                return;
-            };
-            item.icon_texture = icon_tex;
-
-            // Free the icon data - uploaded to GPU
-            upd.allocator.free(icon_data);
-            upd.icon_data = null;
-        }
-    }
-
     fn updateLayout(self: *Self) void {
         const prev_width = self.current_layout.total_width;
         const prev_height = self.current_layout.total_height;
         self.current_layout = ui.calculateGridLayout(self.items.items, ui.THUMBNAIL_HEIGHT);
 
-        // Only update window size/position if window is visible and size changed
         if (!self.window_hidden and (self.current_layout.total_width != prev_width or self.current_layout.total_height != prev_height)) {
             rl.SetWindowSize(@intCast(self.current_layout.total_width), @intCast(self.current_layout.total_height));
             const win_x = self.monitor.x + @divTrunc(self.monitor.width - @as(i32, @intCast(self.current_layout.total_width)), 2);
@@ -761,7 +637,6 @@ pub const App = struct {
     }
 };
 
-/// Find the monitor containing the given position
 pub fn findMonitorAtPosition(pos: x11.MousePosition) MonitorInfo {
     const monitor_count = rl.GetMonitorCount();
 
@@ -787,7 +662,6 @@ pub fn findMonitorAtPosition(pos: x11.MousePosition) MonitorInfo {
         }
     }
 
-    // Default to first monitor
     return MonitorInfo{
         .index = 0,
         .x = 0,

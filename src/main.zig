@@ -44,42 +44,29 @@ fn runDaemon() !void {
     defer x11.ungrabAltTab(conn.conn, conn.root);
 
     // Create update queue and start background worker
-    var update_queue = worker.UpdateQueue{};
+    var task_queue = worker.TaskQueue.init(allocator);
 
-    const worker_thread = std.Thread.spawn(.{}, worker.backgroundWorker, .{ &update_queue, allocator }) catch |err| {
+    const worker_thread = std.Thread.spawn(.{}, worker.backgroundWorker, .{ &task_queue, allocator }) catch |err| {
         log.err("Failed to spawn background worker: {}", .{err});
         return err;
     };
 
     try stdout.print("Waiting for initial window scan...\n", .{});
 
-    // Wait for initial result from worker
-    var initial_result = update_queue.popBlocking(10000) orelse {
-        try stdout.print("No windows found (timeout waiting for worker).\n", .{});
-        update_queue.requestStop();
+    // Wait for first scan completion from worker
+    if (!task_queue.waitForFirstScan(10000)) {
+        try stdout.print("Timeout waiting for worker scan.\n", .{});
+        task_queue.requestStop();
         worker_thread.join();
-        return;
-    };
-    defer initial_result.deinit();
-
-    if (initial_result.updates.items.len == 0) {
-        try stdout.print("No windows could be captured.\n", .{});
-        update_queue.requestStop();
-        worker_thread.join();
+        task_queue.deinit();
         return;
     }
 
-    try stdout.print("Found {d} windows.\n", .{initial_result.updates.items.len});
-
-    for (initial_result.updates.items) |update| {
-        try stdout.print(" {x} {s} ({d}x{d})\n", .{ update.window_id, update.title, update.thumbnail_width, update.thumbnail_height });
-    }
-
-    // Get mouse position BEFORE initializing raylib
-    const mouse_pos = x11.getMousePosition(conn.conn, conn.root);
+    try stdout.print("Initial scan complete.\n", .{});
 
     // Initialize app in daemon mode (window created but hidden)
-    var application = try app.App.init(allocator, &initial_result, mouse_pos, true, &update_queue, conn.conn, conn.root, conn.atoms);
+    // App init drains the queue for initial windows
+    var application = try app.App.init(allocator, &task_queue, true, conn.conn, conn.root, conn.atoms);
     defer application.deinit();
     application.hideWindow();
 
@@ -100,20 +87,17 @@ fn runDaemon() !void {
             processXcbEvents(&application, conn.conn);
         }
 
-        // Poll update queue from background worker
-        if (update_queue.pop()) |*update_result| {
-            defer @constCast(update_result).deinit();
-            application.processWorkerUpdate(@constCast(update_result));
-        }
+        // Process updates from queue
+        application.drainUpdateQueue();
 
         // Update and render
         application.update();
     }
 
     // Stop background worker
-    update_queue.requestStop();
+    task_queue.requestStop();
     worker_thread.join();
-    update_queue.deinit();
+    task_queue.deinit();
 
     try stdout.print("Daemon stopped.\n", .{});
 }
