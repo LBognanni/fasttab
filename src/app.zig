@@ -55,6 +55,7 @@ pub const App = struct {
     icon_texture_cache: std.StringHashMap(rl.Texture2D),
     mouse_active: bool,
     mouse_origin: rl.Vector2,
+    last_mouse_pos: rl.Vector2,
     focus_grace_frames: u8,
 
     const Self = @This();
@@ -120,6 +121,7 @@ pub const App = struct {
             .icon_texture_cache = icon_texture_cache,
             .mouse_active = false,
             .mouse_origin = .{ .x = 0, .y = 0 },
+            .last_mouse_pos = .{ .x = 0, .y = 0 },
             .focus_grace_frames = 0,
         };
 
@@ -226,6 +228,8 @@ pub const App = struct {
 
         // Handle mouse input - only after the mouse has moved from its initial position
         const mouse_pos = rl.GetMousePosition();
+        const mouse_moved = mouse_pos.x != self.last_mouse_pos.x or mouse_pos.y != self.last_mouse_pos.y;
+        self.last_mouse_pos = mouse_pos;
         if (!self.mouse_active) {
             const dx = mouse_pos.x - self.mouse_origin.x;
             const dy = mouse_pos.y - self.mouse_origin.y;
@@ -236,7 +240,11 @@ pub const App = struct {
         if (self.mouse_active) {
             if (ui.getItemAtPosition(self.items.items, self.current_layout, mouse_pos)) |idx| {
                 rl.SetMouseCursor(rl.MOUSE_CURSOR_POINTING_HAND);
-                self.selected_index = idx;
+                // Only update selection when the mouse actually moved,
+                // so keyboard navigation isn't overridden every frame
+                if (mouse_moved) {
+                    self.selected_index = idx;
+                }
 
                 if (rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
                     self.confirmSwitching();
