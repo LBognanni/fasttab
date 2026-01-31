@@ -210,6 +210,19 @@ pub const App = struct {
             }
         }
 
+        // Handle mouse input
+        const mouse_pos = rl.GetMousePosition();
+        if (ui.getItemAtPosition(self.items.items, self.current_layout, mouse_pos)) |idx| {
+            rl.SetMouseCursor(rl.MOUSE_CURSOR_POINTING_HAND);
+            self.selected_index = idx;
+
+            if (rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
+                self.confirmSwitching();
+            }
+        } else {
+            rl.SetMouseCursor(rl.MOUSE_CURSOR_DEFAULT);
+        }
+
         // Render
         self.render();
     }
@@ -426,7 +439,7 @@ pub const App = struct {
 
         // Recalculate layout and resize window if needed
         const prev_layout = self.current_layout;
-        self.current_layout = ui.calculateGridLayout(self.items.items, ui.THUMBNAIL_HEIGHT);
+        self.current_layout = ui.calculateBestLayout(self.items.items);
 
         if (self.current_layout.total_width != prev_layout.total_width or
             self.current_layout.total_height != prev_layout.total_height)
@@ -618,14 +631,14 @@ pub const App = struct {
 
         rl.BeginDrawing();
         rl.ClearBackground(rl.Color{ .r = 0, .g = 0, .b = 0, .a = 0 });
-        ui.renderSwitcher(self.items.items, self.selected_index, self.font);
+        ui.renderSwitcher(self.items.items, self.current_layout, self.selected_index, self.font);
         rl.EndDrawing();
     }
 
     fn updateLayout(self: *Self) void {
         const prev_width = self.current_layout.total_width;
         const prev_height = self.current_layout.total_height;
-        self.current_layout = ui.calculateGridLayout(self.items.items, ui.THUMBNAIL_HEIGHT);
+        self.current_layout = ui.calculateBestLayout(self.items.items);
 
         if (!self.window_hidden and (self.current_layout.total_width != prev_width or self.current_layout.total_height != prev_height)) {
             rl.SetWindowSize(@intCast(self.current_layout.total_width), @intCast(self.current_layout.total_height));

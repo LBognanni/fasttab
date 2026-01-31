@@ -31,14 +31,14 @@ pub const ICON_BOTTOM_OVERHANG: f32 = 0.05;
 // Item holding window data for rendering
 pub const DisplayWindow = struct {
     id: x11.xcb.xcb_window_t,
-    title: []const u8, // owned
-    thumbnail_texture: rl.Texture2D, // GPU handle
-    icon_texture: ?rl.Texture2D, // non-owning copy from icon_texture_cache
-    icon_id: []const u8, // owned (WM_CLASS)
+    title: []const u8,               // owned
+    thumbnail_texture: rl.Texture2D,  // GPU handle
+    icon_texture: ?rl.Texture2D,      // non-owning copy from icon_texture_cache
+    icon_id: []const u8,              // owned (WM_CLASS)
     title_version: u32,
     thumbnail_version: u32,
-    source_width: u32, // original thumbnail width (for layout)
-    source_height: u32, // original thumbnail height (for layout)
+    source_width: u32,                // original thumbnail width (for layout)
+    source_height: u32,               // original thumbnail height (for layout)
     display_width: u32,
     display_height: u32,
 };
@@ -114,6 +114,16 @@ pub fn calculateGridLayout(items: []DisplayWindow, target_height: u32) GridLayou
     };
 }
 
+pub fn calculateBestLayout(items: []DisplayWindow) GridLayout {
+    var layout = calculateGridLayout(items, THUMBNAIL_HEIGHT);
+    var current_height: u32 = THUMBNAIL_HEIGHT;
+    while (layout.total_height > MAX_GRID_HEIGHT and current_height > 60) {
+        current_height -= 10;
+        layout = calculateGridLayout(items, current_height);
+    }
+    return layout;
+}
+
 pub fn calculateRowWidth(items: []DisplayWindow, start_idx: u32, count: u32) u32 {
     var width: u32 = 0;
     const end = @min(start_idx + count, @as(u32, @intCast(items.len)));
@@ -125,6 +135,42 @@ pub fn calculateRowWidth(items: []DisplayWindow, start_idx: u32, count: u32) u32
         }
     }
     return width;
+}
+
+pub fn getItemAtPosition(items: []DisplayWindow, layout: GridLayout, mouse_pos: rl.Vector2) ?usize {
+     if (items.len == 0) return null;
+
+    const item_full_height = layout.item_height + TITLE_SPACING + @as(u32, @intCast(TITLE_FONT_SIZE));
+
+    var item_idx: usize = 0;
+    var row: u32 = 0;
+    while (row < layout.rows and item_idx < items.len) : (row += 1) {
+        const items_in_row = @min(layout.columns, @as(u32, @intCast(items.len)) - @as(u32, @intCast(item_idx)));
+
+        const row_width = calculateRowWidth(items, @intCast(item_idx), items_in_row);
+        var x: f32 = @floatFromInt(PADDING + (layout.total_width - 2 * PADDING - row_width) / 2);
+        const y: f32 = @floatFromInt(PADDING + row * (item_full_height + SPACING));
+
+        var col: u32 = 0;
+        while (col < items_in_row) : (col += 1) {
+            const item = &items[item_idx];
+            
+            const hit_rect = rl.Rectangle{
+                 .x = x - @as(f32, @floatFromInt(SELECTION_BORDER)),
+                 .y = y - @as(f32, @floatFromInt(SELECTION_BORDER)),
+                 .width = @as(f32, @floatFromInt(item.display_width + 2 * SELECTION_BORDER)),
+                 .height = @as(f32, @floatFromInt(item_full_height + 2 * SELECTION_BORDER)),
+            };
+
+            if (rl.CheckCollisionPointRec(mouse_pos, hit_rect)) {
+                return item_idx;
+            }
+
+            x += @as(f32, @floatFromInt(item.display_width + SPACING));
+            item_idx += 1;
+        }
+    }
+    return null;
 }
 
 pub fn loadTextureFromThumbnail(thumb: *const thumbnail.Thumbnail) rl.Texture2D {
@@ -208,16 +254,8 @@ fn drawTruncatedText(font: rl.Font, text: []const u8, x: f32, y: f32, font_size:
     rl.DrawTextEx(font, text_ptr, rl.Vector2{ .x = text_x, .y = y }, font_size, spacing, color);
 }
 
-pub fn renderSwitcher(items: []DisplayWindow, selected_index: usize, font: rl.Font) void {
+pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index: usize, font: rl.Font) void {
     if (items.len == 0) return;
-
-    var layout = calculateGridLayout(items, THUMBNAIL_HEIGHT);
-
-    var current_height = THUMBNAIL_HEIGHT;
-    while (layout.total_height > MAX_GRID_HEIGHT and current_height > 60) {
-        current_height -= 10;
-        layout = calculateGridLayout(items, current_height);
-    }
 
     const item_full_height = layout.item_height + TITLE_SPACING + @as(u32, @intCast(TITLE_FONT_SIZE));
 
