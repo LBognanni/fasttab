@@ -53,6 +53,8 @@ pub const App = struct {
     xcb_atoms: x11.Atoms,
     state: SwitcherState,
     icon_texture_cache: std.StringHashMap(rl.Texture2D),
+    mouse_active: bool,
+    mouse_origin: rl.Vector2,
 
     const Self = @This();
 
@@ -115,6 +117,8 @@ pub const App = struct {
             .xcb_atoms = xcb_atoms,
             .state = .idle,
             .icon_texture_cache = icon_texture_cache,
+            .mouse_active = false,
+            .mouse_origin = .{ .x = 0, .y = 0 },
         };
 
         // Process initial tasks
@@ -210,17 +214,26 @@ pub const App = struct {
             }
         }
 
-        // Handle mouse input
+        // Handle mouse input - only after the mouse has moved from its initial position
         const mouse_pos = rl.GetMousePosition();
-        if (ui.getItemAtPosition(self.items.items, self.current_layout, mouse_pos)) |idx| {
-            rl.SetMouseCursor(rl.MOUSE_CURSOR_POINTING_HAND);
-            self.selected_index = idx;
-
-            if (rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
-                self.confirmSwitching();
+        if (!self.mouse_active) {
+            const dx = mouse_pos.x - self.mouse_origin.x;
+            const dy = mouse_pos.y - self.mouse_origin.y;
+            if (dx * dx + dy * dy > 4.0) {
+                self.mouse_active = true;
             }
-        } else {
-            rl.SetMouseCursor(rl.MOUSE_CURSOR_DEFAULT);
+        }
+        if (self.mouse_active) {
+            if (ui.getItemAtPosition(self.items.items, self.current_layout, mouse_pos)) |idx| {
+                rl.SetMouseCursor(rl.MOUSE_CURSOR_POINTING_HAND);
+                self.selected_index = idx;
+
+                if (rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
+                    self.confirmSwitching();
+                }
+            } else {
+                rl.SetMouseCursor(rl.MOUSE_CURSOR_DEFAULT);
+            }
         }
 
         // Render
@@ -459,6 +472,8 @@ pub const App = struct {
 
         rl.SetWindowFocused();
 
+        self.mouse_active = false;
+        self.mouse_origin = rl.GetMousePosition();
         self.window_hidden = false;
     }
 
