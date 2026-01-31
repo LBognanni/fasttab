@@ -57,6 +57,7 @@ fasttab/
 │   ├── ui.zig                # raylib rendering, window items, UI constants
 │   ├── window_scanner.zig    # Window scanning and parallel thumbnail capture
 │   ├── thumbnail.zig         # Thumbnail processing, STB resize
+│   ├── desktop_icon.zig      # Desktop icon lookup and loading (STB image)
 │   ├── layout.zig            # Pure grid layout calculations (no C deps)
 │   ├── navigation.zig        # Pure grid navigation functions (no deps)
 │   ├── worker.zig            # Background thread for thumbnail refresh
@@ -69,13 +70,18 @@ fasttab/
 │       ├── ui_test.zig           # Grid layout calculations
 │       └── worker_test.zig       # Thread-safe queue behavior
 ├── include/
-│   ├── stb_image_write.h     # STB header for PNG writing
+│   ├── stb_image.h           # STB header for image loading
 │   └── stb_image_resize2.h   # STB header for image resizing
 ├── lib/                      # Downloaded dependencies (gitignored)
 │   └── raylib-5.5_linux_amd64/
+├── .github/
+│   ├── workflows/ci.yml      # CI pipeline (test + release)
+│   └── scripts/collate_commits.py  # Changelog generation for releases
 ├── build.zig                 # Zig build script
 ├── setup.sh                  # Developer setup script (downloads raylib)
-└── spec.md                   # Full project specification
+├── spec.md                   # Full project specification
+├── README.md                 # Project overview and build instructions
+└── LICENSE.md                # GPL-3.0 license
 ```
 
 ### Module Dependencies
@@ -84,10 +90,11 @@ fasttab/
 |--------|------|---------|
 | `main.zig` | Entry point, daemon setup | x11, worker, app |
 | `app.zig` | Switcher state machine | x11, ui, worker, thumbnail, navigation |
-| `x11.zig` | XCB bindings, key grab | std (+ C: xcb) |
+| `x11.zig` | XCB bindings, key grab | desktop_icon (+ C: xcb) |
 | `ui.zig` | raylib rendering | thumbnail, x11, layout (+ C: raylib) |
 | `window_scanner.zig` | Window scan + capture | x11, thumbnail |
 | `thumbnail.zig` | Image processing | x11, color (+ C: stb) |
+| `desktop_icon.zig` | Icon lookup + loading | std (+ C: stb) |
 | `worker.zig` | Background refresh thread | x11, thumbnail, window_scanner |
 | `layout.zig` | Grid layout math | std only |
 | `navigation.zig` | Selection movement | none |
