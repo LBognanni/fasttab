@@ -9,17 +9,57 @@ pub fn main() !void {
     var args_iter = std.process.args();
     _ = args_iter.next(); // skip program name
 
-    if (args_iter.next()) |cmd| {
-        if (std.mem.eql(u8, cmd, "daemon") or std.mem.eql(u8, cmd, "--daemon")) {
-            return runDaemon();
+    var replace = false;
+
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--replace")) {
+            replace = true;
+        } else if (std.mem.eql(u8, arg, "daemon") or std.mem.eql(u8, arg, "--daemon")) {
+            // explicit daemon mode, continue
+        } else {
+            std.debug.print("Unknown command: {s}\n", .{arg});
+            std.debug.print("Usage: fasttab [daemon] [--replace]\n", .{});
+            std.process.exit(1);
         }
-        std.debug.print("Unknown command: {s}\n", .{cmd});
-        std.debug.print("Usage: fasttab [daemon]\n", .{});
-        std.process.exit(1);
     }
 
-    // No arguments - run daemon
+    if (replace) {
+        try killExistingInstance();
+        // Give it a moment to die and release X11 grabs
+        std.time.sleep(200 * std.time.ns_per_ms);
+    }
+
+    // Run daemon
     return runDaemon();
+}
+
+fn killExistingInstance() !void {
+    const my_pid = std.c.getpid();
+    var dir = try std.fs.openDirAbsolute("/proc", .{ .iterate = true });
+    defer dir.close();
+
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
+        if (pid == my_pid) continue;
+
+        // Check comm
+        var buf: [256]u8 = undefined;
+        const comm_path = try std.fmt.bufPrint(&buf, "/proc/{d}/comm", .{pid});
+        const file = std.fs.openFileAbsolute(comm_path, .{}) catch continue;
+        defer file.close();
+
+        const bytes_read = try file.readAll(&buf);
+        const comm = std.mem.trimRight(u8, buf[0..bytes_read], "\n");
+
+        if (std.mem.eql(u8, comm, "fasttab")) {
+            std.debug.print("Killing existing instance (PID {d})...\n", .{pid});
+            std.posix.kill(pid, std.posix.SIG.TERM) catch |err| {
+                std.debug.print("Failed to kill PID {d}: {}\n", .{pid, err});
+            };
+        }
+    }
 }
 
 /// Run the daemon with XCB key grabbing
