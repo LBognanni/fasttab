@@ -314,6 +314,11 @@ pub const App = struct {
             current_window_set.put(wid, {}) catch {};
         }
 
+        log.debug("Current window set is {d} windows; processing {d} updates", .{
+            current_window_set.count(),
+            update_result.updates.items.len,
+        });
+
         // Find and remove closed windows
         self.removeClosedWindows(&current_window_set);
 
@@ -384,13 +389,12 @@ pub const App = struct {
         const mouse_pos = x11.getMousePosition(self.xcb_conn, self.xcb_root);
         self.monitor = findMonitorAtPosition(mouse_pos);
 
-        // Center window on monitor
+        rl.ClearWindowState(rl.FLAG_WINDOW_HIDDEN);
+
         const win_x = self.monitor.x + @divTrunc(self.monitor.width - @as(i32, @intCast(self.current_layout.total_width)), 2);
         const win_y = self.monitor.y + @divTrunc(self.monitor.height - @as(i32, @intCast(self.current_layout.total_height)), 2);
         rl.SetWindowPosition(win_x, win_y);
 
-        // Show the window and focus it
-        rl.ClearWindowState(rl.FLAG_WINDOW_HIDDEN);
         rl.SetWindowFocused();
 
         self.window_hidden = false;
@@ -503,7 +507,7 @@ pub const App = struct {
         if (self.items.items.len > 0 and self.selected_index < self.items.items.len) {
             const selected_id = self.items.items[self.selected_index].id;
             x11.activateWindow(self.xcb_conn, self.xcb_root, selected_id, self.xcb_atoms);
-            log.info("Confirmed: activating window {d}", .{selected_id});
+            log.info("Confirmed: activating window {x}", .{selected_id});
         }
 
         x11.ungrabKeyboard(self.xcb_conn);
@@ -573,6 +577,10 @@ pub const App = struct {
     // === Private methods ===
 
     fn render(self: *Self) void {
+        const win_x = self.monitor.x + @divTrunc(self.monitor.width - @as(i32, @intCast(self.current_layout.total_width)), 2);
+        const win_y = self.monitor.y + @divTrunc(self.monitor.height - @as(i32, @intCast(self.current_layout.total_height)), 2);
+        rl.SetWindowPosition(win_x, win_y);
+
         rl.BeginDrawing();
         rl.ClearBackground(rl.Color{ .r = 0, .g = 0, .b = 0, .a = 0 });
         ui.renderSwitcher(self.items.items, self.selected_index, self.font);
@@ -691,7 +699,7 @@ pub const App = struct {
             return;
         };
 
-        log.debug("Added new window {d}: {s}", .{ new_item.id, new_item.title });
+        log.debug("Added new window {x}: {s}", .{ new_item.id, new_item.title });
 
         // Transfer ownership
         upd.thumbnail_data = &[_]u8{};

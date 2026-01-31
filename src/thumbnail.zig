@@ -159,7 +159,7 @@ pub fn saveThumbnailPNG(thumbnail: Thumbnail, window_id: x11.xcb.xcb_window_t) !
         @intCast(thumbnail.width * 4),
     );
     if (result == 0) {
-        log.err("Failed to write PNG for window {d}", .{window_id});
+        log.err("Failed to write PNG for window {x}", .{window_id});
         return error.PNGWriteFailed;
     }
 }

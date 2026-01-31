@@ -155,13 +155,13 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
             if (err == x11.X11Error.GeometryFetchFailed) {
                 _ = result.window_ids.pop();
                 if (!std.mem.eql(u8, title, "(unknown)")) allocator.free(title);
-                log.debug("Window {d} no longer exists", .{window_id});
+                log.debug("Window {x} no longer exists", .{window_id});
                 continue;
             }
 
             // For other errors, keep window in list but mark capture as failed
             stats.capture_failed += 1;
-            log.debug("Failed to capture window {d}: {}", .{ window_id, err });
+            log.debug("Failed to capture window {x}: {}", .{ window_id, err });
 
             try capture_tasks.append(.{
                 .window_id = window_id,

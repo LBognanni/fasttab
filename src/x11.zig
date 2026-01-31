@@ -437,8 +437,9 @@ pub fn captureRawImage(
     const redirect_cookie = xcb.xcb_composite_redirect_window_checked(conn, window, xcb.XCB_COMPOSITE_REDIRECT_AUTOMATIC);
     const redirect_error = xcb.xcb_request_check(conn, redirect_cookie);
     if (redirect_error != null) {
-        log.warn("xcb_composite_redirect_window failed for {d}: error_code={d}", .{
+        log.warn("xcb_composite_redirect_window failed for {x} ({s}): error_code={d}", .{
             window,
+            title,
             redirect_error.*.error_code,
         });
         std.c.free(redirect_error);
@@ -743,7 +744,7 @@ pub fn activateWindow(
     );
     _ = xcb.xcb_set_input_focus(conn, xcb.XCB_INPUT_FOCUS_POINTER_ROOT, window, xcb.XCB_CURRENT_TIME);
     _ = xcb.xcb_flush(conn);
-    log.debug("Activated window {d}", .{window});
+    log.debug("Activated window {x}", .{window});
 }
 
 /// Get the stacking window list (_NET_CLIENT_LIST_STACKING) as an owned slice.
@@ -931,25 +932,25 @@ pub fn getWindowIcon(
     // 2. Fallback: Try .desktop file
     const class_name = getWindowClass(allocator, conn, window, atoms);
     defer if (!std.mem.eql(u8, class_name, "(unknown)")) allocator.free(class_name);
-    
+
     if (std.mem.eql(u8, class_name, "(unknown)")) return null;
 
     var icon_result = desktop_icon.getAppIcon(allocator, class_name, target_size) catch |err| {
-        log.warn("Failed to get desktop icon for {s}: {}", .{class_name, err});
+        log.warn("Failed to get desktop icon for {s}: {}", .{ class_name, err });
         return null;
     };
     defer icon_result.deinit();
 
     const pixel_count = @as(usize, @intCast(icon_result.width)) * @as(usize, @intCast(icon_result.height));
     const icon_pixels = allocator.alloc(u32, pixel_count) catch return null;
-    
+
     // Convert RGBA (STB) to ARGB (X11/Internal)
     for (0..pixel_count) |i| {
-        const r = icon_result.pixels[i*4 + 0];
-        const g = icon_result.pixels[i*4 + 1];
-        const b = icon_result.pixels[i*4 + 2];
-        const a = icon_result.pixels[i*4 + 3];
-        
+        const r = icon_result.pixels[i * 4 + 0];
+        const g = icon_result.pixels[i * 4 + 1];
+        const b = icon_result.pixels[i * 4 + 2];
+        const a = icon_result.pixels[i * 4 + 3];
+
         icon_pixels[i] = (@as(u32, a) << 24) | (@as(u32, r) << 16) | (@as(u32, g) << 8) | @as(u32, b);
     }
 
