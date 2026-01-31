@@ -55,6 +55,7 @@ pub const App = struct {
     icon_texture_cache: std.StringHashMap(rl.Texture2D),
     mouse_active: bool,
     mouse_origin: rl.Vector2,
+    focus_grace_frames: u8,
 
     const Self = @This();
 
@@ -119,6 +120,7 @@ pub const App = struct {
             .icon_texture_cache = icon_texture_cache,
             .mouse_active = false,
             .mouse_origin = .{ .x = 0, .y = 0 },
+            .focus_grace_frames = 0,
         };
 
         // Process initial tasks
@@ -212,6 +214,14 @@ pub const App = struct {
                 self.should_quit = true;
                 return;
             }
+        }
+
+        // Cancel switching if window loses focus (e.g., clicked outside)
+        if (self.focus_grace_frames > 0) {
+            self.focus_grace_frames -= 1;
+        } else if (self.state == .switching and !rl.IsWindowFocused()) {
+            self.cancelSwitching();
+            return;
         }
 
         // Handle mouse input - only after the mouse has moved from its initial position
@@ -474,6 +484,7 @@ pub const App = struct {
 
         self.mouse_active = false;
         self.mouse_origin = rl.GetMousePosition();
+        self.focus_grace_frames = 5;
         self.window_hidden = false;
     }
 
