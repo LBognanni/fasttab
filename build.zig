@@ -93,15 +93,38 @@ pub fn build(b: *std.Build) void {
     }));
     test_step.dependOn(&b.addRunArtifact(thumbnail_test).step);
 
-    // UI/Layout test
+    // UI test (requires C dependencies for DisplayWindow)
     const ui_test = b.addTest(.{
         .root_source_file = b.path("src/tests/ui_test.zig"),
         .target = target,
         .optimize = optimize,
     });
-    ui_test.root_module.addImport("layout", b.createModule(.{
-        .root_source_file = b.path("src/layout.zig"),
-    }));
+    const ui_module = b.createModule(.{
+        .root_source_file = b.path("src/ui.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ui_module.addIncludePath(b.path("include"));
+    ui_module.addIncludePath(b.path("lib/raylib-5.5_linux_amd64/include"));
+    ui_test.root_module.addImport("ui", ui_module);
+    ui_test.addIncludePath(b.path("include"));
+    ui_test.addLibraryPath(b.path("lib/raylib-5.5_linux_amd64/lib"));
+    ui_test.addCSourceFile(.{
+        .file = b.path("src/stb_impl.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-msse4.1" },
+    });
+    ui_test.linkSystemLibrary("xcb");
+    ui_test.linkSystemLibrary("xcb-composite");
+    ui_test.linkSystemLibrary("xcb-image");
+    ui_test.linkSystemLibrary("xcb-keysyms");
+    ui_test.linkSystemLibrary("raylib");
+    ui_test.linkSystemLibrary("GL");
+    ui_test.linkSystemLibrary("m");
+    ui_test.linkSystemLibrary("pthread");
+    ui_test.linkSystemLibrary("dl");
+    ui_test.linkSystemLibrary("rt");
+    ui_test.linkSystemLibrary("X11");
+    ui_test.linkLibC();
     test_step.dependOn(&b.addRunArtifact(ui_test).step);
 
     // Worker/Queue test
