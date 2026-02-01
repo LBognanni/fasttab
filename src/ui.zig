@@ -21,8 +21,10 @@ pub const CORNER_RADIUS: f32 = 12.0;
 pub const ITEM_CORNER_RADIUS: f32 = 4.0;
 pub const SELECTION_BORDER: u32 = 3;
 pub const BACKGROUND_COLOR = rl.Color{ .r = 0x22, .g = 0x22, .b = 0x22, .a = 217 };
-pub const HIGHLIGHT_COLOR = rl.Color{ .r = 0x3d, .g = 0xae, .b = 0xe9, .a = 255 };
+pub const HIGHLIGHT_COLOR = rl.Color{ .r = 0x2d, .g = 0x8e, .b = 0xc9, .a = 128 };
+pub const HIGHLIGHT_COLOR_LINES = rl.Color{ .r = 0x3d, .g = 0xae, .b = 0xe9, .a = 255 };
 pub const TITLE_COLOR = rl.Color{ .r = 255, .g = 255, .b = 255, .a = 255 };
+pub const ROUNDNESS: f32 = 0.08;
 
 // Icon overlay constants
 pub const ICON_HEIGHT_RATIO: f32 = 0.25;
@@ -185,17 +187,65 @@ pub fn loadTextureFromThumbnail(thumb: *const thumbnail.Thumbnail) rl.Texture2D 
 pub fn loadSystemFont(size: i32) rl.Font {
     const font_paths = [_][*c]const u8{
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+        "/usr/share/fonts/noto/NotoEmoji-Regular.ttf",
+        "/usr/share/fonts/truetype/ancient-scripts/Symbola.ttf",
+        "/usr/share/fonts/gd-s2/Symbola.ttf",
     };
 
+    // Load curated list of characters to support most languages + Emojis
+    var codepoints: [16384]c_int = undefined;
+    var count: usize = 0;
+
+    const ranges = [_][2]c_int{
+        .{ 0x0020, 0x007E }, // Basic Latin
+        .{ 0x00A0, 0x00FF }, // Latin-1 Supplement
+        .{ 0x0100, 0x017F }, // Latin Extended-A
+        .{ 0x0180, 0x024F }, // Latin Extended-B
+        .{ 0x0250, 0x02AF }, // IPA Extensions
+        .{ 0x0300, 0x036F }, // Combining Diacritical Marks
+        .{ 0x0370, 0x03FF }, // Greek and Coptic
+        .{ 0x0400, 0x04FF }, // Cyrillic
+        .{ 0x0500, 0x052F }, // Cyrillic Supplement
+        .{ 0x1E00, 0x1EFF }, // Latin Extended Additional
+        .{ 0x2000, 0x20CF }, // General Punctuation & Currency
+        .{ 0x2100, 0x218F }, // Letterlike Symbols & Number Forms
+        .{ 0x2190, 0x21FF }, // Arrows
+        .{ 0x2200, 0x22FF }, // Mathematical Operators
+        .{ 0x2300, 0x23FF }, // Miscellaneous Technical
+        .{ 0x2460, 0x24FF }, // Enclosed Alphanumerics
+        .{ 0x2500, 0x257F }, // Box Drawing
+        //.{ 0x2580, 0x259F }, // Block Elements
+        //.{ 0x25A0, 0x25FF }, // Geometric Shapes
+        .{ 0x2600, 0x26FF }, // Miscellaneous Symbols
+        .{ 0x2700, 0x27BF }, // Dingbats
+        .{ 0xE000, 0xF8FF }, // Private Use Area (Nerd Fonts)
+        // .{ 0x1F300, 0x1F5FF }, // Misc Symbols and Pictographs
+        .{ 0x1F600, 0x1F64F }, // Emoticons
+        // .{ 0x1F680, 0x1F6FF }, // Transport and Map
+        // .{ 0x1F900, 0x1F9FF }, // Supplemental Symbols and Pictographs
+    };
+
+    for (ranges) |range| {
+        var c = range[0];
+        while (c <= range[1]) : (c += 1) {
+            if (count < codepoints.len) {
+                codepoints[count] = c;
+                count += 1;
+            }
+        }
+    }
+
     for (font_paths) |path| {
-        const font = rl.LoadFontEx(path, size, null, 0);
+        const font = rl.LoadFontEx(path, size, &codepoints[0], @intCast(count));
         if (font.texture.id != 0) {
             rl.SetTextureFilter(font.texture, rl.TEXTURE_FILTER_BILINEAR);
             return font;
@@ -206,7 +256,7 @@ pub fn loadSystemFont(size: i32) rl.Font {
 }
 
 fn drawTruncatedText(font: rl.Font, text: []const u8, x: f32, y: f32, font_size: f32, max_width: f32, color: rl.Color) void {
-    const spacing: f32 = 0;
+    const spacing: f32 = 1;
     var text_buf: [256]u8 = undefined;
     const ellipsis = "...";
 
@@ -219,7 +269,7 @@ fn drawTruncatedText(font: rl.Font, text: []const u8, x: f32, y: f32, font_size:
 
     if (text_size.x <= max_width) {
         const text_x = x + (max_width - text_size.x) / 2.0;
-        rl.DrawTextEx(font, text_ptr, rl.Vector2{ .x = text_x, .y = y }, font_size, spacing, color);
+        rl.DrawTextEx(font, text_ptr, rl.Vector2{ .x = @floor(text_x), .y = @floor(y) }, font_size, spacing, color);
         return;
     }
 
@@ -247,7 +297,7 @@ fn drawTruncatedText(font: rl.Font, text: []const u8, x: f32, y: f32, font_size:
 
     const final_size = rl.MeasureTextEx(font, text_ptr, font_size, spacing);
     const text_x = x + (max_width - final_size.x) / 2.0;
-    rl.DrawTextEx(font, text_ptr, rl.Vector2{ .x = text_x, .y = y }, font_size, spacing, color);
+    rl.DrawTextEx(font, text_ptr, rl.Vector2{ .x = @floor(text_x), .y = @floor(y) }, font_size, spacing, color);
 }
 
 pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index: usize, font: rl.Font) void {
@@ -261,7 +311,7 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
         .width = @floatFromInt(layout.total_width),
         .height = @floatFromInt(layout.total_height),
     };
-    rl.DrawRectangleRounded(bg_rect, CORNER_RADIUS / @as(f32, @floatFromInt(@max(layout.total_width, layout.total_height))), 16, BACKGROUND_COLOR);
+    rl.DrawRectangleRounded(bg_rect, ROUNDNESS, 16, BACKGROUND_COLOR);
 
     var item_idx: usize = 0;
     var row: u32 = 0;
@@ -284,7 +334,8 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                     .width = @as(f32, @floatFromInt(item.display_width + 2 * SELECTION_BORDER)),
                     .height = @as(f32, @floatFromInt(item_full_height + 2 * SELECTION_BORDER)),
                 };
-                rl.DrawRectangleRounded(highlight_rect, ITEM_CORNER_RADIUS / @as(f32, @floatFromInt(@max(item.display_width, item_full_height))), 8, HIGHLIGHT_COLOR);
+                rl.DrawRectangleRounded(highlight_rect, ROUNDNESS, 5, HIGHLIGHT_COLOR);
+                rl.DrawRectangleRoundedLinesEx(highlight_rect, ROUNDNESS, 5, 2, HIGHLIGHT_COLOR_LINES);
             }
 
             const dest_rect = rl.Rectangle{

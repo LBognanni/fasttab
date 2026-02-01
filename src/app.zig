@@ -80,7 +80,7 @@ pub const App = struct {
         rl.SetTargetFPS(60);
 
         // Load system font
-        const font = ui.loadSystemFont(ui.TITLE_FONT_SIZE * 2);
+        const font = ui.loadSystemFont(ui.TITLE_FONT_SIZE);
 
         // Default layout
         const layout = ui.GridLayout{
