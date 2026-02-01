@@ -195,6 +195,7 @@ pub const App = struct {
         // Cancel switching if window loses focus (e.g., clicked outside)
         if (self.focus_grace_frames > 0) {
             self.focus_grace_frames -= 1;
+            self.last_mouse_pos = rl.GetMousePosition();
         } else if (self.state == .switching and !rl.IsWindowFocused()) {
             self.cancelSwitching();
             return;
@@ -450,7 +451,6 @@ pub const App = struct {
 
         rl.SetWindowFocused();
 
-        self.last_mouse_pos = rl.GetMousePosition();
         self.focus_grace_frames = 5;
         self.window_hidden = false;
     }
