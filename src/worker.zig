@@ -4,6 +4,7 @@ const thumbnail = @import("thumbnail.zig");
 const window_scanner = @import("window_scanner.zig");
 
 const log = std.log.scoped(.fasttab);
+const DELAY_SECONDS: f32 = 0.25; // seconds between scans
 
 pub const UpdateTask = union(enum) {
     window_added: WindowAdded,
@@ -268,7 +269,7 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
     while (!queue.shouldStop()) {
         // For first scan, don't wait - produce results immediately
         if (!is_first_scan) {
-            std.time.sleep(1 * std.time.ns_per_s);
+            std.time.sleep(DELAY_SECONDS * std.time.ns_per_s);
         }
 
         if (queue.shouldStop()) break;
