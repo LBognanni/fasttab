@@ -23,6 +23,8 @@ pub const SELECTION_BORDER: u32 = 3;
 pub const BACKGROUND_COLOR = rl.Color{ .r = 0x22, .g = 0x22, .b = 0x22, .a = 217 };
 pub const HIGHLIGHT_COLOR = rl.Color{ .r = 0x2d, .g = 0x8e, .b = 0xc9, .a = 128 };
 pub const HIGHLIGHT_COLOR_LINES = rl.Color{ .r = 0x3d, .g = 0xae, .b = 0xe9, .a = 255 };
+pub const HIGHLIGHT_COLOR_LESS = rl.Color{ .r = 0x2d, .g = 0x8e, .b = 0xc9, .a = 64 };
+pub const HIGHLIGHT_COLOR_LESS_LINES = rl.Color{ .r = 0x3d, .g = 0xae, .b = 0xe9, .a = 128 };
 pub const TITLE_COLOR = rl.Color{ .r = 255, .g = 255, .b = 255, .a = 255 };
 pub const ROUNDNESS: f32 = 0.08;
 
@@ -300,7 +302,7 @@ fn drawTruncatedText(font: rl.Font, text: []const u8, x: f32, y: f32, font_size:
     rl.DrawTextEx(font, text_ptr, rl.Vector2{ .x = @floor(text_x), .y = @floor(y) }, font_size, spacing, color);
 }
 
-pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index: usize, font: rl.Font) void {
+pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index: usize, mouseover_index: ?usize, font: rl.Font) void {
     if (items.len == 0) return;
 
     const item_full_height = layout.item_height + TITLE_SPACING + @as(u32, @intCast(TITLE_FONT_SIZE));
@@ -336,6 +338,17 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                 };
                 rl.DrawRectangleRounded(highlight_rect, ROUNDNESS, 5, HIGHLIGHT_COLOR);
                 rl.DrawRectangleRoundedLinesEx(highlight_rect, ROUNDNESS, 5, 2, HIGHLIGHT_COLOR_LINES);
+            } else if (mouseover_index) |mi| {
+                if (item_idx == mi) {
+                    const highlight_rect = rl.Rectangle{
+                        .x = x - @as(f32, @floatFromInt(SELECTION_BORDER)),
+                        .y = y - @as(f32, @floatFromInt(SELECTION_BORDER)),
+                        .width = @as(f32, @floatFromInt(item.display_width + 2 * SELECTION_BORDER)),
+                        .height = @as(f32, @floatFromInt(item_full_height + 2 * SELECTION_BORDER)),
+                    };
+                    rl.DrawRectangleRounded(highlight_rect, ROUNDNESS, 5, HIGHLIGHT_COLOR_LESS);
+                    rl.DrawRectangleRoundedLinesEx(highlight_rect, ROUNDNESS, 5, 2, HIGHLIGHT_COLOR_LESS_LINES);
+                }
             }
 
             const dest_rect = rl.Rectangle{

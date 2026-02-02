@@ -40,6 +40,7 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayList(ui.DisplayWindow),
     selected_index: usize,
+    mouseover_index: ?usize,
     current_layout: ui.GridLayout,
     font: rl.Font,
     monitor: MonitorInfo,
@@ -53,7 +54,6 @@ pub const App = struct {
     xcb_atoms: x11.Atoms,
     state: SwitcherState,
     icon_texture_cache: std.StringHashMap(rl.Texture2D),
-    last_mouse_pos: rl.Vector2,
     focus_grace_frames: u8,
 
     const Self = @This();
@@ -104,6 +104,7 @@ pub const App = struct {
             .allocator = allocator,
             .items = items,
             .selected_index = 0,
+            .mouseover_index = null,
             .current_layout = layout,
             .font = font,
             .monitor = monitor,
@@ -117,7 +118,6 @@ pub const App = struct {
             .xcb_atoms = xcb_atoms,
             .state = .idle,
             .icon_texture_cache = icon_texture_cache,
-            .last_mouse_pos = .{ .x = 0, .y = 0 },
             .focus_grace_frames = 0,
         };
 
@@ -195,28 +195,23 @@ pub const App = struct {
         // Cancel switching if window loses focus (e.g., clicked outside)
         if (self.focus_grace_frames > 0) {
             self.focus_grace_frames -= 1;
-            self.last_mouse_pos = rl.GetMousePosition();
         } else if (self.state == .switching and !rl.IsWindowFocused()) {
             self.cancelSwitching();
             return;
         }
 
-        // Handle mouse input - only after the mouse has moved from its initial position
+        // Handle mouse input
         const mouse_pos = rl.GetMousePosition();
-        const mouse_moved = @abs(mouse_pos.x - self.last_mouse_pos.x) > 2 or @abs(mouse_pos.y - self.last_mouse_pos.y) > 2;
-        self.last_mouse_pos = mouse_pos;
-        if (mouse_moved) {
-            if (ui.getItemAtPosition(self.items.items, self.current_layout, mouse_pos)) |idx| {
-                rl.SetMouseCursor(rl.MOUSE_CURSOR_POINTING_HAND);
+        if (ui.getItemAtPosition(self.items.items, self.current_layout, mouse_pos)) |idx| {
+            rl.SetMouseCursor(rl.MOUSE_CURSOR_POINTING_HAND);
+            self.mouseover_index = idx;
+            if (rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
                 self.selected_index = idx;
-            } else {
-                rl.SetMouseCursor(rl.MOUSE_CURSOR_DEFAULT);
-            }
-        }
-        if (rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
-            if (ui.getItemAtPosition(self.items.items, self.current_layout, mouse_pos)) |_| {
                 self.confirmSwitching();
             }
+        } else {
+            rl.SetMouseCursor(rl.MOUSE_CURSOR_DEFAULT);
+            self.mouseover_index = null;
         }
 
         // Render
@@ -622,7 +617,7 @@ pub const App = struct {
 
         rl.BeginDrawing();
         rl.ClearBackground(rl.Color{ .r = 0, .g = 0, .b = 0, .a = 0 });
-        ui.renderSwitcher(self.items.items, self.current_layout, self.selected_index, self.font);
+        ui.renderSwitcher(self.items.items, self.current_layout, self.selected_index, self.mouseover_index, self.font);
         rl.EndDrawing();
     }
 
