@@ -31,46 +31,13 @@ pub fn processRawCapture(capture: *const x11.RawCapture, allocator: std.mem.Allo
     const thumb_height = target_height;
     const thumb_width = @as(u32, @intFromFloat(@as(f32, @floatFromInt(thumb_height)) * aspect_ratio));
 
-    // Allocate buffer for RGBA conversion of source image
-    const pixel_count: usize = @as(usize, width) * @as(usize, height);
-    const src_rgba = try allocator.alloc(u8, pixel_count * 4);
-    defer allocator.free(src_rgba);
-
-    // Convert BGRA to RGBA using SIMD (if 32-bit depth)
-    if (bytes_per_pixel == 4 and capture.data.len >= pixel_count * 4) {
-        color.convertBgraToRgbaSimd(capture.data[0 .. pixel_count * 4], src_rgba);
-    } else {
-        // Fallback for non-32bit formats
-        var i: usize = 0;
-        while (i < pixel_count) : (i += 1) {
-            const src_idx = i * bytes_per_pixel;
-            const dst_idx = i * 4;
-            if (src_idx + bytes_per_pixel <= capture.data.len) {
-                if (bytes_per_pixel == 4) {
-                    src_rgba[dst_idx + 0] = capture.data[src_idx + 2];
-                    src_rgba[dst_idx + 1] = capture.data[src_idx + 1];
-                    src_rgba[dst_idx + 2] = capture.data[src_idx + 0];
-                    src_rgba[dst_idx + 3] = 255;
-                } else {
-                    const val = capture.data[src_idx];
-                    src_rgba[dst_idx + 0] = val;
-                    src_rgba[dst_idx + 1] = val;
-                    src_rgba[dst_idx + 2] = val;
-                    src_rgba[dst_idx + 3] = 255;
-                }
-            } else {
-                @memset(src_rgba[dst_idx..][0..4], 0);
-            }
-        }
-    }
-
     // Allocate output buffer for resized thumbnail
     const thumb_data = try allocator.alloc(u8, thumb_width * thumb_height * 4);
-    errdefer allocator.free(thumb_data);
+    defer allocator.free(thumb_data); // Always free - this is intermediate storage
 
     // Use stb_image_resize2 for high-quality scaling
     const result = stb.stbir_resize_uint8_linear(
-        src_rgba.ptr,
+        capture.data.ptr,
         @intCast(width),
         @intCast(height),
         @intCast(@as(u32, width) * 4),
@@ -85,8 +52,41 @@ pub fn processRawCapture(capture: *const x11.RawCapture, allocator: std.mem.Allo
         return x11.X11Error.ImageCaptureFailed;
     }
 
+    // Allocate buffer for RGBA conversion of destination image
+    const pixel_count: usize = @as(usize, thumb_width) * @as(usize, thumb_height);
+    const dest_rgba = try allocator.alloc(u8, pixel_count * 4);
+    errdefer allocator.free(dest_rgba);
+
+    // Convert BGRA to RGBA using SIMD (if 32-bit depth)
+    if (bytes_per_pixel == 4 and thumb_data.len >= pixel_count * 4) {
+        color.convertBgraToRgbaSimd(thumb_data[0 .. pixel_count * 4], dest_rgba);
+    } else {
+        // Fallback for non-32bit formats
+        var i: usize = 0;
+        while (i < pixel_count) : (i += 1) {
+            const src_idx = i * bytes_per_pixel;
+            const dst_idx = i * 4;
+            if (src_idx + bytes_per_pixel <= thumb_data.len) {
+                if (bytes_per_pixel == 4) {
+                    dest_rgba[dst_idx + 0] = thumb_data[src_idx + 2];
+                    dest_rgba[dst_idx + 1] = thumb_data[src_idx + 1];
+                    dest_rgba[dst_idx + 2] = thumb_data[src_idx + 0];
+                    dest_rgba[dst_idx + 3] = 255;
+                } else {
+                    const val = thumb_data[src_idx];
+                    dest_rgba[dst_idx + 0] = val;
+                    dest_rgba[dst_idx + 1] = val;
+                    dest_rgba[dst_idx + 2] = val;
+                    dest_rgba[dst_idx + 3] = 255;
+                }
+            } else {
+                @memset(dest_rgba[dst_idx..][0..4], 0);
+            }
+        }
+    }
+
     return Thumbnail{
-        .data = thumb_data,
+        .data = dest_rgba,
         .width = thumb_width,
         .height = thumb_height,
         .allocator = allocator,
