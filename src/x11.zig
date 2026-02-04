@@ -4,7 +4,7 @@ const ui = @import("ui.zig");
 const rl = ui.rl;
 
 // Feature flags
-pub const FILTER_BY_CURRENT_DESKTOP = true;
+const FILTER_BY_CURRENT_DESKTOP = true;
 
 pub const xcb = @cImport({
     @cInclude("xcb/xcb.h");
@@ -391,7 +391,7 @@ fn internAtom(conn: *xcb.xcb_connection_t, name: [:0]const u8) X11Error!xcb.xcb_
     return reply.*.atom;
 }
 
-pub fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
+fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
     return Atoms{
         .net_client_list = try internAtom(conn, "_NET_CLIENT_LIST"),
         .net_wm_name = try internAtom(conn, "_NET_WM_NAME"),
@@ -415,7 +415,7 @@ pub fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
     };
 }
 
-pub fn initComposite(conn: *xcb.xcb_connection_t) X11Error!void {
+fn initComposite(conn: *xcb.xcb_connection_t) X11Error!void {
     const cookie = xcb.xcb_composite_query_version(conn, 0, 4);
     const reply = xcb.xcb_composite_query_version_reply(conn, cookie, null);
     if (reply == null) {
@@ -605,7 +605,7 @@ pub fn isWindowMinimized(
 }
 
 /// Get the current virtual desktop number from root window
-pub fn getCurrentDesktop(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t, atoms: Atoms) ?u32 {
+fn getCurrentDesktop(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t, atoms: Atoms) ?u32 {
     const cookie = xcb.xcb_get_property(conn, 0, root, atoms.net_current_desktop, xcb.XCB_ATOM_CARDINAL, 0, 1);
     const reply = xcb.xcb_get_property_reply(conn, cookie, null);
     if (reply == null) {
@@ -623,7 +623,7 @@ pub fn getCurrentDesktop(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t, at
 }
 
 /// Get the desktop number a window is on (0xFFFFFFFF means "all desktops")
-pub fn getWindowDesktop(conn: *xcb.xcb_connection_t, window: xcb.xcb_window_t, atoms: Atoms) ?u32 {
+fn getWindowDesktop(conn: *xcb.xcb_connection_t, window: xcb.xcb_window_t, atoms: Atoms) ?u32 {
     const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_desktop, xcb.XCB_ATOM_CARDINAL, 0, 1);
     const reply = xcb.xcb_get_property_reply(conn, cookie, null);
     if (reply == null) {
@@ -799,7 +799,7 @@ fn getWindowPidUncached(conn: *xcb.xcb_connection_t, window: xcb.xcb_window_t, a
 }
 
 /// Get the PID of the process that owns a window (cached version)
-pub fn getWindowPid(
+fn getWindowPid(
     conn: *xcb.xcb_connection_t,
     window: xcb.xcb_window_t,
     atoms: Atoms,

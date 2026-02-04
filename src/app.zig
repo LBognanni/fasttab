@@ -8,18 +8,6 @@ const nav = @import("navigation.zig");
 const rl = ui.rl;
 const log = std.log.scoped(.fasttab);
 
-// Re-export navigation functions for external use
-pub const moveSelectionRight = nav.moveSelectionRight;
-pub const moveSelectionLeft = nav.moveSelectionLeft;
-pub const moveSelectionDown = nav.moveSelectionDown;
-pub const moveSelectionUp = nav.moveSelectionUp;
-
-pub const AppError = error{
-    NoWindows,
-    WorkerTimeout,
-    OutOfMemory,
-};
-
 /// State machine for the Alt+Tab switcher
 pub const SwitcherState = enum {
     idle,
@@ -178,11 +166,6 @@ pub const App = struct {
     /// Get the number of windows
     pub fn windowCount(self: *const Self) usize {
         return self.items.items.len;
-    }
-
-    /// Get the current layout
-    pub fn getLayout(self: *const Self) ui.GridLayout {
-        return self.current_layout;
     }
 
     /// Process one frame: check for window close, render

@@ -17,8 +17,6 @@ pub const TITLE_FONT_SIZE = layout_module.TITLE_FONT_SIZE;
 pub const TITLE_SPACING = layout_module.TITLE_SPACING;
 
 // UI-only constants
-pub const CORNER_RADIUS: f32 = 12.0;
-pub const ITEM_CORNER_RADIUS: f32 = 4.0;
 pub const SELECTION_BORDER: u32 = 3;
 pub const BACKGROUND_COLOR = rl.Color{ .r = 0x22, .g = 0x22, .b = 0x22, .a = 217 };
 pub const HIGHLIGHT_COLOR = rl.Color{ .r = 0x2d, .g = 0x8e, .b = 0xc9, .a = 128 };
@@ -226,15 +224,10 @@ pub fn loadSystemFont(size: i32) rl.Font {
         .{ 0x2300, 0x23FF }, // Miscellaneous Technical
         .{ 0x2460, 0x24FF }, // Enclosed Alphanumerics
         .{ 0x2500, 0x257F }, // Box Drawing
-        //.{ 0x2580, 0x259F }, // Block Elements
-        //.{ 0x25A0, 0x25FF }, // Geometric Shapes
         .{ 0x2600, 0x26FF }, // Miscellaneous Symbols
         .{ 0x2700, 0x27BF }, // Dingbats
         .{ 0xE000, 0xF8FF }, // Private Use Area (Nerd Fonts)
-        // .{ 0x1F300, 0x1F5FF }, // Misc Symbols and Pictographs
         .{ 0x1F600, 0x1F64F }, // Emoticons
-        // .{ 0x1F680, 0x1F6FF }, // Transport and Map
-        // .{ 0x1F900, 0x1F9FF }, // Supplemental Symbols and Pictographs
     };
 
     for (ranges) |range| {
@@ -358,13 +351,8 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                 .width = @floatFromInt(item.display_width),
                 .height = @floatFromInt(item.display_height),
             };
-            // GLX textures have bottom-left origin - flip Y-axis
-            const source_rect = if (item.is_glx) rl.Rectangle{
-                .x = 0,
-                .y = 0,
-                .width = @floatFromInt(item.thumbnail_texture.width),
-                .height = @as(f32, @floatFromInt(item.thumbnail_texture.height)),
-            } else rl.Rectangle{
+            // GLX textures have bottom-left origin - flip Y-axis (currently handled as regular)
+            const source_rect = rl.Rectangle{
                 .x = 0,
                 .y = 0,
                 .width = @floatFromInt(item.thumbnail_texture.width),

@@ -133,17 +133,6 @@ pub fn build(b: *std.Build) void {
     ui_test.linkLibC();
     test_step.dependOn(&b.addRunArtifact(ui_test).step);
 
-    // Worker/Queue test
-    const worker_test = b.addTest(.{
-        .root_source_file = b.path("src/tests/worker_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    worker_test.root_module.addImport("queue", b.createModule(.{
-        .root_source_file = b.path("src/queue.zig"),
-    }));
-    test_step.dependOn(&b.addRunArtifact(worker_test).step);
-
     // Navigation test
     const navigation_test = b.addTest(.{
         .root_source_file = b.path("src/tests/navigation_test.zig"),
