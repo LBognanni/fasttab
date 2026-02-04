@@ -209,7 +209,7 @@ fn fetchAndCacheIcon(
     return icon_cache.get(wm_class);
 }
 
-pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
+pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator, capture_thumbnails: bool) void {
     // Create our own X11 connection (X11 is not thread-safe)
     // Use XCB-only mode (no GLX needed for worker)
     var conn = x11.Connection.initXcbOnly() catch |err| {
@@ -286,6 +286,7 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
             .known_windows = if (known_list.items.len > 0) known_list.items else null,
             .capture_only_new = capture_only_new,
             .parallel_processing = true,
+            .skip_capture = !capture_thumbnails,
         }, &pidCache) catch |err| {
             log.warn("Background worker: Scan failed: {}", .{err});
             continue;
@@ -321,37 +322,36 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
 
         // 2. Process captured windows (additions and updates)
         for (scan_result.items.items) |*item| {
-            if (item.thumbnail) |thumb| {
-                // Check if existing
-                if (tracked_windows.getPtr(item.window_id)) |existing| {
-                    // Update existing
+            // Check if existing
+            if (tracked_windows.getPtr(item.window_id)) |existing| {
+                // Update existing
 
-                    // Check title
-                    if (!std.mem.eql(u8, item.title, existing.title)) {
-                        existing.title_version += 1;
+                // Check title
+                if (!std.mem.eql(u8, item.title, existing.title)) {
+                    existing.title_version += 1;
 
-                        // Handle ownership of item.title
-                        const new_title = if (std.mem.eql(u8, item.title, "(unknown)"))
-                            allocator.dupe(u8, "(unknown)") catch continue
-                        else
-                            allocator.dupe(u8, item.title) catch continue;
+                    // Handle ownership of item.title
+                    const new_title = if (std.mem.eql(u8, item.title, "(unknown)"))
+                        allocator.dupe(u8, "(unknown)") catch continue
+                    else
+                        allocator.dupe(u8, item.title) catch continue;
 
-                        allocator.free(existing.title);
-                        existing.title = new_title; // Transfer ownership to tracked
+                    allocator.free(existing.title);
+                    existing.title = new_title; // Transfer ownership to tracked
 
-                        // Send update with copy
-                        const title_update = allocator.dupe(u8, existing.title) catch continue;
-                        queue.push(.{ .title_updated = .{
-                            .window_id = item.window_id,
-                            .title = title_update,
-                            .title_version = existing.title_version,
-                            .allocator = allocator,
-                        } });
-                    }
+                    // Send update with copy
+                    const title_update = allocator.dupe(u8, existing.title) catch continue;
+                    queue.push(.{ .title_updated = .{
+                        .window_id = item.window_id,
+                        .title = title_update,
+                        .title_version = existing.title_version,
+                        .allocator = allocator,
+                    } });
+                }
 
-                    // Update thumbnail
-                    // For now, always update if captured (visible)
-                    // (Change detection could be added here)
+                // Update thumbnail
+                // Only if captured
+                if (item.thumbnail) |thumb| {
                     existing.thumbnail_version += 1;
                     const thumb_data = allocator.dupe(u8, thumb.data) catch continue;
 
@@ -363,100 +363,100 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
                         .thumbnail_version = existing.thumbnail_version,
                         .allocator = allocator,
                     } });
-                } else {
-                    // New window
-                    const wm_class = x11.getWindowClass(allocator, conn.conn, item.window_id, conn.atoms);
-                    defer {
-                        if (!std.mem.eql(u8, wm_class, "(unknown)")) {
-                            allocator.free(wm_class);
+                }
+            } else {
+                // New window
+                const wm_class = x11.getWindowClass(allocator, conn.conn, item.window_id, conn.atoms);
+                defer {
+                    if (!std.mem.eql(u8, wm_class, "(unknown)")) {
+                        allocator.free(wm_class);
+                    }
+                }
+
+                // Check if we need to send icon
+                if (!pushed_icons.contains(wm_class)) {
+                    var icon_data_copy: ?[]u8 = null;
+                    var icon_w: u32 = 0;
+                    var icon_h: u32 = 0;
+
+                    if (icon_cache.get(wm_class)) |cached_icon| {
+                        icon_data_copy = allocator.dupe(u8, cached_icon.data) catch null;
+                        icon_w = cached_icon.width;
+                        icon_h = cached_icon.height;
+                    } else {
+                        const icon_opt = fetchAndCacheIcon(allocator, &conn, item.window_id, wm_class, &icon_cache);
+                        if (icon_opt) |cached| {
+                            icon_data_copy = allocator.dupe(u8, cached.data) catch null;
+                            icon_w = cached.width;
+                            icon_h = cached.height;
                         }
                     }
 
-                    // Check if we need to send icon
-                    if (!pushed_icons.contains(wm_class)) {
-                        var icon_data_copy: ?[]u8 = null;
-                        var icon_w: u32 = 0;
-                        var icon_h: u32 = 0;
-
-                        if (icon_cache.get(wm_class)) |cached_icon| {
-                            icon_data_copy = allocator.dupe(u8, cached_icon.data) catch null;
-                            icon_w = cached_icon.width;
-                            icon_h = cached_icon.height;
-                        } else {
-                            const icon_opt = fetchAndCacheIcon(allocator, &conn, item.window_id, wm_class, &icon_cache);
-                            if (icon_opt) |cached| {
-                                icon_data_copy = allocator.dupe(u8, cached.data) catch null;
-                                icon_w = cached.width;
-                                icon_h = cached.height;
-                            }
-                        }
-
-                        if (icon_data_copy) |idc| {
-                            const icon_id_owned = allocator.dupe(u8, wm_class) catch {
-                                allocator.free(idc);
-                                continue;
-                            };
-
-                            queue.push(.{ .icon_added = .{
-                                .icon_id = icon_id_owned,
-                                .icon_data = idc,
-                                .icon_width = icon_w,
-                                .icon_height = icon_h,
-                                .allocator = allocator,
-                            } });
-
-                            pushed_icons.put(allocator.dupe(u8, wm_class) catch continue, {}) catch {};
-                        }
-                    }
-
-                    // Add window
-                    const title_owned = if (std.mem.eql(u8, item.title, "(unknown)"))
-                        allocator.dupe(u8, "(unknown)") catch continue
-                    else
-                        allocator.dupe(u8, item.title) catch continue;
-
-                    const icon_id_owned = if (std.mem.eql(u8, wm_class, "(unknown)"))
-                        allocator.dupe(u8, "(unknown)") catch {
-                            allocator.free(title_owned);
-                            continue;
-                        }
-                    else
-                        allocator.dupe(u8, wm_class) catch {
-                            allocator.free(title_owned);
+                    if (icon_data_copy) |idc| {
+                        const icon_id_owned = allocator.dupe(u8, wm_class) catch {
+                            allocator.free(idc);
                             continue;
                         };
 
-                    const tracked = TrackedWindow{
-                        .title = title_owned, // Takes ownership
-                        .icon_id = icon_id_owned, // Takes ownership
-                        .title_version = 1,
-                        .thumbnail_version = 1,
-                        .allocator = allocator,
-                    };
-                    tracked_windows.put(item.window_id, tracked) catch {
-                        // Cleanup
-                        var t = tracked;
-                        t.deinit();
-                        continue;
-                    };
+                        queue.push(.{ .icon_added = .{
+                            .icon_id = icon_id_owned,
+                            .icon_data = idc,
+                            .icon_width = icon_w,
+                            .icon_height = icon_h,
+                            .allocator = allocator,
+                        } });
 
-                    // Send to queue (needs its own copies)
-                    const title_send = allocator.dupe(u8, title_owned) catch continue;
-                    const icon_id_send = allocator.dupe(u8, icon_id_owned) catch {
-                        allocator.free(title_send);
-                        continue;
-                    };
-
-                    const is_minimized = x11.isWindowMinimized(conn.conn, item.window_id, conn.atoms);
-
-                    queue.push(.{ .window_added = .{
-                        .window_id = item.window_id,
-                        .title = title_send,
-                        .icon_id = icon_id_send,
-                        .is_minimized = is_minimized,
-                        .allocator = allocator,
-                    } });
+                        pushed_icons.put(allocator.dupe(u8, wm_class) catch continue, {}) catch {};
+                    }
                 }
+
+                // Add window
+                const title_owned = if (std.mem.eql(u8, item.title, "(unknown)"))
+                    allocator.dupe(u8, "(unknown)") catch continue
+                else
+                    allocator.dupe(u8, item.title) catch continue;
+
+                const icon_id_owned = if (std.mem.eql(u8, wm_class, "(unknown)"))
+                    allocator.dupe(u8, "(unknown)") catch {
+                        allocator.free(title_owned);
+                        continue;
+                    }
+                else
+                    allocator.dupe(u8, wm_class) catch {
+                        allocator.free(title_owned);
+                        continue;
+                    };
+
+                const tracked = TrackedWindow{
+                    .title = title_owned, // Takes ownership
+                    .icon_id = icon_id_owned, // Takes ownership
+                    .title_version = 1,
+                    .thumbnail_version = 1,
+                    .allocator = allocator,
+                };
+                tracked_windows.put(item.window_id, tracked) catch {
+                    // Cleanup
+                    var t = tracked;
+                    t.deinit();
+                    continue;
+                };
+
+                // Send to queue (needs its own copies)
+                const title_send = allocator.dupe(u8, title_owned) catch continue;
+                const icon_id_send = allocator.dupe(u8, icon_id_owned) catch {
+                    allocator.free(title_send);
+                    continue;
+                };
+
+                const is_minimized = x11.isWindowMinimized(conn.conn, item.window_id, conn.atoms);
+
+                queue.push(.{ .window_added = .{
+                    .window_id = item.window_id,
+                    .title = title_send,
+                    .icon_id = icon_id_send,
+                    .is_minimized = is_minimized,
+                    .allocator = allocator,
+                } });
             }
         }
 

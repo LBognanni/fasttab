@@ -14,12 +14,14 @@ pub const ScanOptions = struct {
     parallel_processing: bool = true,
     /// Maximum threads for parallel processing (null = auto-detect)
     max_threads: ?u32 = null,
+    /// Skip image capture (e.g. when using GLX)
+    skip_capture: bool = false,
 };
 
 pub const ProcessedWindow = struct {
     window_id: x11.xcb.xcb_window_t,
     title: []const u8,
-    thumbnail: ?thumbnail.Thumbnail, // null if capture failed (e.g., minimized window on refresh)
+    thumbnail: ?thumbnail.Thumbnail, // null if capture failed or skipped
     is_minimized: bool,
     allocator: std.mem.Allocator,
 
@@ -136,6 +138,17 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
         // Get window title
         const title = x11.getWindowTitle(allocator, conn.conn, window_id, conn.atoms);
 
+        if (options.skip_capture) {
+            try capture_tasks.append(.{
+                .window_id = window_id,
+                .title = title,
+                .raw_capture = null,
+                .is_minimized = is_minimized,
+                .is_new_window = !is_known,
+            });
+            continue;
+        }
+
         // Try to capture raw image
         const raw_capture = x11.captureRawImage(allocator, conn.conn, window_id, title) catch |err| {
             // If geometry fetch failed, window no longer exists - remove from window_ids
@@ -223,7 +236,7 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
 
         // For new windows without thumbnails, skip them (they'll be retried)
         // For known windows, we keep them in window_ids but don't add to items
-        if (thumb == null and task.is_new_window) {
+        if (thumb == null and task.is_new_window and !options.skip_capture) {
             if (!std.mem.eql(u8, task.title, "(unknown)")) {
                 allocator.free(task.title);
             }
@@ -231,8 +244,8 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
             continue;
         }
 
-        // If we have a thumbnail, add to items
-        if (thumb != null) {
+        // If we have a thumbnail OR skipping capture
+        if (thumb != null or options.skip_capture) {
             result.items.appendAssumeCapacity(.{
                 .window_id = task.window_id,
                 .title = task.title,

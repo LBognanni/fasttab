@@ -187,9 +187,10 @@ pub const WindowTexture = struct {
     glx_pixmap: xlib.GLXPixmap,
     gl_texture: c_uint,
     damage: xcb.xcb_damage_damage_t,
+    gl_display: ?*xlib.Display,
 
     pub fn deinit(self: *WindowTexture, conn: *Connection) void {
-        if (conn.display) |display| {
+        if (self.gl_display) |display| {
             clearGlxError(display);
             conn.glx_release.?(display, self.glx_pixmap, xlib.GLX_FRONT_LEFT_EXT);
             xlib.glDeleteTextures(1, &self.gl_texture);
@@ -214,7 +215,7 @@ pub const WindowTexture = struct {
     /// Rebind after damage (window content changed).
     /// Returns false if the rebind failed (texture is now invalid).
     pub fn rebind(self: *WindowTexture, conn: *Connection) bool {
-        const display = conn.display orelse return false;
+        const display = self.gl_display orelse return false;
         clearGlxError(display);
 
         xlib.glBindTexture(xlib.GL_TEXTURE_2D, self.gl_texture);
@@ -1052,6 +1053,12 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
         return error.GLXExtensionMissing;
     }
 
+    const gl_display = xlib.glXGetCurrentDisplay();
+    if (gl_display == null) {
+        log.err("No current GLX display found", .{});
+        return error.GLXExtensionMissing;
+    }
+
     // Redirect for compositing
     const redirect_cookie = xcb.xcb_composite_redirect_window_checked(
         conn.conn,
@@ -1078,14 +1085,15 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
     if (width == 0 or height == 0) return error.InvalidGeometry;
 
     // Find FBConfig matching this window's visual
-    const fb_config = findFBConfigForVisual(conn.display.?, conn.screen_num, visual_id) orelse {
+    const screen_num = xlib.DefaultScreen(gl_display);
+    const fb_config = findFBConfigForVisual(gl_display.?, screen_num, visual_id) orelse {
         log.err("No matching FBConfig for visual 0x{x} depth {d} (window {x})", .{ visual_id, depth, window });
         return error.NoSuitableFBConfig;
     };
 
     // Check whether this FBConfig supports RGBA or RGB texture binding
     var bind_rgba: c_int = 0;
-    _ = xlib.glXGetFBConfigAttrib(conn.display.?, fb_config, xlib.GLX_BIND_TO_TEXTURE_RGBA_EXT, &bind_rgba);
+    _ = xlib.glXGetFBConfigAttrib(gl_display.?, fb_config, xlib.GLX_BIND_TO_TEXTURE_RGBA_EXT, &bind_rgba);
     const texture_format = if (bind_rgba != 0) xlib.GLX_TEXTURE_FORMAT_RGBA_EXT else xlib.GLX_TEXTURE_FORMAT_RGB_EXT;
 
     // Create composite pixmap
@@ -1104,11 +1112,10 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
         0,
     };
 
-    const display = conn.display.?;
-    clearGlxError(display);
+    clearGlxError(gl_display.?);
 
-    const glx_pixmap = xlib.glXCreatePixmap(display, fb_config, pixmap, &glx_attribs);
-    if (glx_pixmap == 0 or checkGlxError(display)) {
+    const glx_pixmap = xlib.glXCreatePixmap(gl_display, fb_config, pixmap, &glx_attribs);
+    if (glx_pixmap == 0 or checkGlxError(gl_display.?)) {
         log.err("glXCreatePixmap failed for window {x} (depth={d}, {}x{})", .{ window, depth, width, height });
         _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
         return error.GLXPixmapCreationFailed;
@@ -1122,14 +1129,14 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
     xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_WRAP_S, xlib.GL_CLAMP_TO_EDGE);
     xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_WRAP_T, xlib.GL_CLAMP_TO_EDGE);
 
-    clearGlxError(display);
-    conn.glx_bind.?(display, glx_pixmap, xlib.GLX_FRONT_LEFT_EXT, null);
+    clearGlxError(gl_display.?);
+    conn.glx_bind.?(gl_display.?, glx_pixmap, xlib.GLX_FRONT_LEFT_EXT, null);
 
-    if (checkGlxError(display)) {
+    if (checkGlxError(gl_display.?)) {
         log.err("glXBindTexImageEXT failed for window {x} (depth={d}, visual=0x{x})", .{ window, depth, visual_id });
         xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
         xlib.glDeleteTextures(1, &gl_texture);
-        xlib.glXDestroyPixmap(display, glx_pixmap);
+        xlib.glXDestroyPixmap(gl_display, glx_pixmap);
         _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
         return error.GLXPixmapCreationFailed;
     }
@@ -1147,6 +1154,7 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
         .glx_pixmap = glx_pixmap,
         .gl_texture = gl_texture,
         .damage = damage,
+        .gl_display = gl_display,
     };
 }
 
