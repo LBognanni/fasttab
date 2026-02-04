@@ -106,7 +106,7 @@ fn runDaemon() !void {
 
     // Initialize app in daemon mode (window created but hidden)
     // App init drains the queue for initial windows
-    var application = try app.App.init(allocator, &task_queue, true, conn.conn, conn.root, conn.atoms);
+    var application = try app.App.init(allocator, &task_queue, true, &conn);
     defer application.deinit();
     application.hideWindow();
 
@@ -122,9 +122,9 @@ fn runDaemon() !void {
         // Poll for XCB events (16ms timeout ~= 60fps)
         _ = std.posix.poll(&pollfds, 16) catch {};
 
-        // Process XCB events (key press/release)
+        // Process XCB events (key press/release, damage)
         if (pollfds[0].revents & std.posix.POLL.IN != 0) {
-            processXcbEvents(&application, conn.conn);
+            processXcbEvents(&application, &conn);
         }
 
         // Process updates from queue
@@ -142,10 +142,10 @@ fn runDaemon() !void {
     try stdout.print("Daemon stopped.\n", .{});
 }
 
-/// Process all pending XCB events (key press/release)
-fn processXcbEvents(application: *app.App, conn: *x11.xcb.xcb_connection_t) void {
+/// Process all pending XCB events (key press/release, damage)
+fn processXcbEvents(application: *app.App, conn: *x11.Connection) void {
     while (true) {
-        const event = x11.xcb.xcb_poll_for_event(conn);
+        const event = x11.xcb.xcb_poll_for_event(conn.conn);
         if (event == null) break;
         defer std.c.free(event);
 
@@ -154,7 +154,7 @@ fn processXcbEvents(application: *app.App, conn: *x11.xcb.xcb_connection_t) void
         switch (response_type) {
             x11.xcb.XCB_KEY_PRESS => {
                 const key_event: *x11.xcb.xcb_key_press_event_t = @ptrCast(event);
-                const keysym = x11.keycodeToKeysym(conn, key_event.detail, 0);
+                const keysym = x11.keycodeToKeysym(conn.conn, key_event.detail, 0);
                 const state_mask = key_event.state;
 
                 // Check for Shift via state mask or keysym
@@ -177,11 +177,17 @@ fn processXcbEvents(application: *app.App, conn: *x11.xcb.xcb_connection_t) void
             },
             x11.xcb.XCB_KEY_RELEASE => {
                 const key_event: *x11.xcb.xcb_key_release_event_t = @ptrCast(event);
-                const keysym = x11.keycodeToKeysym(conn, key_event.detail, 0);
+                const keysym = x11.keycodeToKeysym(conn.conn, key_event.detail, 0);
 
                 _ = application.handleKeyEvent(keysym, false);
             },
-            else => {},
+            else => {
+                // Check for damage events
+                if (response_type == conn.damage_event_base + x11.xcb.XCB_DAMAGE_NOTIFY) {
+                    const damage_event: *x11.xcb.xcb_damage_notify_event_t = @ptrCast(event);
+                    application.handleDamageEvent(damage_event.drawable);
+                }
+            },
         }
     }
 }

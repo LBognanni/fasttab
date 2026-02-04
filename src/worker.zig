@@ -4,7 +4,7 @@ const thumbnail = @import("thumbnail.zig");
 const window_scanner = @import("window_scanner.zig");
 
 const log = std.log.scoped(.fasttab);
-const DELAY_SECONDS: f32 = 0.25; // seconds between scans
+const DELAY_SECONDS: f32 = 0.05; // seconds between scans
 
 pub const UpdateTask = union(enum) {
     window_added: WindowAdded,
@@ -17,11 +17,7 @@ pub const UpdateTask = union(enum) {
         window_id: x11.xcb.xcb_window_t,
         title: []const u8, // owned
         icon_id: []const u8, // owned (WM_CLASS)
-        thumbnail_data: []u8, // owned RGBA
-        thumbnail_width: u32,
-        thumbnail_height: u32,
-        thumbnail_version: u32,
-        title_version: u32,
+        is_minimized: bool,
         allocator: std.mem.Allocator,
     };
     pub const WindowRemoved = struct { window_id: x11.xcb.xcb_window_t };
@@ -50,7 +46,6 @@ pub const UpdateTask = union(enum) {
     pub fn deinit(self: *UpdateTask) void {
         switch (self.*) {
             .window_added => |*t| {
-                if (t.thumbnail_data.len > 0) t.allocator.free(t.thumbnail_data);
                 if (t.title.len > 0) t.allocator.free(t.title);
                 if (t.icon_id.len > 0) t.allocator.free(t.icon_id);
             },
@@ -216,7 +211,8 @@ fn fetchAndCacheIcon(
 
 pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
     // Create our own X11 connection (X11 is not thread-safe)
-    var conn = x11.Connection.init() catch |err| {
+    // Use XCB-only mode (no GLX needed for worker)
+    var conn = x11.Connection.initXcbOnly() catch |err| {
         log.err("Background worker: Failed to connect to X11: {}", .{err});
         return;
     };
@@ -430,12 +426,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
                             continue;
                         };
 
-                    const thumb_data = allocator.dupe(u8, thumb.data) catch {
-                        allocator.free(title_owned);
-                        allocator.free(icon_id_owned);
-                        continue;
-                    };
-
                     const tracked = TrackedWindow{
                         .title = title_owned, // Takes ownership
                         .icon_id = icon_id_owned, // Takes ownership
@@ -447,31 +437,23 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
                         // Cleanup
                         var t = tracked;
                         t.deinit();
-                        allocator.free(thumb_data);
                         continue;
                     };
 
                     // Send to queue (needs its own copies)
-                    const title_send = allocator.dupe(u8, title_owned) catch {
-                        // tracked already owns title_owned, so just free data for send
-                        allocator.free(thumb_data);
-                        continue;
-                    };
+                    const title_send = allocator.dupe(u8, title_owned) catch continue;
                     const icon_id_send = allocator.dupe(u8, icon_id_owned) catch {
                         allocator.free(title_send);
-                        allocator.free(thumb_data);
                         continue;
                     };
+
+                    const is_minimized = x11.isWindowMinimized(conn.conn, item.window_id, conn.atoms);
 
                     queue.push(.{ .window_added = .{
                         .window_id = item.window_id,
                         .title = title_send,
                         .icon_id = icon_id_send,
-                        .thumbnail_data = thumb_data,
-                        .thumbnail_width = thumb.width,
-                        .thumbnail_height = thumb.height,
-                        .thumbnail_version = 1,
-                        .title_version = 1,
+                        .is_minimized = is_minimized,
                         .allocator = allocator,
                     } });
                 }

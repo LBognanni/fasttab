@@ -49,11 +49,10 @@ pub const App = struct {
     should_quit: bool,
     update_queue: ?*worker.TaskQueue,
     temp_tasks: std.ArrayList(worker.UpdateTask),
-    xcb_conn: *x11.xcb.xcb_connection_t,
-    xcb_root: x11.xcb.xcb_window_t,
-    xcb_atoms: x11.Atoms,
+    conn: *x11.Connection,
     state: SwitcherState,
     icon_texture_cache: std.StringHashMap(rl.Texture2D),
+    window_textures: std.AutoHashMap(x11.xcb.xcb_window_t, x11.WindowTexture),
     focus_grace_frames: u8,
 
     const Self = @This();
@@ -63,13 +62,12 @@ pub const App = struct {
         allocator: std.mem.Allocator,
         task_queue: *worker.TaskQueue,
         daemon_mode: bool,
-        xcb_conn: *x11.xcb.xcb_connection_t,
-        xcb_root: x11.xcb.xcb_window_t,
-        xcb_atoms: x11.Atoms,
+        conn: *x11.Connection,
     ) !Self {
         // Create empty items list and caches
         const items = std.ArrayList(ui.DisplayWindow).init(allocator);
         const icon_texture_cache = std.StringHashMap(rl.Texture2D).init(allocator);
+        const window_textures = std.AutoHashMap(x11.xcb.xcb_window_t, x11.WindowTexture).init(allocator);
         const temp_tasks = std.ArrayList(worker.UpdateTask).init(allocator);
 
         // Create raylib window (hidden initially)
@@ -113,11 +111,10 @@ pub const App = struct {
             .should_quit = false,
             .update_queue = task_queue,
             .temp_tasks = temp_tasks,
-            .xcb_conn = xcb_conn,
-            .xcb_root = xcb_root,
-            .xcb_atoms = xcb_atoms,
+            .conn = conn,
             .state = .idle,
             .icon_texture_cache = icon_texture_cache,
+            .window_textures = window_textures,
             .focus_grace_frames = 0,
         };
 
@@ -133,13 +130,27 @@ pub const App = struct {
     pub fn deinit(self: *Self) void {
         // Unload textures and close window
         for (self.items.items) |*item| {
-            rl.UnloadTexture(item.thumbnail_texture);
+            // Check if this is a GLX texture (owned by window_textures)
+            if (self.window_textures.contains(item.id)) {
+                // Don't unload GLX textures here - they're owned by window_textures
+            } else {
+                // Regular texture - unload it
+                rl.UnloadTexture(item.thumbnail_texture);
+            }
             // Don't unload icon_texture here - it's shared via icon_texture_cache
             // Free owned fields
             self.allocator.free(item.title);
             self.allocator.free(item.icon_id);
         }
         self.items.deinit();
+
+        // Clean up window textures
+        var tex_iter = self.window_textures.valueIterator();
+        while (tex_iter.next()) |tex| {
+            var t = tex.*;
+            t.deinit(self.conn);
+        }
+        self.window_textures.deinit();
 
         // Unload icon textures from cache
         var icon_iter = self.icon_texture_cache.iterator();
@@ -231,14 +242,33 @@ pub const App = struct {
             any_changes = true;
             switch (task.*) {
                 .window_added => |*data| {
-                    // Upload thumbnail
-                    const thumb = thumbnail.Thumbnail{
-                        .data = data.thumbnail_data,
-                        .width = data.thumbnail_width,
-                        .height = data.thumbnail_height,
-                        .allocator = data.allocator,
-                    };
-                    const texture = ui.loadTextureFromThumbnail(&thumb);
+                    // Try to create GLX texture if available
+                    var texture: rl.Texture2D = undefined;
+                    var source_width: u32 = 0;
+                    var source_height: u32 = 0;
+
+                    if (self.conn.use_glx and !data.is_minimized) {
+                        const win_tex = x11.createWindowTexture(self.conn, data.window_id) catch |err| {
+                            log.err("GLX texture failed for {x}: {}, falling back to XCB", .{ data.window_id, err });
+                            // TODO: Fallback to XCB capture
+                            continue;
+                        };
+
+                        texture = win_tex.toRaylibTexture();
+                        source_width = win_tex.width;
+                        source_height = win_tex.height;
+
+                        self.window_textures.put(data.window_id, win_tex) catch {
+                            var t = win_tex;
+                            t.deinit(self.conn);
+                            continue;
+                        };
+                    } else {
+                        // GLX not available or window minimized - skip for now
+                        // TODO: Implement XCB fallback
+                        log.warn("GLX not available for window {x}, skipping", .{data.window_id});
+                        continue;
+                    }
 
                     // Look up icon
                     var icon_tex: ?rl.Texture2D = null;
@@ -253,34 +283,42 @@ pub const App = struct {
                         .thumbnail_texture = texture,
                         .icon_texture = icon_tex,
                         .icon_id = data.icon_id,
-                        .title_version = data.title_version,
-                        .thumbnail_version = data.thumbnail_version,
-                        .source_width = data.thumbnail_width,
-                        .source_height = data.thumbnail_height,
+                        .title_version = 1,
+                        .thumbnail_version = 1,
+                        .source_width = source_width,
+                        .source_height = source_height,
                         .display_width = 0,
                         .display_height = 0,
+                        .is_glx = self.conn.use_glx,
                     };
 
                     self.items.append(new_item) catch {
-                        rl.UnloadTexture(texture);
                         // Free the strings since we failed to append
                         self.allocator.free(data.title);
                         self.allocator.free(data.icon_id);
+                        if (self.window_textures.fetchRemove(data.window_id)) |entry| {
+                            var t = entry.value;
+                            t.deinit(self.conn);
+                        }
                         continue;
                     };
 
                     // Clear ownership from task
                     data.title = &[_]u8{};
                     data.icon_id = &[_]u8{};
-                    // thumbnail_data is also owned by task, but we uploaded it and don't need it anymore.
-                    data.allocator.free(data.thumbnail_data);
-                    data.thumbnail_data = &[_]u8{};
                 },
 
                 .window_removed => |*data| {
                     for (self.items.items, 0..) |*item, i| {
                         if (item.id == data.window_id) {
-                            rl.UnloadTexture(item.thumbnail_texture);
+                            // Clean up WindowTexture if it exists
+                            if (self.window_textures.fetchRemove(data.window_id)) |entry| {
+                                var tex = entry.value;
+                                tex.deinit(self.conn);
+                            } else {
+                                // Not a GLX texture, unload normally
+                                rl.UnloadTexture(item.thumbnail_texture);
+                            }
                             self.allocator.free(item.title);
                             self.allocator.free(item.icon_id);
                             _ = self.items.orderedRemove(i);
@@ -432,7 +470,7 @@ pub const App = struct {
         self.current_layout = ui.calculateBestLayout(self.items.items);
 
         // Query current mouse position and find monitor
-        const mouse_pos = x11.getMousePosition(self.xcb_conn, self.xcb_root);
+        const mouse_pos = x11.getMousePosition(self.conn.conn, self.conn.root);
         self.monitor = findMonitorAtPosition(mouse_pos);
 
         rl.ClearWindowState(rl.FLAG_WINDOW_HIDDEN);
@@ -463,7 +501,7 @@ pub const App = struct {
             return;
         }
 
-        if (!x11.grabKeyboard(self.xcb_conn, self.xcb_root)) {
+        if (!x11.grabKeyboard(self.conn.conn, self.conn.root)) {
             log.err("Could not grab keyboard, aborting Alt+Tab", .{});
             return;
         }
@@ -544,11 +582,11 @@ pub const App = struct {
 
         if (self.items.items.len > 0 and self.selected_index < self.items.items.len) {
             const selected_id = self.items.items[self.selected_index].id;
-            x11.activateWindow(self.xcb_conn, self.xcb_root, selected_id, self.xcb_atoms);
+            x11.activateWindow(self.conn.conn, self.conn.root, selected_id, self.conn.atoms);
             log.info("Confirmed: activating window {x}", .{selected_id});
         }
 
-        x11.ungrabKeyboard(self.xcb_conn);
+        x11.ungrabKeyboard(self.conn.conn);
         self.hideWindow();
         self.state = .idle;
     }
@@ -558,14 +596,28 @@ pub const App = struct {
         if (self.state != .switching) return;
 
         log.info("Switching cancelled", .{});
-        x11.ungrabKeyboard(self.xcb_conn);
+        x11.ungrabKeyboard(self.conn.conn);
         self.hideWindow();
         self.state = .idle;
     }
 
+    /// Handle damage event for a window (rebind GLX texture)
+    pub fn handleDamageEvent(self: *Self, drawable: x11.xcb.xcb_window_t) void {
+        if (self.window_textures.getPtr(drawable)) |tex| {
+            if (!tex.rebind(self.conn)) {
+                // Rebind failed — texture is stale, remove it
+                log.warn("Removing stale GLX texture for window {x}", .{drawable});
+                var t = self.window_textures.fetchRemove(drawable) orelse return;
+                t.value.deinit(self.conn);
+                return;
+            }
+            _ = x11.xcb.xcb_damage_subtract(self.conn.conn, tex.damage, 0, 0);
+        }
+    }
+
     /// Reorder internal items to match stacking order (reversed = MRU first)
     fn reorderByStacking(self: *Self) void {
-        const stacking = x11.getStackingWindowList(self.allocator, self.xcb_conn, self.xcb_root, self.xcb_atoms) catch |err| {
+        const stacking = x11.getStackingWindowList(self.allocator, self.conn.conn, self.conn.root, self.conn.atoms) catch |err| {
             log.warn("Could not get stacking list: {}", .{err});
             return;
         };

@@ -29,6 +29,7 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("xcb-composite");
     exe.linkSystemLibrary("xcb-image");
     exe.linkSystemLibrary("xcb-keysyms");
+    exe.linkSystemLibrary("xcb-damage");
 
     // Link raylib and its dependencies
     exe.linkSystemLibrary("raylib");
@@ -38,6 +39,7 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("dl");
     exe.linkSystemLibrary("rt");
     exe.linkSystemLibrary("X11");
+    exe.linkSystemLibrary("X11-xcb"); // Xlib-XCB bridge functions
 
     exe.linkLibC();
 
@@ -66,6 +68,7 @@ pub fn build(b: *std.Build) void {
     exe_unit_tests.linkSystemLibrary("xcb-composite");
     exe_unit_tests.linkSystemLibrary("xcb-image");
     exe_unit_tests.linkSystemLibrary("xcb-keysyms");
+    exe_unit_tests.linkSystemLibrary("xcb-damage");
     exe_unit_tests.linkSystemLibrary("raylib");
     exe_unit_tests.linkSystemLibrary("GL");
     exe_unit_tests.linkSystemLibrary("m");
@@ -73,6 +76,7 @@ pub fn build(b: *std.Build) void {
     exe_unit_tests.linkSystemLibrary("dl");
     exe_unit_tests.linkSystemLibrary("rt");
     exe_unit_tests.linkSystemLibrary("X11");
+    exe_unit_tests.linkSystemLibrary("X11-xcb");
     exe_unit_tests.linkLibC();
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
@@ -117,6 +121,7 @@ pub fn build(b: *std.Build) void {
     ui_test.linkSystemLibrary("xcb-composite");
     ui_test.linkSystemLibrary("xcb-image");
     ui_test.linkSystemLibrary("xcb-keysyms");
+    ui_test.linkSystemLibrary("xcb-damage");
     ui_test.linkSystemLibrary("raylib");
     ui_test.linkSystemLibrary("GL");
     ui_test.linkSystemLibrary("m");
@@ -124,6 +129,7 @@ pub fn build(b: *std.Build) void {
     ui_test.linkSystemLibrary("dl");
     ui_test.linkSystemLibrary("rt");
     ui_test.linkSystemLibrary("X11");
+    ui_test.linkSystemLibrary("X11-xcb");
     ui_test.linkLibC();
     test_step.dependOn(&b.addRunArtifact(ui_test).step);
 

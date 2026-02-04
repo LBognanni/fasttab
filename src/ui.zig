@@ -45,6 +45,7 @@ pub const DisplayWindow = struct {
     source_height: u32, // original thumbnail height (for layout)
     display_width: u32,
     display_height: u32,
+    is_glx: bool, // true if this is a GLX texture (needs Y-flip)
 };
 
 // Re-export GridLayout from layout module
@@ -357,7 +358,13 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                 .width = @floatFromInt(item.display_width),
                 .height = @floatFromInt(item.display_height),
             };
-            const source_rect = rl.Rectangle{
+            // GLX textures have bottom-left origin - flip Y-axis
+            const source_rect = if (item.is_glx) rl.Rectangle{
+                .x = 0,
+                .y = 0,
+                .width = @floatFromInt(item.thumbnail_texture.width),
+                .height = @as(f32, @floatFromInt(item.thumbnail_texture.height)),
+            } else rl.Rectangle{
                 .x = 0,
                 .y = 0,
                 .width = @floatFromInt(item.thumbnail_texture.width),
