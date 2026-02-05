@@ -392,7 +392,7 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                 .width = @floatFromInt(item.display_width),
                 .height = @floatFromInt(item.display_height),
             };
-            // GLX textures have bottom-left origin - flip Y-axis (currently handled as regular)
+            // Draw texture without Y-axis flipping; any GLX origin handling is done when creating the texture
             const source_rect = rl.Rectangle{
                 .x = 0,
                 .y = 0,
