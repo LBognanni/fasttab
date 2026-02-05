@@ -53,22 +53,21 @@ fasttab/
 ├── src/
 │   ├── main.zig              # Entry point, CLI parsing, daemon loop
 │   ├── app.zig               # Alt+Tab switcher state machine (SwitcherState)
-│   ├── x11.zig               # XCB bindings, key grabbing, window properties
-│   ├── ui.zig                # raylib rendering, window items, UI constants
-│   ├── window_scanner.zig    # Window scanning and parallel thumbnail capture
-│   ├── thumbnail.zig         # Thumbnail processing, STB resize
+│   ├── x11.zig               # XCB/GLX bindings, texture management, key grabbing
+│   ├── ui.zig                # raylib rendering, shader integration, UI constants
+│   ├── window_scanner.zig    # Window scanning and filtering
+│   ├── thumbnail.zig         # Icon processing (STB image)
 │   ├── desktop_icon.zig      # Desktop icon lookup and loading (STB image)
 │   ├── layout.zig            # Pure grid layout calculations (no C deps)
 │   ├── navigation.zig        # Pure grid navigation functions (no deps)
-│   ├── worker.zig            # Background thread for thumbnail refresh
-│   ├── queue.zig             # Generic thread-safe queue (no C deps)
-│   ├── color.zig             # SIMD BGRA→RGBA conversion (no C deps)
+│   ├── worker.zig            # Background thread for window monitoring
 │   ├── stb_impl.c            # STB image library C implementation
+│   ├── shaders/
+│   │   ├── downsample.vs     # Vertex shader for thumbnail downsampling
+│   │   └── downsample.fs     # Fragment shader with adaptive box filtering
 │   └── tests/
 │       ├── navigation_test.zig   # Navigation index calculations
-│       ├── thumbnail_test.zig    # BGRA→RGBA color conversion
-│       ├── ui_test.zig           # Grid layout calculations
-│       └── worker_test.zig       # Thread-safe queue behavior
+│       └── ui_test.zig           # Grid layout calculations
 ├── include/
 │   ├── stb_image.h           # STB header for image loading
 │   └── stb_image_resize2.h   # STB header for image resizing
@@ -90,24 +89,22 @@ fasttab/
 |--------|------|---------|
 | `main.zig` | Entry point, daemon setup | x11, worker, app |
 | `app.zig` | Switcher state machine | x11, ui, worker, thumbnail, navigation |
-| `x11.zig` | XCB bindings, key grab | desktop_icon (+ C: xcb) |
-| `ui.zig` | raylib rendering | thumbnail, x11, layout (+ C: raylib) |
-| `window_scanner.zig` | Window scan + capture | x11, thumbnail |
-| `thumbnail.zig` | Image processing | x11, color (+ C: stb) |
+| `x11.zig` | XCB/GLX bindings, texture mgmt | desktop_icon (+ C: xcb, glx) |
+| `ui.zig` | raylib rendering, shaders | thumbnail, x11, layout (+ C: raylib, embedded shaders) |
+| `window_scanner.zig` | Window discovery + filtering | x11, thumbnail |
+| `thumbnail.zig` | Icon processing | std (+ C: stb) |
 | `desktop_icon.zig` | Icon lookup + loading | std (+ C: stb) |
-| `worker.zig` | Background refresh thread | x11, thumbnail, window_scanner |
+| `worker.zig` | Background window monitoring | x11, thumbnail, window_scanner |
 | `layout.zig` | Grid layout math | std only |
 | `navigation.zig` | Selection movement | none |
-| `queue.zig` | Thread-safe queue | std only |
-| `color.zig` | SIMD pixel conversion | std only |
 
 ## Testing Strategy
 
 Tests are organized into two tiers:
 
-1. **Main module tests** (`zig build test` via `src/main.zig`): Tests embedded in source files using `test` blocks. These link against XCB, raylib, and all C dependencies. They require a display server and the full library set.
+1. **Main module tests** (`zig build test` via `src/main.zig`): Tests embedded in source files using `test` blocks. These link against XCB, GLX, raylib, and all C dependencies. They require a display server and the full library set.
 
-2. **Pure logic tests** (`src/tests/*.zig`): Standalone test files that import individual modules without C dependencies. These test `navigation`, `layout`, `queue`, and `color` in isolation and can run anywhere without X11 or raylib. Each test file gets its module injected via `addImport` in `build.zig`.
+2. **Pure logic tests** (`src/tests/*.zig`): Standalone test files that import individual modules without C dependencies. These test `navigation` and `layout` in isolation and can run anywhere without X11 or raylib. Each test file gets its module injected via `addImport` in `build.zig`.
 
 Both tiers run together under `zig build test`.
 
@@ -168,8 +165,9 @@ xev                                # Monitor X11 events
 - **Read spec.md first** before implementing any feature
 - Follow milestone order - don't skip ahead
 - Performance is critical: Profile before optimizing, but keep CLI path minimal
-- X11 and raylib are C libraries - use `@cImport` and respect C semantics
+- X11, GLX, and raylib are C libraries - use `@cImport` and respect C semantics
 - You are running in a container, this means that the user will have to test GUI features on their own machine
 - When in doubt about Zig syntax, use `zig build` early and often - compiler errors are helpful
 - Run `./setup.sh` before first build to download raylib
-- Modules without C deps (`layout`, `navigation`, `queue`, `color`) are the easiest to test and modify
+- Modules without C deps (`layout`, `navigation`) are the easiest to test and modify
+- GLX textures use zero-copy binding - pixel data never leaves the GPU

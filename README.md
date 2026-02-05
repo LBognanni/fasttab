@@ -22,14 +22,16 @@ I am, however, in the opposite camp: I Alt+Tab all the time, my computer can han
 So I decided to try out writing my own Alt+Tab switcher.
 
 FastTab improves performance in several ways:
- - It runs as a daemon in the background, constantly monitoring windows and generating thumbnails as needed.
- - It caches window thumbnails in memory, so that when the switcher is invoked, it can display them instantly.
- - It's written in Zig and uses SIMD optimizations for image processing tasks, making thumbnail generation very efficient.
- - It uses OpenGL via Raylib for fast rendering of the switcher UI.
+ - It runs as a daemon in the background, constantly monitoring windows and maintaining live thumbnails.
+ - It uses OpenGL via Raylib for fast rendering of the switcher UI
+ - Window thumbnails are rendered entirely on the GPU using GLX texture binding (zero-copy, no CPU overhead).
+ - Live thumbnail updates reflect window content changes in real-time without capturing screenshots.
+ - It's written in Zig!
 
 ## Prerequisites
 
  - An X11-based desktop environment (e.g. KDE Plasma, Xfce, etc)
+ - Hardware-accelerated OpenGL support
  - Rebind the default `Alt+Tab` shortcuts to something else (e.g. `Ctrl+Meta+Tab`, `Ctrl+Meta+Shift+Tab`), to avoid conflicts.  
 
 ## Build instructions

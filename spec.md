@@ -8,14 +8,14 @@
 
 FastTab is a high-performance window switcher for X11 desktops. It is a standalone daemon written in Zig that:
 
-1. **Pre-caches window thumbnails** in the background using XComposite, so the switcher displays instantly
+1. **Binds window textures directly on the GPU** using GLX_EXT_texture_from_pixmap for zero-copy rendering
 2. **Grabs Alt+Tab globally** via XCB passive key grabs, handling the full switching lifecycle
 3. **Renders a thumbnail grid** using raylib, with MRU window ordering
 4. **Activates windows** directly via `_NET_ACTIVE_WINDOW` client messages
 
 ### Why Standalone?
 
-KDE's built-in task switchers render thumbnails on demand when Alt+Tab is pressed, which introduces latency. FastTab pre-caches thumbnails in the background so the switcher can display instantly by blitting existing images rather than capturing windows at display time.
+KDE's built-in task switchers render thumbnails on demand when Alt+Tab is pressed, which introduces latency. FastTab maintains live GPU-bound textures that reflect window content in real-time without any CPU-side capture or processing.
 
 Rather than integrating as a KWin plugin (which adds complexity and limits portability), FastTab grabs Alt+Tab directly at the X11 level. This makes it work with any X11 window manager, not just KWin.
 
@@ -29,11 +29,11 @@ Rather than integrating as a KWin plugin (which adds complexity and limits porta
 ├────────────────────────────────────────────────────────────────┤
 │                                                                │
 │  ┌──────────────────┐     ┌─────────────────────────────────┐  │
-│  │  Window Tracker  │     │       Thumbnail Cache           │  │
+│  │  Window Tracker  │     │     GLX Texture Manager         │  │
 │  │                  │     │                                 │  │
-│  │  - X11 events    │────▶│  - XComposite capture           │  │
-│  │  - _NET_CLIENT   │     │  - Periodic refresh             │  │
-│  │    _LIST         │     │  - In-memory RGBA buffers       │  │
+│  │  - X11 events    │────▶│  - GLX pixmap binding           │  │
+│  │  - _NET_CLIENT   │     │  - XDamage monitoring           │  │
+│  │    _LIST         │     │  - Zero-copy GPU textures       │  │
 │  └──────────────────┘     └─────────────────────────────────┘  │
 │                                       │                        │
 │                                       ▼                        │
@@ -67,8 +67,9 @@ Key Flow:
 #### Technology Stack
 
 - **Language:** Zig
-- **X11 Binding:** XCB via Zig's @cImport (xcb, xcb-composite, xcb-image, xcb-keysyms)
+- **X11 Binding:** XCB + GLX via Zig's @cImport (xcb, xcb-composite, xcb-damage, xcb-keysyms, glx)
 - **Rendering:** raylib (provides window creation, OpenGL context, texture rendering, text drawing)
+- **Shaders:** GLSL (embedded at compile time for adaptive box-filter downsampling)
 - **Input:** XCB passive key grab (Alt+Tab) + active keyboard grab during switching
 
 #### Responsibilities
@@ -78,11 +79,12 @@ Key Flow:
    - Listen for `DestroyNotify` and `UnmapNotify` events
    - Maintain an internal list of window IDs with metadata (title, class)
 
-2. **Thumbnail Caching**
-   - Capture window contents using XComposite extension
-   - Store thumbnails as in-memory RGBA buffers
-   - Refresh thumbnails periodically (polling)
-   - Scale thumbnails to target height of 256 pixels, preserving aspect ratio
+2. **GPU Texture Management**
+   - Bind window pixmaps directly as OpenGL textures using GLX_EXT_texture_from_pixmap
+   - Zero-copy architecture - pixel data never leaves GPU memory
+   - Monitor window content changes via XDamage extension
+   - Rebind textures when damage events indicate content changed
+   - Apply custom GLSL downsampling shader for high-quality thumbnail rendering (adaptive 2x2 to 8x8 box filtering)
 
 3. **Global Key Grabbing**
    - Grab Alt+Tab and Alt+Shift+Tab on root window (passive grab via `xcb_grab_key`)
@@ -107,10 +109,6 @@ Key Flow:
    - Render cached thumbnails in a grid layout
    - Draw selection highlight around current window
    - Display window titles below thumbnails
-
-#### Future Enhancement: XDamage
-
-The initial implementation uses periodic polling to refresh thumbnails. A future enhancement should use XDamage to receive notifications when window contents change, updating only the affected thumbnails. This would reduce CPU usage while keeping thumbnails current.
 
 ---
 
