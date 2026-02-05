@@ -86,17 +86,6 @@ pub fn build(b: *std.Build) void {
     // Pure logic unit tests (no X11/raylib dependencies)
     // Each test file needs access to the modules it imports
 
-    // Thumbnail test
-    const thumbnail_test = b.addTest(.{
-        .root_source_file = b.path("src/tests/thumbnail_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    thumbnail_test.root_module.addImport("color", b.createModule(.{
-        .root_source_file = b.path("src/color.zig"),
-    }));
-    test_step.dependOn(&b.addRunArtifact(thumbnail_test).step);
-
     // UI test (requires C dependencies for DisplayWindow)
     const ui_test = b.addTest(.{
         .root_source_file = b.path("src/tests/ui_test.zig"),

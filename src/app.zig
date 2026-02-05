@@ -116,17 +116,10 @@ pub const App = struct {
 
     /// Clean up all resources
     pub fn deinit(self: *Self) void {
-        // Unload textures and close window
+        // Free owned fields from items (textures are cleaned up via window_textures)
         for (self.items.items) |*item| {
-            // Check if this is a GLX texture (owned by window_textures)
-            if (self.window_textures.contains(item.id)) {
-                // Don't unload GLX textures here - they're owned by window_textures
-            } else {
-                // Regular texture - unload it
-                rl.UnloadTexture(item.thumbnail_texture);
-            }
+            // Don't unload thumbnail_texture here - it's owned by window_textures
             // Don't unload icon_texture here - it's shared via icon_texture_cache
-            // Free owned fields
             self.allocator.free(item.title);
             self.allocator.free(item.icon_id);
         }
@@ -225,33 +218,27 @@ pub const App = struct {
             any_changes = true;
             switch (task.*) {
                 .window_added => |*data| {
-                    // Try to create GLX texture if available
-                    var texture: rl.Texture2D = undefined;
-                    var source_width: u32 = 0;
-                    var source_height: u32 = 0;
-
-                    if (self.conn.use_glx and !data.is_minimized) {
-                        const win_tex = x11.createWindowTexture(self.conn, data.window_id) catch |err| {
-                            log.err("GLX texture failed for {x}: {}, falling back to XCB", .{ data.window_id, err });
-                            // TODO: Fallback to XCB capture
-                            continue;
-                        };
-
-                        texture = win_tex.toRaylibTexture();
-                        source_width = win_tex.width;
-                        source_height = win_tex.height;
-
-                        self.window_textures.put(data.window_id, win_tex) catch {
-                            var t = win_tex;
-                            t.deinit(self.conn);
-                            continue;
-                        };
-                    } else {
-                        // GLX not available or window minimized - skip for now
-                        // TODO: Implement XCB fallback
-                        log.warn("GLX not available for window {x}, skipping", .{data.window_id});
+                    // Skip minimized windows (can't create GLX texture for them)
+                    if (data.is_minimized) {
+                        log.debug("Skipping minimized window {x}", .{data.window_id});
                         continue;
                     }
+
+                    // Create GLX texture
+                    const win_tex = x11.createWindowTexture(self.conn, data.window_id) catch |err| {
+                        log.err("GLX texture failed for {x}: {}", .{ data.window_id, err });
+                        continue;
+                    };
+
+                    const texture = win_tex.toRaylibTexture();
+                    const source_width = win_tex.width;
+                    const source_height = win_tex.height;
+
+                    self.window_textures.put(data.window_id, win_tex) catch {
+                        var t = win_tex;
+                        t.deinit(self.conn);
+                        continue;
+                    };
 
                     // Look up icon
                     var icon_tex: ?rl.Texture2D = null;
@@ -272,7 +259,7 @@ pub const App = struct {
                         .source_height = source_height,
                         .display_width = 0,
                         .display_height = 0,
-                        .is_glx = self.conn.use_glx,
+                        .is_glx = true,
                     };
 
                     self.items.append(new_item) catch {
@@ -294,13 +281,10 @@ pub const App = struct {
                 .window_removed => |*data| {
                     for (self.items.items, 0..) |*item, i| {
                         if (item.id == data.window_id) {
-                            // Clean up WindowTexture if it exists
+                            // Clean up WindowTexture
                             if (self.window_textures.fetchRemove(data.window_id)) |entry| {
                                 var tex = entry.value;
                                 tex.deinit(self.conn);
-                            } else {
-                                // Not a GLX texture, unload normally
-                                rl.UnloadTexture(item.thumbnail_texture);
                             }
                             self.allocator.free(item.title);
                             self.allocator.free(item.icon_id);
@@ -308,30 +292,6 @@ pub const App = struct {
                             break;
                         }
                     }
-                },
-
-                .thumbnail_updated => |*data| {
-                    for (self.items.items) |*item| {
-                        if (item.id == data.window_id) {
-                            if (data.thumbnail_version > item.thumbnail_version) {
-                                rl.UnloadTexture(item.thumbnail_texture);
-                                const thumb = thumbnail.Thumbnail{
-                                    .data = data.thumbnail_data,
-                                    .width = data.thumbnail_width,
-                                    .height = data.thumbnail_height,
-                                    .allocator = data.allocator,
-                                };
-                                item.thumbnail_texture = ui.loadTextureFromThumbnail(&thumb);
-                                item.thumbnail_version = data.thumbnail_version;
-                                item.source_width = data.thumbnail_width;
-                                item.source_height = data.thumbnail_height;
-                            }
-                            break;
-                        }
-                    }
-                    // Free pixel data
-                    data.allocator.free(data.thumbnail_data);
-                    data.thumbnail_data = &[_]u8{};
                 },
 
                 .title_updated => |*data| {

@@ -86,8 +86,7 @@ fn runDaemon() !void {
     // Create update queue and start background worker
     var task_queue = worker.TaskQueue.init(allocator);
 
-    const capture_thumbnails = !conn.use_glx;
-    const worker_thread = std.Thread.spawn(.{}, worker.backgroundWorker, .{ &task_queue, allocator, capture_thumbnails }) catch |err| {
+    const worker_thread = std.Thread.spawn(.{}, worker.backgroundWorker, .{ &task_queue, allocator }) catch |err| {
         log.err("Failed to spawn background worker: {}", .{err});
         return err;
     };

@@ -9,7 +9,6 @@ const DELAY_SECONDS: f32 = 0.05; // seconds between scans
 pub const UpdateTask = union(enum) {
     window_added: WindowAdded,
     window_removed: WindowRemoved,
-    thumbnail_updated: ThumbnailUpdated,
     title_updated: TitleUpdated,
     icon_added: IconAdded,
 
@@ -21,14 +20,6 @@ pub const UpdateTask = union(enum) {
         allocator: std.mem.Allocator,
     };
     pub const WindowRemoved = struct { window_id: x11.xcb.xcb_window_t };
-    pub const ThumbnailUpdated = struct {
-        window_id: x11.xcb.xcb_window_t,
-        thumbnail_data: []u8, // owned RGBA
-        thumbnail_width: u32,
-        thumbnail_height: u32,
-        thumbnail_version: u32,
-        allocator: std.mem.Allocator,
-    };
     pub const TitleUpdated = struct {
         window_id: x11.xcb.xcb_window_t,
         title: []const u8, // owned
@@ -50,9 +41,6 @@ pub const UpdateTask = union(enum) {
                 if (t.icon_id.len > 0) t.allocator.free(t.icon_id);
             },
             .window_removed => {},
-            .thumbnail_updated => |*t| {
-                if (t.thumbnail_data.len > 0) t.allocator.free(t.thumbnail_data);
-            },
             .title_updated => |*t| {
                 if (t.title.len > 0) t.allocator.free(t.title);
             },
@@ -169,7 +157,6 @@ const TrackedWindow = struct {
     title: []const u8, // owned copy for comparison
     icon_id: []const u8, // owned copy (WM_CLASS)
     title_version: u32,
-    thumbnail_version: u32,
     allocator: std.mem.Allocator,
 
     fn deinit(self: *TrackedWindow) void {
@@ -209,7 +196,7 @@ fn fetchAndCacheIcon(
     return icon_cache.get(wm_class);
 }
 
-pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator, capture_thumbnails: bool) void {
+pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
     // Create our own X11 connection (X11 is not thread-safe)
     // Use XCB-only mode (no GLX needed for worker)
     var conn = x11.Connection.initXcbOnly() catch |err| {
@@ -281,12 +268,10 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator, capture
         const window_visible = queue.isWindowVisible();
         const capture_only_new = !is_first_scan and !window_visible;
 
-        // Use window_scanner for parallel processing
+        // Use window_scanner for window discovery
         var scan_result = window_scanner.scanAndProcess(allocator, &conn, .{
             .known_windows = if (known_list.items.len > 0) known_list.items else null,
             .capture_only_new = capture_only_new,
-            .parallel_processing = true,
-            .skip_capture = !capture_thumbnails,
         }, &pidCache) catch |err| {
             log.warn("Background worker: Scan failed: {}", .{err});
             continue;
@@ -345,22 +330,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator, capture
                         .window_id = item.window_id,
                         .title = title_update,
                         .title_version = existing.title_version,
-                        .allocator = allocator,
-                    } });
-                }
-
-                // Update thumbnail
-                // Only if captured
-                if (item.thumbnail) |thumb| {
-                    existing.thumbnail_version += 1;
-                    const thumb_data = allocator.dupe(u8, thumb.data) catch continue;
-
-                    queue.push(.{ .thumbnail_updated = .{
-                        .window_id = item.window_id,
-                        .thumbnail_data = thumb_data,
-                        .thumbnail_width = thumb.width,
-                        .thumbnail_height = thumb.height,
-                        .thumbnail_version = existing.thumbnail_version,
                         .allocator = allocator,
                     } });
                 }
@@ -431,7 +400,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator, capture
                     .title = title_owned, // Takes ownership
                     .icon_id = icon_id_owned, // Takes ownership
                     .title_version = 1,
-                    .thumbnail_version = 1,
                     .allocator = allocator,
                 };
                 tracked_windows.put(item.window_id, tracked) catch {

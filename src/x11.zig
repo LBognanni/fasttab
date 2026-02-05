@@ -159,24 +159,6 @@ pub const MousePosition = struct {
     y: i32,
 };
 
-// Raw capture data from X11 (before processing)
-pub const RawCapture = struct {
-    window_id: xcb.xcb_window_t,
-    title: []const u8,
-    width: u16,
-    height: u16,
-    data: []u8, // Raw BGRA from X11
-    depth: u8,
-    allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *RawCapture) void {
-        self.allocator.free(self.data);
-        if (!std.mem.eql(u8, self.title, "(unknown)")) {
-            self.allocator.free(self.title);
-        }
-    }
-};
-
 /// GLX texture directly bound to window pixmap (zero-copy)
 pub const WindowTexture = struct {
     window_id: xcb.xcb_window_t,
@@ -245,7 +227,6 @@ pub const Connection = struct {
 
     // Damage extension
     damage_event_base: u8,
-    use_glx: bool,
 
     pub fn init() X11Error!Connection {
         const display = xlib.XOpenDisplay(null) orelse return error.ConnectionFailed;
@@ -285,30 +266,26 @@ pub const Connection = struct {
 
         const damage_base = try initDamage(xcb_conn);
 
-        // Try to initialize GLX
-        var use_glx = false;
-        var glx_bind_opt: ?*const fn (*xlib.Display, xlib.GLXPixmap, c_int, ?[*]const c_int) callconv(.C) void = null;
-        var glx_release_opt: ?*const fn (*xlib.Display, xlib.GLXPixmap, c_int) callconv(.C) void = null;
+        // Initialize GLX extension function pointers
+        const bind_fn = xlib.glXGetProcAddress("glXBindTexImageEXT") orelse {
+            _ = xlib.XCloseDisplay(display);
+            return error.GLXExtensionMissing;
+        };
+        const release_fn = xlib.glXGetProcAddress("glXReleaseTexImageEXT") orelse {
+            _ = xlib.XCloseDisplay(display);
+            return error.GLXExtensionMissing;
+        };
 
-        const bind_fn = xlib.glXGetProcAddress("glXBindTexImageEXT");
-        const release_fn = xlib.glXGetProcAddress("glXReleaseTexImageEXT");
-
-        if (bind_fn != null and release_fn != null) {
-            // Verify at least one texture-bindable FBConfig exists
-            var num_configs: c_int = 0;
-            const configs = xlib.glXGetFBConfigs(display, screen_num, &num_configs);
-            if (configs != null and num_configs > 0) {
-                _ = xlib.XFree(@ptrCast(configs));
-                glx_bind_opt = @ptrCast(bind_fn);
-                glx_release_opt = @ptrCast(release_fn);
-                use_glx = true;
-                log.info("GLX texture binding enabled", .{});
-            } else {
-                log.warn("No FBConfigs available, using fallback XCB path", .{});
-            }
-        } else {
-            log.warn("GLX extension not found, using fallback XCB path", .{});
+        // Verify at least one texture-bindable FBConfig exists
+        var num_configs: c_int = 0;
+        const configs = xlib.glXGetFBConfigs(display, screen_num, &num_configs);
+        if (configs == null or num_configs == 0) {
+            _ = xlib.XCloseDisplay(display);
+            return error.NoSuitableFBConfig;
         }
+        _ = xlib.XFree(@ptrCast(configs));
+
+        log.info("GLX texture binding enabled", .{});
 
         return Connection{
             .display = display,
@@ -316,11 +293,10 @@ pub const Connection = struct {
             .screen = screen,
             .root = screen.*.root,
             .atoms = atoms,
-            .glx_bind = glx_bind_opt,
-            .glx_release = glx_release_opt,
+            .glx_bind = @ptrCast(bind_fn),
+            .glx_release = @ptrCast(release_fn),
             .screen_num = screen_num,
             .damage_event_base = damage_base,
-            .use_glx = use_glx,
         };
     }
 
@@ -364,7 +340,6 @@ pub const Connection = struct {
             .glx_release = null,
             .screen_num = 0,
             .damage_event_base = 0,
-            .use_glx = false,
         };
     }
 
@@ -675,111 +650,6 @@ pub fn getMousePosition(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) Mou
     };
 }
 
-pub fn captureRawImage(
-    allocator: std.mem.Allocator,
-    conn: *xcb.xcb_connection_t,
-    window: xcb.xcb_window_t,
-    title: []const u8,
-) X11Error!RawCapture {
-    // Redirect this specific window
-    const redirect_cookie = xcb.xcb_composite_redirect_window_checked(conn, window, xcb.XCB_COMPOSITE_REDIRECT_AUTOMATIC);
-    const redirect_error = xcb.xcb_request_check(conn, redirect_cookie);
-    if (redirect_error != null) {
-        log.warn("xcb_composite_redirect_window failed for {x} ({s}): error_code={d}", .{
-            window,
-            title,
-            redirect_error.*.error_code,
-        });
-        std.c.free(redirect_error);
-    }
-
-    // Get window geometry
-    const geom_cookie = xcb.xcb_get_geometry(conn, window);
-    const geom_reply = xcb.xcb_get_geometry_reply(conn, geom_cookie, null);
-    if (geom_reply == null) {
-        log.err("Failed to get geometry for window {x} ({s})", .{ window, title });
-        return X11Error.GeometryFetchFailed;
-    }
-    defer std.c.free(geom_reply);
-
-    const width = geom_reply.*.width;
-    const height = geom_reply.*.height;
-
-    if (width == 0 or height == 0) {
-        return X11Error.ImageCaptureFailed;
-    }
-
-    // Get pixmap for window using Composite
-    const pixmap = xcb.xcb_generate_id(conn);
-    const name_cookie = xcb.xcb_composite_name_window_pixmap_checked(conn, window, pixmap);
-    const name_error = xcb.xcb_request_check(conn, name_cookie);
-    if (name_error != null) {
-        std.c.free(name_error);
-        return X11Error.PixmapCreationFailed;
-    }
-    defer _ = xcb.xcb_free_pixmap(conn, pixmap);
-
-    // Get image from pixmap
-    const image_cookie = xcb.xcb_get_image(
-        conn,
-        xcb.XCB_IMAGE_FORMAT_Z_PIXMAP,
-        pixmap,
-        0,
-        0,
-        width,
-        height,
-        ~@as(u32, 0),
-    );
-
-    var error_ptr: ?*xcb.xcb_generic_error_t = null;
-    var image_reply = xcb.xcb_get_image_reply(conn, image_cookie, &error_ptr);
-
-    if (image_reply == null) {
-        if (error_ptr != null) {
-            std.c.free(error_ptr);
-        }
-        // Try fallback: get image directly from window
-        const fallback_cookie = xcb.xcb_get_image(
-            conn,
-            xcb.XCB_IMAGE_FORMAT_Z_PIXMAP,
-            window,
-            0,
-            0,
-            width,
-            height,
-            ~@as(u32, 0),
-        );
-        var fallback_error: ?*xcb.xcb_generic_error_t = null;
-        image_reply = xcb.xcb_get_image_reply(conn, fallback_cookie, &fallback_error);
-        if (image_reply == null) {
-            if (fallback_error != null) {
-                std.c.free(fallback_error);
-            }
-            return X11Error.ImageCaptureFailed;
-        }
-    }
-    defer std.c.free(image_reply);
-
-    const image_data_len = xcb.xcb_get_image_data_length(image_reply);
-    const image_data: [*]const u8 = @ptrCast(xcb.xcb_get_image_data(image_reply));
-    const depth = image_reply.?.*.depth;
-
-    // Copy the raw data to our buffer
-    const data = try allocator.alloc(u8, @intCast(image_data_len));
-    errdefer allocator.free(data);
-    @memcpy(data, image_data[0..@intCast(image_data_len)]);
-
-    return RawCapture{
-        .window_id = window,
-        .title = title,
-        .width = width,
-        .height = height,
-        .data = data,
-        .depth = depth,
-        .allocator = allocator,
-    };
-}
-
 /// Get the PID of the process that owns a window (uncached version)
 fn getWindowPidUncached(conn: *xcb.xcb_connection_t, window: xcb.xcb_window_t, atoms: Atoms) ?std.posix.pid_t {
     const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_pid, xcb.XCB_ATOM_CARDINAL, 0, 1);
@@ -1049,10 +919,6 @@ pub fn getXcbFd(conn: *xcb.xcb_connection_t) std.posix.fd_t {
 /// Create a GLX texture bound to a window's pixmap (zero-copy thumbnail).
 /// MUST be called from the main thread (GL context owner).
 pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error!WindowTexture {
-    if (!conn.use_glx) {
-        return error.GLXExtensionMissing;
-    }
-
     const gl_display = xlib.glXGetCurrentDisplay();
     if (gl_display == null) {
         log.err("No current GLX display found", .{});
