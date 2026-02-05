@@ -42,6 +42,7 @@ pub const App = struct {
     icon_texture_cache: std.StringHashMap(rl.Texture2D),
     window_textures: std.AutoHashMap(x11.xcb.xcb_window_t, x11.WindowTexture),
     focus_grace_frames: u8,
+    downsample_shader: ?ui.DownsampleShader,
 
     const Self = @This();
 
@@ -67,6 +68,9 @@ pub const App = struct {
 
         // Load system font
         const font = ui.loadSystemFont(ui.TITLE_FONT_SIZE);
+
+        // Load downsample shader for high-quality thumbnail scaling
+        const downsample_shader = ui.DownsampleShader.load();
 
         // Default layout
         const layout = ui.GridLayout{
@@ -104,6 +108,7 @@ pub const App = struct {
             .icon_texture_cache = icon_texture_cache,
             .window_textures = window_textures,
             .focus_grace_frames = 0,
+            .downsample_shader = downsample_shader,
         };
 
         // Process initial tasks
@@ -146,6 +151,11 @@ pub const App = struct {
             task.deinit();
         }
         self.temp_tasks.deinit();
+
+        // Unload downsample shader
+        if (self.downsample_shader) |*shader| {
+            shader.unload();
+        }
 
         rl.UnloadFont(self.font);
         rl.CloseWindow();
@@ -612,7 +622,8 @@ pub const App = struct {
 
         rl.BeginDrawing();
         rl.ClearBackground(rl.Color{ .r = 0, .g = 0, .b = 0, .a = 0 });
-        ui.renderSwitcher(self.items.items, self.current_layout, self.selected_index, self.mouseover_index, self.font);
+        const shader_ptr: ?*const ui.DownsampleShader = if (self.downsample_shader) |*s| s else null;
+        ui.renderSwitcher(self.items.items, self.current_layout, self.selected_index, self.mouseover_index, self.font, shader_ptr);
         rl.EndDrawing();
     }
 
