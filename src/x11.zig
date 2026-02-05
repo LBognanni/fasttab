@@ -104,14 +104,6 @@ pub const PidCache = struct {
     pub fn put(self: *PidCache, window: xcb.xcb_window_t, pid: std.posix.pid_t) void {
         self.map.put(window, pid) catch {};
     }
-
-    pub fn remove(self: *PidCache, window: xcb.xcb_window_t) void {
-        _ = self.map.remove(window);
-    }
-
-    pub fn clear(self: *PidCache) void {
-        self.map.clearRetainingCapacity();
-    }
 };
 
 pub const X11Error = error{
