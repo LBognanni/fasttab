@@ -257,20 +257,7 @@ pub const App = struct {
                     }
 
                     // Create display window (taking ownership of title and icon_id)
-                    const new_item = ui.DisplayWindow{
-                        .id = data.window_id,
-                        .title = data.title,
-                        .thumbnail_texture = texture,
-                        .icon_texture = icon_tex,
-                        .icon_id = data.icon_id,
-                        .title_version = 1,
-                        .thumbnail_version = 1,
-                        .source_width = source_width,
-                        .source_height = source_height,
-                        .display_width = 0,
-                        .display_height = 0,
-                        .is_glx = true,
-                    };
+                    const new_item = ui.DisplayWindow{ .id = data.window_id, .title = data.title, .thumbnail_texture = texture, .icon_texture = icon_tex, .icon_id = data.icon_id, .title_version = 1, .thumbnail_version = 1, .source_width = source_width, .source_height = source_height, .display_width = 0, .display_height = 0 };
 
                     self.items.append(new_item) catch {
                         // Free the strings since we failed to append
