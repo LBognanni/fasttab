@@ -160,6 +160,18 @@ pub const MousePosition = struct {
 };
 
 /// GLX texture directly bound to window pixmap (zero-copy)
+// Cached glGenerateMipmap function pointer (looked up once)
+var cached_glGenerateMipmap: ?*const fn (c_uint) callconv(.C) void = null;
+var glGenerateMipmap_looked_up: bool = false;
+
+fn getGlGenerateMipmap() ?*const fn (c_uint) callconv(.C) void {
+    if (!glGenerateMipmap_looked_up) {
+        cached_glGenerateMipmap = @ptrCast(xlib.glXGetProcAddress("glGenerateMipmap"));
+        glGenerateMipmap_looked_up = true;
+    }
+    return cached_glGenerateMipmap;
+}
+
 pub const WindowTexture = struct {
     window_id: xcb.xcb_window_t,
     width: u16,
@@ -203,12 +215,19 @@ pub const WindowTexture = struct {
         xlib.glBindTexture(xlib.GL_TEXTURE_2D, self.gl_texture);
         conn.glx_release.?(display, self.glx_pixmap, xlib.GLX_FRONT_LEFT_EXT);
         conn.glx_bind.?(display, self.glx_pixmap, xlib.GLX_FRONT_LEFT_EXT, null);
-        xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
 
         if (checkGlxError(display)) {
+            xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
             log.warn("GLX rebind failed for window {x}", .{self.window_id});
             return false;
         }
+
+        // Regenerate mipmaps for smooth downscaling
+        if (getGlGenerateMipmap()) |generateMipmap| {
+            generateMipmap(xlib.GL_TEXTURE_2D);
+        }
+        xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
+
         return true;
     }
 };
@@ -990,7 +1009,11 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
     var gl_texture: c_uint = undefined;
     xlib.glGenTextures(1, &gl_texture);
     xlib.glBindTexture(xlib.GL_TEXTURE_2D, gl_texture);
-    xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_MIN_FILTER, xlib.GL_LINEAR);
+
+    // Use trilinear filtering with mipmaps for smooth downscaling (if available)
+    const genMip = getGlGenerateMipmap();
+    const min_filter = if (genMip != null) xlib.GL_LINEAR_MIPMAP_LINEAR else xlib.GL_LINEAR;
+    xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_MIN_FILTER, min_filter);
     xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_MAG_FILTER, xlib.GL_LINEAR);
     xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_WRAP_S, xlib.GL_CLAMP_TO_EDGE);
     xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_WRAP_T, xlib.GL_CLAMP_TO_EDGE);
@@ -1005,6 +1028,11 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
         xlib.glXDestroyPixmap(gl_display, glx_pixmap);
         _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
         return error.GLXPixmapCreationFailed;
+    }
+
+    // Generate mipmaps for smooth downscaling
+    if (genMip) |generateMipmap| {
+        generateMipmap(xlib.GL_TEXTURE_2D);
     }
 
     xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
