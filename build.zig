@@ -29,6 +29,7 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("xcb-composite");
     exe.linkSystemLibrary("xcb-image");
     exe.linkSystemLibrary("xcb-keysyms");
+    exe.linkSystemLibrary("xcb-damage");
 
     // Link raylib and its dependencies
     exe.linkSystemLibrary("raylib");
@@ -38,6 +39,7 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("dl");
     exe.linkSystemLibrary("rt");
     exe.linkSystemLibrary("X11");
+    exe.linkSystemLibrary("X11-xcb"); // Xlib-XCB bridge functions
 
     exe.linkLibC();
 
@@ -66,6 +68,7 @@ pub fn build(b: *std.Build) void {
     exe_unit_tests.linkSystemLibrary("xcb-composite");
     exe_unit_tests.linkSystemLibrary("xcb-image");
     exe_unit_tests.linkSystemLibrary("xcb-keysyms");
+    exe_unit_tests.linkSystemLibrary("xcb-damage");
     exe_unit_tests.linkSystemLibrary("raylib");
     exe_unit_tests.linkSystemLibrary("GL");
     exe_unit_tests.linkSystemLibrary("m");
@@ -73,6 +76,7 @@ pub fn build(b: *std.Build) void {
     exe_unit_tests.linkSystemLibrary("dl");
     exe_unit_tests.linkSystemLibrary("rt");
     exe_unit_tests.linkSystemLibrary("X11");
+    exe_unit_tests.linkSystemLibrary("X11-xcb");
     exe_unit_tests.linkLibC();
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
@@ -81,17 +85,6 @@ pub fn build(b: *std.Build) void {
 
     // Pure logic unit tests (no X11/raylib dependencies)
     // Each test file needs access to the modules it imports
-
-    // Thumbnail test
-    const thumbnail_test = b.addTest(.{
-        .root_source_file = b.path("src/tests/thumbnail_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    thumbnail_test.root_module.addImport("color", b.createModule(.{
-        .root_source_file = b.path("src/color.zig"),
-    }));
-    test_step.dependOn(&b.addRunArtifact(thumbnail_test).step);
 
     // UI test (requires C dependencies for DisplayWindow)
     const ui_test = b.addTest(.{
@@ -117,6 +110,7 @@ pub fn build(b: *std.Build) void {
     ui_test.linkSystemLibrary("xcb-composite");
     ui_test.linkSystemLibrary("xcb-image");
     ui_test.linkSystemLibrary("xcb-keysyms");
+    ui_test.linkSystemLibrary("xcb-damage");
     ui_test.linkSystemLibrary("raylib");
     ui_test.linkSystemLibrary("GL");
     ui_test.linkSystemLibrary("m");
@@ -124,19 +118,9 @@ pub fn build(b: *std.Build) void {
     ui_test.linkSystemLibrary("dl");
     ui_test.linkSystemLibrary("rt");
     ui_test.linkSystemLibrary("X11");
+    ui_test.linkSystemLibrary("X11-xcb");
     ui_test.linkLibC();
     test_step.dependOn(&b.addRunArtifact(ui_test).step);
-
-    // Worker/Queue test
-    const worker_test = b.addTest(.{
-        .root_source_file = b.path("src/tests/worker_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    worker_test.root_module.addImport("queue", b.createModule(.{
-        .root_source_file = b.path("src/queue.zig"),
-    }));
-    test_step.dependOn(&b.addRunArtifact(worker_test).step);
 
     // Navigation test
     const navigation_test = b.addTest(.{

@@ -1,17 +1,57 @@
 const std = @import("std");
 const desktop_icon = @import("desktop_icon.zig");
+const ui = @import("ui.zig");
+const rl = ui.rl;
 
 // Feature flags
-pub const FILTER_BY_CURRENT_DESKTOP = true;
+const FILTER_BY_CURRENT_DESKTOP = true;
 
 pub const xcb = @cImport({
     @cInclude("xcb/xcb.h");
     @cInclude("xcb/composite.h");
     @cInclude("xcb/xcb_image.h");
     @cInclude("xcb/xcb_keysyms.h");
+    @cInclude("xcb/damage.h");
+});
+
+pub const xlib = @cImport({
+    @cInclude("X11/Xlib.h");
+    @cInclude("X11/Xlib-xcb.h");
+    @cInclude("GL/gl.h");
+    @cInclude("GL/glx.h");
+    @cInclude("GL/glxext.h");
 });
 
 const log = std.log.scoped(.fasttab);
+
+// Global flag for capturing Xlib errors (used by GLX operations)
+var glx_error_code: u8 = 0;
+
+fn xlibErrorHandler(_: ?*xlib.Display, event: ?*xlib.XErrorEvent) callconv(.C) c_int {
+    if (event) |e| {
+        glx_error_code = e.error_code;
+        log.warn("Xlib error: code={d} major={d} minor={d} serial={d}", .{
+            e.error_code,
+            e.request_code,
+            e.minor_code,
+            e.serial,
+        });
+    }
+    return 0; // Don't crash
+}
+
+/// Clear any pending Xlib error and sync to flush errors from previous operations.
+fn clearGlxError(display: *xlib.Display) void {
+    glx_error_code = 0;
+    _ = xlib.XSync(display, xlib.False);
+    glx_error_code = 0;
+}
+
+/// Sync and check if a GLX error occurred since the last clear.
+fn checkGlxError(display: *xlib.Display) bool {
+    _ = xlib.XSync(display, xlib.False);
+    return glx_error_code != 0;
+}
 
 // Keysym constants (from X11/keysymdef.h)
 pub const XK_Tab = 0xff09;
@@ -64,14 +104,6 @@ pub const PidCache = struct {
     pub fn put(self: *PidCache, window: xcb.xcb_window_t, pid: std.posix.pid_t) void {
         self.map.put(window, pid) catch {};
     }
-
-    pub fn remove(self: *PidCache, window: xcb.xcb_window_t) void {
-        _ = self.map.remove(window);
-    }
-
-    pub fn clear(self: *PidCache) void {
-        self.map.clearRetainingCapacity();
-    }
 };
 
 pub const X11Error = error{
@@ -81,10 +113,15 @@ pub const X11Error = error{
     PropertyFetchFailed,
     NoScreen,
     CompositeExtensionMissing,
+    CompositeNotAvailable,
     PixmapCreationFailed,
     ImageCaptureFailed,
     GeometryFetchFailed,
+    InvalidGeometry,
     OutOfMemory,
+    GLXExtensionMissing,
+    NoSuitableFBConfig,
+    GLXPixmapCreationFailed,
 };
 
 pub const Atoms = struct {
@@ -114,31 +151,164 @@ pub const MousePosition = struct {
     y: i32,
 };
 
-// Raw capture data from X11 (before processing)
-pub const RawCapture = struct {
+/// GLX texture directly bound to window pixmap (zero-copy)
+// Cached glGenerateMipmap function pointer (looked up once)
+var cached_glGenerateMipmap: ?*const fn (c_uint) callconv(.C) void = null;
+var glGenerateMipmap_looked_up: bool = false;
+
+fn getGlGenerateMipmap() ?*const fn (c_uint) callconv(.C) void {
+    if (!glGenerateMipmap_looked_up) {
+        cached_glGenerateMipmap = @ptrCast(xlib.glXGetProcAddress("glGenerateMipmap"));
+        glGenerateMipmap_looked_up = true;
+    }
+    return cached_glGenerateMipmap;
+}
+
+pub const WindowTexture = struct {
     window_id: xcb.xcb_window_t,
-    title: []const u8,
     width: u16,
     height: u16,
-    data: []u8, // Raw BGRA from X11
-    depth: u8,
-    allocator: std.mem.Allocator,
 
-    pub fn deinit(self: *RawCapture) void {
-        self.allocator.free(self.data);
-        if (!std.mem.eql(u8, self.title, "(unknown)")) {
-            self.allocator.free(self.title);
+    pixmap: xcb.xcb_pixmap_t,
+    glx_pixmap: xlib.GLXPixmap,
+    gl_texture: c_uint,
+    damage: xcb.xcb_damage_damage_t,
+    gl_display: ?*xlib.Display,
+
+    pub fn deinit(self: *WindowTexture, conn: *Connection) void {
+        if (self.gl_display) |display| {
+            clearGlxError(display);
+            conn.glx_release.?(display, self.glx_pixmap, xlib.GLX_FRONT_LEFT_EXT);
+            xlib.glDeleteTextures(1, &self.gl_texture);
+            xlib.glXDestroyPixmap(display, self.glx_pixmap);
+            _ = xlib.XSync(display, xlib.False);
         }
+        _ = xcb.xcb_free_pixmap(conn.conn, self.pixmap);
+        _ = xcb.xcb_damage_destroy(conn.conn, self.damage);
+    }
+
+    /// Wrap as raylib Texture2D. Caller must NOT call rl.UnloadTexture on this.
+    pub fn toRaylibTexture(self: *const WindowTexture) rl.Texture2D {
+        return rl.Texture2D{
+            .id = @intCast(self.gl_texture),
+            .width = @intCast(self.width),
+            .height = @intCast(self.height),
+            .mipmaps = 1,
+            .format = rl.PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+        };
+    }
+
+    /// Rebind after damage (window content changed).
+    /// Returns false if the rebind failed (texture is now invalid).
+    pub fn rebind(self: *WindowTexture, conn: *Connection) bool {
+        const display = self.gl_display orelse return false;
+        clearGlxError(display);
+
+        xlib.glBindTexture(xlib.GL_TEXTURE_2D, self.gl_texture);
+        conn.glx_release.?(display, self.glx_pixmap, xlib.GLX_FRONT_LEFT_EXT);
+        conn.glx_bind.?(display, self.glx_pixmap, xlib.GLX_FRONT_LEFT_EXT, null);
+
+        if (checkGlxError(display)) {
+            xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
+            log.warn("GLX rebind failed for window {x}", .{self.window_id});
+            return false;
+        }
+
+        xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
+
+        return true;
     }
 };
 
 pub const Connection = struct {
+    display: ?*xlib.Display, // null if XCB-only mode
     conn: *xcb.xcb_connection_t,
     screen: *xcb.xcb_screen_t,
     root: xcb.xcb_window_t,
     atoms: Atoms,
 
+    // GLX extension function pointers (null if GLX not available)
+    glx_bind: ?*const fn (*xlib.Display, xlib.GLXPixmap, c_int, ?[*]const c_int) callconv(.C) void,
+    glx_release: ?*const fn (*xlib.Display, xlib.GLXPixmap, c_int) callconv(.C) void,
+    screen_num: c_int,
+
+    // Damage extension
+    damage_event_base: u8,
+
     pub fn init() X11Error!Connection {
+        const display = xlib.XOpenDisplay(null) orelse return error.ConnectionFailed;
+
+        // Install custom error handler to prevent crashes from GLX errors
+        _ = xlib.XSetErrorHandler(xlibErrorHandler);
+
+        const conn = xlib.XGetXCBConnection(display);
+        if (conn == null) {
+            _ = xlib.XCloseDisplay(display);
+            return error.ConnectionFailed;
+        }
+
+        // Let XCB own the event queue (we poll with xcb_poll_for_event)
+        _ = xlib.XSetEventQueueOwner(display, xlib.XCBOwnsEventQueue);
+
+        if (xcb.xcb_connection_has_error(@ptrCast(conn)) != 0) {
+            _ = xlib.XCloseDisplay(display);
+            return error.ConnectionError;
+        }
+
+        const screen_num = xlib.DefaultScreen(display);
+        const setup = xcb.xcb_get_setup(@ptrCast(conn));
+        var iter = xcb.xcb_setup_roots_iterator(setup);
+        var i: c_int = 0;
+        while (i < screen_num) : (i += 1) {
+            xcb.xcb_screen_next(&iter);
+        }
+        const screen = iter.data orelse {
+            _ = xlib.XCloseDisplay(display);
+            return error.NoScreen;
+        };
+
+        const xcb_conn: *xcb.xcb_connection_t = @ptrCast(conn);
+        const atoms = try initAtoms(xcb_conn);
+        try initComposite(xcb_conn);
+
+        const damage_base = try initDamage(xcb_conn);
+
+        // Initialize GLX extension function pointers
+        const bind_fn = xlib.glXGetProcAddress("glXBindTexImageEXT") orelse {
+            _ = xlib.XCloseDisplay(display);
+            return error.GLXExtensionMissing;
+        };
+        const release_fn = xlib.glXGetProcAddress("glXReleaseTexImageEXT") orelse {
+            _ = xlib.XCloseDisplay(display);
+            return error.GLXExtensionMissing;
+        };
+
+        // Verify at least one texture-bindable FBConfig exists
+        var num_configs: c_int = 0;
+        const configs = xlib.glXGetFBConfigs(display, screen_num, &num_configs);
+        if (configs == null or num_configs == 0) {
+            _ = xlib.XCloseDisplay(display);
+            return error.NoSuitableFBConfig;
+        }
+        _ = xlib.XFree(@ptrCast(configs));
+
+        log.info("GLX texture binding enabled", .{});
+
+        return Connection{
+            .display = display,
+            .conn = xcb_conn,
+            .screen = screen,
+            .root = screen.*.root,
+            .atoms = atoms,
+            .glx_bind = @ptrCast(bind_fn),
+            .glx_release = @ptrCast(release_fn),
+            .screen_num = screen_num,
+            .damage_event_base = damage_base,
+        };
+    }
+
+    /// Initialize XCB-only connection for background worker (no GLX)
+    pub fn initXcbOnly() X11Error!Connection {
         var screen_num: c_int = 0;
         const conn = xcb.xcb_connect(null, &screen_num);
         if (conn == null) {
@@ -168,15 +338,24 @@ pub const Connection = struct {
         try initComposite(conn.?);
 
         return Connection{
+            .display = null,
             .conn = conn.?,
             .screen = screen.?,
-            .root = screen.*.root,
+            .root = screen.?.*.root,
             .atoms = atoms,
+            .glx_bind = null,
+            .glx_release = null,
+            .screen_num = 0,
+            .damage_event_base = 0,
         };
     }
 
     pub fn deinit(self: *Connection) void {
-        xcb.xcb_disconnect(self.conn);
+        if (self.display) |display| {
+            _ = xlib.XCloseDisplay(display);
+        } else {
+            xcb.xcb_disconnect(self.conn);
+        }
     }
 
     pub fn flush(self: *Connection) void {
@@ -194,7 +373,7 @@ fn internAtom(conn: *xcb.xcb_connection_t, name: [:0]const u8) X11Error!xcb.xcb_
     return reply.*.atom;
 }
 
-pub fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
+fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
     return Atoms{
         .net_client_list = try internAtom(conn, "_NET_CLIENT_LIST"),
         .net_wm_name = try internAtom(conn, "_NET_WM_NAME"),
@@ -218,13 +397,62 @@ pub fn initAtoms(conn: *xcb.xcb_connection_t) X11Error!Atoms {
     };
 }
 
-pub fn initComposite(conn: *xcb.xcb_connection_t) X11Error!void {
+fn initComposite(conn: *xcb.xcb_connection_t) X11Error!void {
     const cookie = xcb.xcb_composite_query_version(conn, 0, 4);
     const reply = xcb.xcb_composite_query_version_reply(conn, cookie, null);
     if (reply == null) {
         return X11Error.CompositeExtensionMissing;
     }
     defer std.c.free(reply);
+}
+
+/// Find an FBConfig that matches a specific X visual ID and supports texture binding.
+/// Iterates all FBConfigs and returns the first one whose GLX_VISUAL_ID matches.
+fn findFBConfigForVisual(display: *xlib.Display, screen: c_int, visual_id: u32) ?xlib.GLXFBConfig {
+    var num_configs: c_int = 0;
+    const configs = xlib.glXGetFBConfigs(display, screen, &num_configs) orelse return null;
+    defer _ = xlib.XFree(@ptrCast(configs));
+
+    for (0..@intCast(num_configs)) |i| {
+        const cfg = configs[i];
+
+        // Check visual ID matches
+        var vis_id: c_int = 0;
+        if (xlib.glXGetFBConfigAttrib(display, cfg, xlib.GLX_VISUAL_ID, &vis_id) != 0) continue;
+        if (vis_id != @as(c_int, @intCast(visual_id))) continue;
+
+        // Check it supports pixmap drawable type
+        var drawable_type: c_int = 0;
+        if (xlib.glXGetFBConfigAttrib(display, cfg, xlib.GLX_DRAWABLE_TYPE, &drawable_type) != 0) continue;
+        if (drawable_type & xlib.GLX_PIXMAP_BIT == 0) continue;
+
+        // Check it supports texture binding (RGBA or RGB)
+        var bind_rgba: c_int = 0;
+        var bind_rgb: c_int = 0;
+        _ = xlib.glXGetFBConfigAttrib(display, cfg, xlib.GLX_BIND_TO_TEXTURE_RGBA_EXT, &bind_rgba);
+        _ = xlib.glXGetFBConfigAttrib(display, cfg, xlib.GLX_BIND_TO_TEXTURE_RGB_EXT, &bind_rgb);
+        if (bind_rgba == 0 and bind_rgb == 0) continue;
+
+        // Check 2D texture target support
+        var bind_targets: c_int = 0;
+        _ = xlib.glXGetFBConfigAttrib(display, cfg, xlib.GLX_BIND_TO_TEXTURE_TARGETS_EXT, &bind_targets);
+        if (bind_targets & xlib.GLX_TEXTURE_2D_BIT_EXT == 0) continue;
+
+        return cfg;
+    }
+
+    return null;
+}
+
+fn initDamage(conn: *xcb.xcb_connection_t) X11Error!u8 {
+    const ext_cookie = xcb.xcb_damage_query_version(conn, 1, 1);
+    const ext_reply = xcb.xcb_damage_query_version_reply(conn, ext_cookie, null) orelse return error.CompositeNotAvailable;
+    defer std.c.free(ext_reply);
+
+    const ext = xcb.xcb_get_extension_data(conn, &xcb.xcb_damage_id);
+    if (ext == null) return error.CompositeNotAvailable;
+
+    return ext.*.first_event;
 }
 
 pub fn getWindowList(allocator: std.mem.Allocator, conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t, atoms: Atoms) (X11Error || std.mem.Allocator.Error)![]xcb.xcb_window_t {
@@ -359,7 +587,7 @@ pub fn isWindowMinimized(
 }
 
 /// Get the current virtual desktop number from root window
-pub fn getCurrentDesktop(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t, atoms: Atoms) ?u32 {
+fn getCurrentDesktop(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t, atoms: Atoms) ?u32 {
     const cookie = xcb.xcb_get_property(conn, 0, root, atoms.net_current_desktop, xcb.XCB_ATOM_CARDINAL, 0, 1);
     const reply = xcb.xcb_get_property_reply(conn, cookie, null);
     if (reply == null) {
@@ -377,7 +605,7 @@ pub fn getCurrentDesktop(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t, at
 }
 
 /// Get the desktop number a window is on (0xFFFFFFFF means "all desktops")
-pub fn getWindowDesktop(conn: *xcb.xcb_connection_t, window: xcb.xcb_window_t, atoms: Atoms) ?u32 {
+fn getWindowDesktop(conn: *xcb.xcb_connection_t, window: xcb.xcb_window_t, atoms: Atoms) ?u32 {
     const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_desktop, xcb.XCB_ATOM_CARDINAL, 0, 1);
     const reply = xcb.xcb_get_property_reply(conn, cookie, null);
     if (reply == null) {
@@ -429,111 +657,6 @@ pub fn getMousePosition(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) Mou
     };
 }
 
-pub fn captureRawImage(
-    allocator: std.mem.Allocator,
-    conn: *xcb.xcb_connection_t,
-    window: xcb.xcb_window_t,
-    title: []const u8,
-) X11Error!RawCapture {
-    // Redirect this specific window
-    const redirect_cookie = xcb.xcb_composite_redirect_window_checked(conn, window, xcb.XCB_COMPOSITE_REDIRECT_AUTOMATIC);
-    const redirect_error = xcb.xcb_request_check(conn, redirect_cookie);
-    if (redirect_error != null) {
-        log.warn("xcb_composite_redirect_window failed for {x} ({s}): error_code={d}", .{
-            window,
-            title,
-            redirect_error.*.error_code,
-        });
-        std.c.free(redirect_error);
-    }
-
-    // Get window geometry
-    const geom_cookie = xcb.xcb_get_geometry(conn, window);
-    const geom_reply = xcb.xcb_get_geometry_reply(conn, geom_cookie, null);
-    if (geom_reply == null) {
-        log.err("Failed to get geometry for window {x} ({s})", .{ window, title });
-        return X11Error.GeometryFetchFailed;
-    }
-    defer std.c.free(geom_reply);
-
-    const width = geom_reply.*.width;
-    const height = geom_reply.*.height;
-
-    if (width == 0 or height == 0) {
-        return X11Error.ImageCaptureFailed;
-    }
-
-    // Get pixmap for window using Composite
-    const pixmap = xcb.xcb_generate_id(conn);
-    const name_cookie = xcb.xcb_composite_name_window_pixmap_checked(conn, window, pixmap);
-    const name_error = xcb.xcb_request_check(conn, name_cookie);
-    if (name_error != null) {
-        std.c.free(name_error);
-        return X11Error.PixmapCreationFailed;
-    }
-    defer _ = xcb.xcb_free_pixmap(conn, pixmap);
-
-    // Get image from pixmap
-    const image_cookie = xcb.xcb_get_image(
-        conn,
-        xcb.XCB_IMAGE_FORMAT_Z_PIXMAP,
-        pixmap,
-        0,
-        0,
-        width,
-        height,
-        ~@as(u32, 0),
-    );
-
-    var error_ptr: ?*xcb.xcb_generic_error_t = null;
-    var image_reply = xcb.xcb_get_image_reply(conn, image_cookie, &error_ptr);
-
-    if (image_reply == null) {
-        if (error_ptr != null) {
-            std.c.free(error_ptr);
-        }
-        // Try fallback: get image directly from window
-        const fallback_cookie = xcb.xcb_get_image(
-            conn,
-            xcb.XCB_IMAGE_FORMAT_Z_PIXMAP,
-            window,
-            0,
-            0,
-            width,
-            height,
-            ~@as(u32, 0),
-        );
-        var fallback_error: ?*xcb.xcb_generic_error_t = null;
-        image_reply = xcb.xcb_get_image_reply(conn, fallback_cookie, &fallback_error);
-        if (image_reply == null) {
-            if (fallback_error != null) {
-                std.c.free(fallback_error);
-            }
-            return X11Error.ImageCaptureFailed;
-        }
-    }
-    defer std.c.free(image_reply);
-
-    const image_data_len = xcb.xcb_get_image_data_length(image_reply);
-    const image_data: [*]const u8 = @ptrCast(xcb.xcb_get_image_data(image_reply));
-    const depth = image_reply.?.*.depth;
-
-    // Copy the raw data to our buffer
-    const data = try allocator.alloc(u8, @intCast(image_data_len));
-    errdefer allocator.free(data);
-    @memcpy(data, image_data[0..@intCast(image_data_len)]);
-
-    return RawCapture{
-        .window_id = window,
-        .title = title,
-        .width = width,
-        .height = height,
-        .data = data,
-        .depth = depth,
-        .allocator = allocator,
-    };
-}
-
 /// Get the PID of the process that owns a window (uncached version)
 fn getWindowPidUncached(conn: *xcb.xcb_connection_t, window: xcb.xcb_window_t, atoms: Atoms) ?std.posix.pid_t {
     const cookie = xcb.xcb_get_property(conn, 0, window, atoms.net_wm_pid, xcb.XCB_ATOM_CARDINAL, 0, 1);
@@ -553,7 +676,7 @@ fn getWindowPidUncached(conn: *xcb.xcb_connection_t, window: xcb.xcb_window_t, a
 }
 
 /// Get the PID of the process that owns a window (cached version)
-pub fn getWindowPid(
+fn getWindowPid(
     conn: *xcb.xcb_connection_t,
     window: xcb.xcb_window_t,
     atoms: Atoms,
@@ -798,6 +921,116 @@ pub fn keycodeToKeysym(conn: *xcb.xcb_connection_t, keycode: xcb.xcb_keycode_t, 
 /// Get the XCB connection file descriptor for polling.
 pub fn getXcbFd(conn: *xcb.xcb_connection_t) std.posix.fd_t {
     return xcb.xcb_get_file_descriptor(conn);
+}
+
+/// Create a GLX texture bound to a window's pixmap (zero-copy thumbnail).
+/// MUST be called from the main thread (GL context owner).
+pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error!WindowTexture {
+    const gl_display = xlib.glXGetCurrentDisplay();
+    if (gl_display == null) {
+        log.err("No current GLX display found", .{});
+        return error.GLXExtensionMissing;
+    }
+
+    // Redirect for compositing
+    const redirect_cookie = xcb.xcb_composite_redirect_window_checked(
+        conn.conn,
+        window,
+        xcb.XCB_COMPOSITE_REDIRECT_AUTOMATIC,
+    );
+    if (xcb.xcb_request_check(conn.conn, redirect_cookie)) |err| {
+        std.c.free(err);
+    }
+
+    // Get window attributes to find its visual ID
+    const attr_cookie = xcb.xcb_get_window_attributes(conn.conn, window);
+    const attr_reply = xcb.xcb_get_window_attributes_reply(conn.conn, attr_cookie, null) orelse return error.GeometryFetchFailed;
+    defer std.c.free(attr_reply);
+    const visual_id = attr_reply.*.visual;
+
+    const geom_cookie = xcb.xcb_get_geometry(conn.conn, window);
+    const geom_reply = xcb.xcb_get_geometry_reply(conn.conn, geom_cookie, null) orelse return error.GeometryFetchFailed;
+    defer std.c.free(geom_reply);
+
+    const width = geom_reply.*.width;
+    const height = geom_reply.*.height;
+    const depth = geom_reply.*.depth;
+    if (width == 0 or height == 0) return error.InvalidGeometry;
+
+    // Find FBConfig matching this window's visual
+    const screen_num = xlib.DefaultScreen(gl_display);
+    const fb_config = findFBConfigForVisual(gl_display.?, screen_num, visual_id) orelse {
+        log.err("No matching FBConfig for visual 0x{x} depth {d} (window {x})", .{ visual_id, depth, window });
+        return error.NoSuitableFBConfig;
+    };
+
+    // Check whether this FBConfig supports RGBA or RGB texture binding
+    var bind_rgba: c_int = 0;
+    _ = xlib.glXGetFBConfigAttrib(gl_display.?, fb_config, xlib.GLX_BIND_TO_TEXTURE_RGBA_EXT, &bind_rgba);
+    const texture_format = if (bind_rgba != 0) xlib.GLX_TEXTURE_FORMAT_RGBA_EXT else xlib.GLX_TEXTURE_FORMAT_RGB_EXT;
+
+    // Create composite pixmap
+    const pixmap = xcb.xcb_generate_id(conn.conn);
+    const name_cookie = xcb.xcb_composite_name_window_pixmap_checked(conn.conn, window, pixmap);
+    if (xcb.xcb_request_check(conn.conn, name_cookie)) |err| {
+        std.c.free(err);
+        return error.PixmapCreationFailed;
+    }
+
+    const glx_attribs = [_]c_int{
+        xlib.GLX_TEXTURE_TARGET_EXT,
+        xlib.GLX_TEXTURE_2D_EXT,
+        xlib.GLX_TEXTURE_FORMAT_EXT,
+        texture_format,
+        0,
+    };
+
+    clearGlxError(gl_display.?);
+
+    const glx_pixmap = xlib.glXCreatePixmap(gl_display, fb_config, pixmap, &glx_attribs);
+    if (glx_pixmap == 0 or checkGlxError(gl_display.?)) {
+        log.err("glXCreatePixmap failed for window {x} (depth={d}, {}x{})", .{ window, depth, width, height });
+        _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
+        return error.GLXPixmapCreationFailed;
+    }
+
+    var gl_texture: c_uint = undefined;
+    xlib.glGenTextures(1, &gl_texture);
+    xlib.glBindTexture(xlib.GL_TEXTURE_2D, gl_texture);
+
+    // Use bilinear filtering (no mipmaps - they interfere with live GLX texture updates)
+    xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_MIN_FILTER, xlib.GL_LINEAR);
+    xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_MAG_FILTER, xlib.GL_LINEAR);
+    xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_WRAP_S, xlib.GL_CLAMP_TO_EDGE);
+    xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_WRAP_T, xlib.GL_CLAMP_TO_EDGE);
+
+    clearGlxError(gl_display.?);
+    conn.glx_bind.?(gl_display.?, glx_pixmap, xlib.GLX_FRONT_LEFT_EXT, null);
+
+    if (checkGlxError(gl_display.?)) {
+        log.err("glXBindTexImageEXT failed for window {x} (depth={d}, visual=0x{x})", .{ window, depth, visual_id });
+        xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
+        xlib.glDeleteTextures(1, &gl_texture);
+        xlib.glXDestroyPixmap(gl_display, glx_pixmap);
+        _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
+        return error.GLXPixmapCreationFailed;
+    }
+
+    xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
+
+    const damage = xcb.xcb_generate_id(conn.conn);
+    _ = xcb.xcb_damage_create(conn.conn, damage, window, xcb.XCB_DAMAGE_REPORT_LEVEL_NON_EMPTY);
+
+    return WindowTexture{
+        .window_id = window,
+        .width = width,
+        .height = height,
+        .pixmap = pixmap,
+        .glx_pixmap = glx_pixmap,
+        .gl_texture = gl_texture,
+        .damage = damage,
+        .gl_display = gl_display,
+    };
 }
 
 /// Raw icon data from _NET_WM_ICON (ARGB u32 pixels)

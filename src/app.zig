@@ -8,18 +8,6 @@ const nav = @import("navigation.zig");
 const rl = ui.rl;
 const log = std.log.scoped(.fasttab);
 
-// Re-export navigation functions for external use
-pub const moveSelectionRight = nav.moveSelectionRight;
-pub const moveSelectionLeft = nav.moveSelectionLeft;
-pub const moveSelectionDown = nav.moveSelectionDown;
-pub const moveSelectionUp = nav.moveSelectionUp;
-
-pub const AppError = error{
-    NoWindows,
-    WorkerTimeout,
-    OutOfMemory,
-};
-
 /// State machine for the Alt+Tab switcher
 pub const SwitcherState = enum {
     idle,
@@ -49,12 +37,12 @@ pub const App = struct {
     should_quit: bool,
     update_queue: ?*worker.TaskQueue,
     temp_tasks: std.ArrayList(worker.UpdateTask),
-    xcb_conn: *x11.xcb.xcb_connection_t,
-    xcb_root: x11.xcb.xcb_window_t,
-    xcb_atoms: x11.Atoms,
+    conn: *x11.Connection,
     state: SwitcherState,
     icon_texture_cache: std.StringHashMap(rl.Texture2D),
+    window_textures: std.AutoHashMap(x11.xcb.xcb_window_t, x11.WindowTexture),
     focus_grace_frames: u8,
+    downsample_shader: ?ui.DownsampleShader,
 
     const Self = @This();
 
@@ -63,13 +51,12 @@ pub const App = struct {
         allocator: std.mem.Allocator,
         task_queue: *worker.TaskQueue,
         daemon_mode: bool,
-        xcb_conn: *x11.xcb.xcb_connection_t,
-        xcb_root: x11.xcb.xcb_window_t,
-        xcb_atoms: x11.Atoms,
+        conn: *x11.Connection,
     ) !Self {
         // Create empty items list and caches
         const items = std.ArrayList(ui.DisplayWindow).init(allocator);
         const icon_texture_cache = std.StringHashMap(rl.Texture2D).init(allocator);
+        const window_textures = std.AutoHashMap(x11.xcb.xcb_window_t, x11.WindowTexture).init(allocator);
         const temp_tasks = std.ArrayList(worker.UpdateTask).init(allocator);
 
         // Create raylib window (hidden initially)
@@ -81,6 +68,9 @@ pub const App = struct {
 
         // Load system font
         const font = ui.loadSystemFont(ui.TITLE_FONT_SIZE);
+
+        // Load downsample shader for high-quality thumbnail scaling
+        const downsample_shader = ui.DownsampleShader.load();
 
         // Default layout
         const layout = ui.GridLayout{
@@ -113,12 +103,12 @@ pub const App = struct {
             .should_quit = false,
             .update_queue = task_queue,
             .temp_tasks = temp_tasks,
-            .xcb_conn = xcb_conn,
-            .xcb_root = xcb_root,
-            .xcb_atoms = xcb_atoms,
+            .conn = conn,
             .state = .idle,
             .icon_texture_cache = icon_texture_cache,
+            .window_textures = window_textures,
             .focus_grace_frames = 0,
+            .downsample_shader = downsample_shader,
         };
 
         // Process initial tasks
@@ -131,15 +121,22 @@ pub const App = struct {
 
     /// Clean up all resources
     pub fn deinit(self: *Self) void {
-        // Unload textures and close window
+        // Free owned fields from items (textures are cleaned up via window_textures)
         for (self.items.items) |*item| {
-            rl.UnloadTexture(item.thumbnail_texture);
+            // Don't unload thumbnail_texture here - it's owned by window_textures
             // Don't unload icon_texture here - it's shared via icon_texture_cache
-            // Free owned fields
             self.allocator.free(item.title);
             self.allocator.free(item.icon_id);
         }
         self.items.deinit();
+
+        // Clean up window textures
+        var tex_iter = self.window_textures.valueIterator();
+        while (tex_iter.next()) |tex| {
+            var t = tex.*;
+            t.deinit(self.conn);
+        }
+        self.window_textures.deinit();
 
         // Unload icon textures from cache
         var icon_iter = self.icon_texture_cache.iterator();
@@ -155,6 +152,11 @@ pub const App = struct {
         }
         self.temp_tasks.deinit();
 
+        // Unload downsample shader
+        if (self.downsample_shader) |*shader| {
+            shader.unload();
+        }
+
         rl.UnloadFont(self.font);
         rl.CloseWindow();
     }
@@ -167,11 +169,6 @@ pub const App = struct {
     /// Get the number of windows
     pub fn windowCount(self: *const Self) usize {
         return self.items.items.len;
-    }
-
-    /// Get the current layout
-    pub fn getLayout(self: *const Self) ui.GridLayout {
-        return self.current_layout;
     }
 
     /// Process one frame: check for window close, render
@@ -231,14 +228,27 @@ pub const App = struct {
             any_changes = true;
             switch (task.*) {
                 .window_added => |*data| {
-                    // Upload thumbnail
-                    const thumb = thumbnail.Thumbnail{
-                        .data = data.thumbnail_data,
-                        .width = data.thumbnail_width,
-                        .height = data.thumbnail_height,
-                        .allocator = data.allocator,
+                    // Skip minimized windows (can't create GLX texture for them)
+                    if (data.is_minimized) {
+                        log.debug("Skipping minimized window {x}", .{data.window_id});
+                        continue;
+                    }
+
+                    // Create GLX texture
+                    const win_tex = x11.createWindowTexture(self.conn, data.window_id) catch |err| {
+                        log.err("GLX texture failed for {x}: {}", .{ data.window_id, err });
+                        continue;
                     };
-                    const texture = ui.loadTextureFromThumbnail(&thumb);
+
+                    const texture = win_tex.toRaylibTexture();
+                    const source_width = win_tex.width;
+                    const source_height = win_tex.height;
+
+                    self.window_textures.put(data.window_id, win_tex) catch {
+                        var t = win_tex;
+                        t.deinit(self.conn);
+                        continue;
+                    };
 
                     // Look up icon
                     var icon_tex: ?rl.Texture2D = null;
@@ -247,70 +257,38 @@ pub const App = struct {
                     }
 
                     // Create display window (taking ownership of title and icon_id)
-                    const new_item = ui.DisplayWindow{
-                        .id = data.window_id,
-                        .title = data.title,
-                        .thumbnail_texture = texture,
-                        .icon_texture = icon_tex,
-                        .icon_id = data.icon_id,
-                        .title_version = data.title_version,
-                        .thumbnail_version = data.thumbnail_version,
-                        .source_width = data.thumbnail_width,
-                        .source_height = data.thumbnail_height,
-                        .display_width = 0,
-                        .display_height = 0,
-                    };
+                    const new_item = ui.DisplayWindow{ .id = data.window_id, .title = data.title, .thumbnail_texture = texture, .icon_texture = icon_tex, .icon_id = data.icon_id, .title_version = 1, .thumbnail_version = 1, .source_width = source_width, .source_height = source_height, .display_width = 0, .display_height = 0 };
 
                     self.items.append(new_item) catch {
-                        rl.UnloadTexture(texture);
                         // Free the strings since we failed to append
                         self.allocator.free(data.title);
                         self.allocator.free(data.icon_id);
+                        if (self.window_textures.fetchRemove(data.window_id)) |entry| {
+                            var t = entry.value;
+                            t.deinit(self.conn);
+                        }
                         continue;
                     };
 
                     // Clear ownership from task
                     data.title = &[_]u8{};
                     data.icon_id = &[_]u8{};
-                    // thumbnail_data is also owned by task, but we uploaded it and don't need it anymore.
-                    data.allocator.free(data.thumbnail_data);
-                    data.thumbnail_data = &[_]u8{};
                 },
 
                 .window_removed => |*data| {
                     for (self.items.items, 0..) |*item, i| {
                         if (item.id == data.window_id) {
-                            rl.UnloadTexture(item.thumbnail_texture);
+                            // Clean up WindowTexture
+                            if (self.window_textures.fetchRemove(data.window_id)) |entry| {
+                                var tex = entry.value;
+                                tex.deinit(self.conn);
+                            }
                             self.allocator.free(item.title);
                             self.allocator.free(item.icon_id);
                             _ = self.items.orderedRemove(i);
                             break;
                         }
                     }
-                },
-
-                .thumbnail_updated => |*data| {
-                    for (self.items.items) |*item| {
-                        if (item.id == data.window_id) {
-                            if (data.thumbnail_version > item.thumbnail_version) {
-                                rl.UnloadTexture(item.thumbnail_texture);
-                                const thumb = thumbnail.Thumbnail{
-                                    .data = data.thumbnail_data,
-                                    .width = data.thumbnail_width,
-                                    .height = data.thumbnail_height,
-                                    .allocator = data.allocator,
-                                };
-                                item.thumbnail_texture = ui.loadTextureFromThumbnail(&thumb);
-                                item.thumbnail_version = data.thumbnail_version;
-                                item.source_width = data.thumbnail_width;
-                                item.source_height = data.thumbnail_height;
-                            }
-                            break;
-                        }
-                    }
-                    // Free pixel data
-                    data.allocator.free(data.thumbnail_data);
-                    data.thumbnail_data = &[_]u8{};
                 },
 
                 .title_updated => |*data| {
@@ -432,7 +410,7 @@ pub const App = struct {
         self.current_layout = ui.calculateBestLayout(self.items.items);
 
         // Query current mouse position and find monitor
-        const mouse_pos = x11.getMousePosition(self.xcb_conn, self.xcb_root);
+        const mouse_pos = x11.getMousePosition(self.conn.conn, self.conn.root);
         self.monitor = findMonitorAtPosition(mouse_pos);
 
         rl.ClearWindowState(rl.FLAG_WINDOW_HIDDEN);
@@ -463,7 +441,7 @@ pub const App = struct {
             return;
         }
 
-        if (!x11.grabKeyboard(self.xcb_conn, self.xcb_root)) {
+        if (!x11.grabKeyboard(self.conn.conn, self.conn.root)) {
             log.err("Could not grab keyboard, aborting Alt+Tab", .{});
             return;
         }
@@ -544,11 +522,11 @@ pub const App = struct {
 
         if (self.items.items.len > 0 and self.selected_index < self.items.items.len) {
             const selected_id = self.items.items[self.selected_index].id;
-            x11.activateWindow(self.xcb_conn, self.xcb_root, selected_id, self.xcb_atoms);
+            x11.activateWindow(self.conn.conn, self.conn.root, selected_id, self.conn.atoms);
             log.info("Confirmed: activating window {x}", .{selected_id});
         }
 
-        x11.ungrabKeyboard(self.xcb_conn);
+        x11.ungrabKeyboard(self.conn.conn);
         self.hideWindow();
         self.state = .idle;
     }
@@ -558,14 +536,28 @@ pub const App = struct {
         if (self.state != .switching) return;
 
         log.info("Switching cancelled", .{});
-        x11.ungrabKeyboard(self.xcb_conn);
+        x11.ungrabKeyboard(self.conn.conn);
         self.hideWindow();
         self.state = .idle;
     }
 
+    /// Handle damage event for a window (rebind GLX texture)
+    pub fn handleDamageEvent(self: *Self, drawable: x11.xcb.xcb_window_t) void {
+        if (self.window_textures.getPtr(drawable)) |tex| {
+            if (!tex.rebind(self.conn)) {
+                // Rebind failed — texture is stale, remove it
+                log.warn("Removing stale GLX texture for window {x}", .{drawable});
+                var t = self.window_textures.fetchRemove(drawable) orelse return;
+                t.value.deinit(self.conn);
+                return;
+            }
+            _ = x11.xcb.xcb_damage_subtract(self.conn.conn, tex.damage, 0, 0);
+        }
+    }
+
     /// Reorder internal items to match stacking order (reversed = MRU first)
     fn reorderByStacking(self: *Self) void {
-        const stacking = x11.getStackingWindowList(self.allocator, self.xcb_conn, self.xcb_root, self.xcb_atoms) catch |err| {
+        const stacking = x11.getStackingWindowList(self.allocator, self.conn.conn, self.conn.root, self.conn.atoms) catch |err| {
             log.warn("Could not get stacking list: {}", .{err});
             return;
         };
@@ -617,7 +609,8 @@ pub const App = struct {
 
         rl.BeginDrawing();
         rl.ClearBackground(rl.Color{ .r = 0, .g = 0, .b = 0, .a = 0 });
-        ui.renderSwitcher(self.items.items, self.current_layout, self.selected_index, self.mouseover_index, self.font);
+        const shader_ptr: ?*const ui.DownsampleShader = if (self.downsample_shader) |*s| s else null;
+        ui.renderSwitcher(self.items.items, self.current_layout, self.selected_index, self.mouseover_index, self.font, shader_ptr);
         rl.EndDrawing();
     }
 

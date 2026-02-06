@@ -17,8 +17,6 @@ pub const TITLE_FONT_SIZE = layout_module.TITLE_FONT_SIZE;
 pub const TITLE_SPACING = layout_module.TITLE_SPACING;
 
 // UI-only constants
-pub const CORNER_RADIUS: f32 = 12.0;
-pub const ITEM_CORNER_RADIUS: f32 = 4.0;
 pub const SELECTION_BORDER: u32 = 3;
 pub const BACKGROUND_COLOR = rl.Color{ .r = 0x22, .g = 0x22, .b = 0x22, .a = 217 };
 pub const HIGHLIGHT_COLOR = rl.Color{ .r = 0x2d, .g = 0x8e, .b = 0xc9, .a = 128 };
@@ -31,6 +29,47 @@ pub const ROUNDNESS: f32 = 0.08;
 // Icon overlay constants
 pub const ICON_HEIGHT_RATIO: f32 = 0.25;
 pub const ICON_BOTTOM_OVERHANG: f32 = 0.05;
+
+// Downsample shader for high-quality thumbnail scaling (embedded at compile time)
+pub const DownsampleShader = struct {
+    shader: rl.Shader,
+    source_size_loc: c_int,
+    dest_size_loc: c_int,
+
+    // Embed shader source at compile time
+    const vs_source = @embedFile("shaders/downsample.vs");
+    const fs_source = @embedFile("shaders/downsample.fs");
+
+    pub fn load() ?DownsampleShader {
+        const shader = rl.LoadShaderFromMemory(vs_source, fs_source);
+        if (shader.id == 0) {
+            std.log.warn("Failed to load downsample shader, falling back to bilinear", .{});
+            return null;
+        }
+
+        return DownsampleShader{
+            .shader = shader,
+            .source_size_loc = rl.GetShaderLocation(shader, "sourceSize"),
+            .dest_size_loc = rl.GetShaderLocation(shader, "destSize"),
+        };
+    }
+
+    pub fn unload(self: *DownsampleShader) void {
+        rl.UnloadShader(self.shader);
+    }
+
+    pub fn begin(self: *const DownsampleShader, source_w: f32, source_h: f32, dest_w: f32, dest_h: f32) void {
+        const source_size = [2]f32{ source_w, source_h };
+        const dest_size = [2]f32{ dest_w, dest_h };
+        rl.SetShaderValue(self.shader, self.source_size_loc, &source_size, rl.SHADER_UNIFORM_VEC2);
+        rl.SetShaderValue(self.shader, self.dest_size_loc, &dest_size, rl.SHADER_UNIFORM_VEC2);
+        rl.BeginShaderMode(self.shader);
+    }
+
+    pub fn end(_: *const DownsampleShader) void {
+        rl.EndShaderMode();
+    }
+};
 
 // Item holding window data for rendering
 pub const DisplayWindow = struct {
@@ -225,15 +264,10 @@ pub fn loadSystemFont(size: i32) rl.Font {
         .{ 0x2300, 0x23FF }, // Miscellaneous Technical
         .{ 0x2460, 0x24FF }, // Enclosed Alphanumerics
         .{ 0x2500, 0x257F }, // Box Drawing
-        //.{ 0x2580, 0x259F }, // Block Elements
-        //.{ 0x25A0, 0x25FF }, // Geometric Shapes
         .{ 0x2600, 0x26FF }, // Miscellaneous Symbols
         .{ 0x2700, 0x27BF }, // Dingbats
         .{ 0xE000, 0xF8FF }, // Private Use Area (Nerd Fonts)
-        // .{ 0x1F300, 0x1F5FF }, // Misc Symbols and Pictographs
         .{ 0x1F600, 0x1F64F }, // Emoticons
-        // .{ 0x1F680, 0x1F6FF }, // Transport and Map
-        // .{ 0x1F900, 0x1F9FF }, // Supplemental Symbols and Pictographs
     };
 
     for (ranges) |range| {
@@ -302,7 +336,7 @@ fn drawTruncatedText(font: rl.Font, text: []const u8, x: f32, y: f32, font_size:
     rl.DrawTextEx(font, text_ptr, rl.Vector2{ .x = @floor(text_x), .y = @floor(y) }, font_size, spacing, color);
 }
 
-pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index: usize, mouseover_index: ?usize, font: rl.Font) void {
+pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index: usize, mouseover_index: ?usize, font: rl.Font, downsample_shader: ?*const DownsampleShader) void {
     if (items.len == 0) return;
 
     const item_full_height = layout.item_height + TITLE_SPACING + @as(u32, @intCast(TITLE_FONT_SIZE));
@@ -357,13 +391,22 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                 .width = @floatFromInt(item.display_width),
                 .height = @floatFromInt(item.display_height),
             };
+
             const source_rect = rl.Rectangle{
                 .x = 0,
                 .y = 0,
                 .width = @floatFromInt(item.thumbnail_texture.width),
                 .height = @floatFromInt(item.thumbnail_texture.height),
             };
-            rl.DrawTexturePro(item.thumbnail_texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+
+            // Use downsample shader for high-quality scaling if available
+            if (downsample_shader) |shader| {
+                shader.begin(source_rect.width, source_rect.height, dest_rect.width, dest_rect.height);
+                rl.DrawTexturePro(item.thumbnail_texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+                shader.end();
+            } else {
+                rl.DrawTexturePro(item.thumbnail_texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+            }
 
             // Draw icon overlay at bottom-center of thumbnail
             if (item.icon_texture) |icon_tex| {

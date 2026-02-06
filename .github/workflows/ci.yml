@@ -9,19 +9,35 @@ on:
 permissions:
   contents: write
 
+env:
+  APT_PACKAGES: >-
+    libasound2-dev
+    libgl1-mesa-dev
+    libglu1-mesa-dev
+    libwayland-dev
+    libx11-dev
+    libx11-xcb-dev
+    libxcb-composite0-dev
+    libxcb-damage0-dev
+    libxcb-image0-dev
+    libxcb-keysyms1-dev
+    libxcb-shm0-dev
+    libxcb-util0-dev
+    libxcb1-dev
+    libxcursor-dev
+    libxi-dev
+    libxinerama-dev
+    libxkbcommon-dev
+    libxrandr-dev
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev \
-            libxext-dev libxfixes-dev libgl1-mesa-dev \
-            libxcb1-dev libxcb-composite0-dev libxcb-image0-dev libxcb-keysyms1-dev
+        run: sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -54,12 +70,7 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check_changes.outputs.should_release == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev \
-            libxext-dev libxfixes-dev libgl1-mesa-dev \
-            libxcb1-dev libxcb-composite0-dev libxcb-image0-dev libxcb-keysyms1-dev
+        run: sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
 
       - name: Setup Zig
         if: steps.check_changes.outputs.should_release == 'true'
