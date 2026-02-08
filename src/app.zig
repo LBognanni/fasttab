@@ -250,6 +250,13 @@ pub const App = struct {
                         continue;
                     };
 
+                    // Release binding immediately if hidden so other compositors can use the pixmap
+                    if (self.window_hidden) {
+                        if (self.window_textures.getPtr(data.window_id)) |stored_tex| {
+                            stored_tex.release(self.conn);
+                        }
+                    }
+
                     // Look up icon
                     var icon_tex: ?rl.Texture2D = null;
                     if (self.icon_texture_cache.get(data.icon_id)) |tex| {
@@ -395,6 +402,9 @@ pub const App = struct {
         rl.SetWindowState(rl.FLAG_WINDOW_HIDDEN);
 
         self.window_hidden = true;
+
+        // Release GLX bindings so other compositors (KDE taskbar) can use the pixmaps
+        self.releaseAllBindings();
     }
 
     /// Show the switcher window (public for socket commands)
@@ -405,6 +415,9 @@ pub const App = struct {
         if (self.update_queue) |queue| {
             queue.setWindowVisible(true);
         }
+
+        // Reacquire GLX pixmaps and texture bindings before rendering
+        self.reacquireAllTextures();
 
         // Recalculate layout
         self.current_layout = ui.calculateBestLayout(self.items.items);
@@ -544,6 +557,12 @@ pub const App = struct {
     /// Handle damage event for a window (rebind GLX texture)
     pub fn handleDamageEvent(self: *Self, drawable: x11.xcb.xcb_window_t) void {
         if (self.window_textures.getPtr(drawable)) |tex| {
+            // Always acknowledge the damage to prevent event queue buildup
+            _ = x11.xcb.xcb_damage_subtract(self.conn.conn, tex.damage, 0, 0);
+
+            // Skip rebind when hidden — bindings are released
+            if (self.window_hidden) return;
+
             if (!tex.rebind(self.conn)) {
                 // Rebind failed — texture is stale, remove it
                 log.warn("Removing stale GLX texture for window {x}", .{drawable});
@@ -551,7 +570,6 @@ pub const App = struct {
                 t.value.deinit(self.conn);
                 return;
             }
-            _ = x11.xcb.xcb_damage_subtract(self.conn.conn, tex.damage, 0, 0);
         }
     }
 
@@ -597,6 +615,40 @@ pub const App = struct {
         self.items.clearRetainingCapacity();
         for (new_items.items) |item| {
             self.items.append(item) catch continue;
+        }
+    }
+
+    /// Release all GLX texture bindings (frees pixmaps for other compositors)
+    fn releaseAllBindings(self: *Self) void {
+        var iter = self.window_textures.valueIterator();
+        while (iter.next()) |tex| {
+            tex.release(self.conn);
+        }
+        log.debug("Released {d} GLX bindings", .{self.window_textures.count()});
+    }
+
+    /// Reacquire all GLX textures (recreate pixmaps and bindings before rendering)
+    fn reacquireAllTextures(self: *Self) void {
+        var to_remove = std.ArrayList(x11.xcb.xcb_window_t).init(self.allocator);
+        defer to_remove.deinit();
+
+        var iter = self.window_textures.iterator();
+        while (iter.next()) |entry| {
+            if (!entry.value_ptr.reacquire(self.conn)) {
+                to_remove.append(entry.key_ptr.*) catch continue;
+            }
+        }
+
+        for (to_remove.items) |wid| {
+            log.warn("Removing stale GLX texture for window {x} during reacquire", .{wid});
+            if (self.window_textures.fetchRemove(wid)) |entry| {
+                var t = entry.value;
+                t.deinit(self.conn);
+            }
+        }
+
+        if (to_remove.items.len > 0) {
+            log.debug("Reacquire: {d} textures failed", .{to_remove.items.len});
         }
     }
 

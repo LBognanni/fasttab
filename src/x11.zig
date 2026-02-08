@@ -174,11 +174,15 @@ pub const WindowTexture = struct {
     gl_texture: c_uint,
     damage: xcb.xcb_damage_damage_t,
     gl_display: ?*xlib.Display,
+    texture_format: c_int,
+    bound: bool,
 
     pub fn deinit(self: *WindowTexture, conn: *Connection) void {
         if (self.gl_display) |display| {
             clearGlxError(display);
-            conn.glx_release.?(display, self.glx_pixmap, xlib.GLX_FRONT_LEFT_EXT);
+            if (self.bound) {
+                conn.glx_release.?(display, self.glx_pixmap, xlib.GLX_FRONT_LEFT_EXT);
+            }
             xlib.glDeleteTextures(1, &self.gl_texture);
             xlib.glXDestroyPixmap(display, self.glx_pixmap);
             _ = xlib.XSync(display, xlib.False);
@@ -198,10 +202,94 @@ pub const WindowTexture = struct {
         };
     }
 
+    /// Release the GLX pixmap and XCB pixmap, freeing the window's backing store
+    /// for use by other compositors (e.g. KDE taskbar previews).
+    /// The GL texture and damage monitor are kept. Use reacquire() to rebind.
+    pub fn release(self: *WindowTexture, conn: *Connection) void {
+        const display = self.gl_display orelse return;
+        if (!self.bound) return;
+        clearGlxError(display);
+        conn.glx_release.?(display, self.glx_pixmap, xlib.GLX_FRONT_LEFT_EXT);
+        xlib.glXDestroyPixmap(display, self.glx_pixmap);
+        _ = xlib.XSync(display, xlib.False);
+        _ = xcb.xcb_free_pixmap(conn.conn, self.pixmap);
+        self.glx_pixmap = 0;
+        self.pixmap = 0;
+        self.bound = false;
+    }
+
+    /// Reacquire the composite pixmap and GLX binding after a release().
+    /// Returns false if reacquisition failed (window may have been destroyed).
+    pub fn reacquire(self: *WindowTexture, conn: *Connection) bool {
+        const display = self.gl_display orelse return false;
+        if (self.bound) return true;
+
+        // Recreate composite pixmap
+        const pixmap = xcb.xcb_generate_id(conn.conn);
+        const name_cookie = xcb.xcb_composite_name_window_pixmap_checked(conn.conn, self.window_id, pixmap);
+        if (xcb.xcb_request_check(conn.conn, name_cookie)) |err| {
+            std.c.free(err);
+            log.warn("Failed to recreate composite pixmap for window {x}", .{self.window_id});
+            return false;
+        }
+
+        // Get window attributes for FBConfig lookup
+        const attr_cookie = xcb.xcb_get_window_attributes(conn.conn, self.window_id);
+        const attr_reply = xcb.xcb_get_window_attributes_reply(conn.conn, attr_cookie, null) orelse {
+            _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
+            return false;
+        };
+        const visual_id = attr_reply.*.visual;
+        std.c.free(attr_reply);
+
+        const screen_num = xlib.DefaultScreen(display);
+        const fb_config = findFBConfigForVisual(display, screen_num, visual_id) orelse {
+            _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
+            log.warn("No FBConfig for visual 0x{x} during reacquire (window {x})", .{ visual_id, self.window_id });
+            return false;
+        };
+
+        const glx_attribs = [_]c_int{
+            xlib.GLX_TEXTURE_TARGET_EXT,
+            xlib.GLX_TEXTURE_2D_EXT,
+            xlib.GLX_TEXTURE_FORMAT_EXT,
+            self.texture_format,
+            0,
+        };
+
+        clearGlxError(display);
+        const glx_pixmap = xlib.glXCreatePixmap(display, fb_config, pixmap, &glx_attribs);
+        if (glx_pixmap == 0 or checkGlxError(display)) {
+            _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
+            log.warn("glXCreatePixmap failed during reacquire for window {x}", .{self.window_id});
+            return false;
+        }
+
+        // Bind texture content
+        xlib.glBindTexture(xlib.GL_TEXTURE_2D, self.gl_texture);
+        clearGlxError(display);
+        conn.glx_bind.?(display, glx_pixmap, xlib.GLX_FRONT_LEFT_EXT, null);
+
+        if (checkGlxError(display)) {
+            xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
+            xlib.glXDestroyPixmap(display, glx_pixmap);
+            _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
+            log.warn("glXBindTexImageEXT failed during reacquire for window {x}", .{self.window_id});
+            return false;
+        }
+        xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
+
+        self.pixmap = pixmap;
+        self.glx_pixmap = glx_pixmap;
+        self.bound = true;
+        return true;
+    }
+
     /// Rebind after damage (window content changed).
     /// Returns false if the rebind failed (texture is now invalid).
     pub fn rebind(self: *WindowTexture, conn: *Connection) bool {
         const display = self.gl_display orelse return false;
+        if (!self.bound) return false;
         clearGlxError(display);
 
         xlib.glBindTexture(xlib.GL_TEXTURE_2D, self.gl_texture);
@@ -1030,6 +1118,8 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
         .gl_texture = gl_texture,
         .damage = damage,
         .gl_display = gl_display,
+        .texture_format = texture_format,
+        .bound = true,
     };
 }
 
