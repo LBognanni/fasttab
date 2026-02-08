@@ -224,63 +224,13 @@ pub const WindowTexture = struct {
         const display = self.gl_display orelse return false;
         if (self.bound) return true;
 
-        // Recreate composite pixmap
-        const pixmap = xcb.xcb_generate_id(conn.conn);
-        const name_cookie = xcb.xcb_composite_name_window_pixmap_checked(conn.conn, self.window_id, pixmap);
-        if (xcb.xcb_request_check(conn.conn, name_cookie)) |err| {
-            std.c.free(err);
-            log.warn("Failed to recreate composite pixmap for window {x}", .{self.window_id});
-            return false;
-        }
-
-        // Get window attributes for FBConfig lookup
-        const attr_cookie = xcb.xcb_get_window_attributes(conn.conn, self.window_id);
-        const attr_reply = xcb.xcb_get_window_attributes_reply(conn.conn, attr_cookie, null) orelse {
-            _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
-            return false;
-        };
-        const visual_id = attr_reply.*.visual;
-        std.c.free(attr_reply);
-
-        const screen_num = xlib.DefaultScreen(display);
-        const fb_config = findFBConfigForVisual(display, screen_num, visual_id) orelse {
-            _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
-            log.warn("No FBConfig for visual 0x{x} during reacquire (window {x})", .{ visual_id, self.window_id });
+        const binding = acquirePixmapBinding(conn, display, self.window_id, self.gl_texture, self.texture_format) catch |err| {
+            log.warn("Reacquire failed for window {x}: {}", .{ self.window_id, err });
             return false;
         };
 
-        const glx_attribs = [_]c_int{
-            xlib.GLX_TEXTURE_TARGET_EXT,
-            xlib.GLX_TEXTURE_2D_EXT,
-            xlib.GLX_TEXTURE_FORMAT_EXT,
-            self.texture_format,
-            0,
-        };
-
-        clearGlxError(display);
-        const glx_pixmap = xlib.glXCreatePixmap(display, fb_config, pixmap, &glx_attribs);
-        if (glx_pixmap == 0 or checkGlxError(display)) {
-            _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
-            log.warn("glXCreatePixmap failed during reacquire for window {x}", .{self.window_id});
-            return false;
-        }
-
-        // Bind texture content
-        xlib.glBindTexture(xlib.GL_TEXTURE_2D, self.gl_texture);
-        clearGlxError(display);
-        conn.glx_bind.?(display, glx_pixmap, xlib.GLX_FRONT_LEFT_EXT, null);
-
-        if (checkGlxError(display)) {
-            xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
-            xlib.glXDestroyPixmap(display, glx_pixmap);
-            _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
-            log.warn("glXBindTexImageEXT failed during reacquire for window {x}", .{self.window_id});
-            return false;
-        }
-        xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
-
-        self.pixmap = pixmap;
-        self.glx_pixmap = glx_pixmap;
+        self.pixmap = binding.pixmap;
+        self.glx_pixmap = binding.glx_pixmap;
         self.bound = true;
         return true;
     }
@@ -1011,6 +961,86 @@ pub fn getXcbFd(conn: *xcb.xcb_connection_t) std.posix.fd_t {
     return xcb.xcb_get_file_descriptor(conn);
 }
 
+/// Result of acquiring a pixmap binding for a window.
+const PixmapBinding = struct {
+    pixmap: xcb.xcb_pixmap_t,
+    glx_pixmap: xlib.GLXPixmap,
+    texture_format: c_int,
+};
+
+/// Create composite pixmap, GLX pixmap, and bind to a GL texture.
+/// Shared by createWindowTexture (initial) and WindowTexture.reacquire (after release).
+fn acquirePixmapBinding(
+    conn: *Connection,
+    display: *xlib.Display,
+    window: xcb.xcb_window_t,
+    gl_texture: c_uint,
+    texture_format_hint: ?c_int,
+) X11Error!PixmapBinding {
+    // Create composite pixmap
+    const pixmap = xcb.xcb_generate_id(conn.conn);
+    const name_cookie = xcb.xcb_composite_name_window_pixmap_checked(conn.conn, window, pixmap);
+    if (xcb.xcb_request_check(conn.conn, name_cookie)) |err| {
+        std.c.free(err);
+        return error.PixmapCreationFailed;
+    }
+
+    // Get visual for FBConfig lookup
+    const attr_cookie = xcb.xcb_get_window_attributes(conn.conn, window);
+    const attr_reply = xcb.xcb_get_window_attributes_reply(conn.conn, attr_cookie, null) orelse {
+        _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
+        return error.GeometryFetchFailed;
+    };
+    const visual_id = attr_reply.*.visual;
+    std.c.free(attr_reply);
+
+    const screen_num = xlib.DefaultScreen(display);
+    const fb_config = findFBConfigForVisual(display, screen_num, visual_id) orelse {
+        _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
+        return error.NoSuitableFBConfig;
+    };
+
+    const texture_format = texture_format_hint orelse blk: {
+        var bind_rgba: c_int = 0;
+        _ = xlib.glXGetFBConfigAttrib(display, fb_config, xlib.GLX_BIND_TO_TEXTURE_RGBA_EXT, &bind_rgba);
+        break :blk if (bind_rgba != 0) xlib.GLX_TEXTURE_FORMAT_RGBA_EXT else xlib.GLX_TEXTURE_FORMAT_RGB_EXT;
+    };
+
+    const glx_attribs = [_]c_int{
+        xlib.GLX_TEXTURE_TARGET_EXT,
+        xlib.GLX_TEXTURE_2D_EXT,
+        xlib.GLX_TEXTURE_FORMAT_EXT,
+        texture_format,
+        0,
+    };
+
+    clearGlxError(display);
+    const glx_pixmap = xlib.glXCreatePixmap(display, fb_config, pixmap, &glx_attribs);
+    if (glx_pixmap == 0 or checkGlxError(display)) {
+        _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
+        return error.GLXPixmapCreationFailed;
+    }
+
+    // Bind pixmap content to GL texture
+    xlib.glBindTexture(xlib.GL_TEXTURE_2D, gl_texture);
+    clearGlxError(display);
+    conn.glx_bind.?(display, glx_pixmap, xlib.GLX_FRONT_LEFT_EXT, null);
+
+    if (checkGlxError(display)) {
+        xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
+        xlib.glXDestroyPixmap(display, glx_pixmap);
+        _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
+        return error.GLXPixmapCreationFailed;
+    }
+    xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
+
+    return PixmapBinding{
+        .pixmap = pixmap,
+        .glx_pixmap = glx_pixmap,
+        .texture_format = texture_format,
+    };
+}
+
 /// Create a GLX texture bound to a window's pixmap (zero-copy thumbnail).
 /// MUST be called from the main thread (GL context owner).
 pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error!WindowTexture {
@@ -1030,81 +1060,30 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
         std.c.free(err);
     }
 
-    // Get window attributes to find its visual ID
-    const attr_cookie = xcb.xcb_get_window_attributes(conn.conn, window);
-    const attr_reply = xcb.xcb_get_window_attributes_reply(conn.conn, attr_cookie, null) orelse return error.GeometryFetchFailed;
-    defer std.c.free(attr_reply);
-    const visual_id = attr_reply.*.visual;
-
+    // Get geometry for dimensions
     const geom_cookie = xcb.xcb_get_geometry(conn.conn, window);
     const geom_reply = xcb.xcb_get_geometry_reply(conn.conn, geom_cookie, null) orelse return error.GeometryFetchFailed;
     defer std.c.free(geom_reply);
 
     const width = geom_reply.*.width;
     const height = geom_reply.*.height;
-    const depth = geom_reply.*.depth;
     if (width == 0 or height == 0) return error.InvalidGeometry;
 
-    // Find FBConfig matching this window's visual
-    const screen_num = xlib.DefaultScreen(gl_display);
-    const fb_config = findFBConfigForVisual(gl_display.?, screen_num, visual_id) orelse {
-        log.err("No matching FBConfig for visual 0x{x} depth {d} (window {x})", .{ visual_id, depth, window });
-        return error.NoSuitableFBConfig;
-    };
-
-    // Check whether this FBConfig supports RGBA or RGB texture binding
-    var bind_rgba: c_int = 0;
-    _ = xlib.glXGetFBConfigAttrib(gl_display.?, fb_config, xlib.GLX_BIND_TO_TEXTURE_RGBA_EXT, &bind_rgba);
-    const texture_format = if (bind_rgba != 0) xlib.GLX_TEXTURE_FORMAT_RGBA_EXT else xlib.GLX_TEXTURE_FORMAT_RGB_EXT;
-
-    // Create composite pixmap
-    const pixmap = xcb.xcb_generate_id(conn.conn);
-    const name_cookie = xcb.xcb_composite_name_window_pixmap_checked(conn.conn, window, pixmap);
-    if (xcb.xcb_request_check(conn.conn, name_cookie)) |err| {
-        std.c.free(err);
-        return error.PixmapCreationFailed;
-    }
-
-    const glx_attribs = [_]c_int{
-        xlib.GLX_TEXTURE_TARGET_EXT,
-        xlib.GLX_TEXTURE_2D_EXT,
-        xlib.GLX_TEXTURE_FORMAT_EXT,
-        texture_format,
-        0,
-    };
-
-    clearGlxError(gl_display.?);
-
-    const glx_pixmap = xlib.glXCreatePixmap(gl_display, fb_config, pixmap, &glx_attribs);
-    if (glx_pixmap == 0 or checkGlxError(gl_display.?)) {
-        log.err("glXCreatePixmap failed for window {x} (depth={d}, {}x{})", .{ window, depth, width, height });
-        _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
-        return error.GLXPixmapCreationFailed;
-    }
-
+    // Create GL texture with filtering params
     var gl_texture: c_uint = undefined;
     xlib.glGenTextures(1, &gl_texture);
     xlib.glBindTexture(xlib.GL_TEXTURE_2D, gl_texture);
-
-    // Use bilinear filtering (no mipmaps - they interfere with live GLX texture updates)
     xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_MIN_FILTER, xlib.GL_LINEAR);
     xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_MAG_FILTER, xlib.GL_LINEAR);
     xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_WRAP_S, xlib.GL_CLAMP_TO_EDGE);
     xlib.glTexParameteri(xlib.GL_TEXTURE_2D, xlib.GL_TEXTURE_WRAP_T, xlib.GL_CLAMP_TO_EDGE);
-
-    clearGlxError(gl_display.?);
-    conn.glx_bind.?(gl_display.?, glx_pixmap, xlib.GLX_FRONT_LEFT_EXT, null);
-
-    if (checkGlxError(gl_display.?)) {
-        log.err("glXBindTexImageEXT failed for window {x} (depth={d}, visual=0x{x})", .{ window, depth, visual_id });
-        xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
-        xlib.glDeleteTextures(1, &gl_texture);
-        xlib.glXDestroyPixmap(gl_display, glx_pixmap);
-        _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
-        return error.GLXPixmapCreationFailed;
-    }
-
     xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
+
+    // Acquire pixmap binding (composite pixmap + GLX pixmap + bind)
+    const binding = acquirePixmapBinding(conn, gl_display.?, window, gl_texture, null) catch |err| {
+        xlib.glDeleteTextures(1, &gl_texture);
+        return err;
+    };
 
     const damage = xcb.xcb_generate_id(conn.conn);
     _ = xcb.xcb_damage_create(conn.conn, damage, window, xcb.XCB_DAMAGE_REPORT_LEVEL_NON_EMPTY);
@@ -1113,12 +1092,12 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
         .window_id = window,
         .width = width,
         .height = height,
-        .pixmap = pixmap,
-        .glx_pixmap = glx_pixmap,
+        .pixmap = binding.pixmap,
+        .glx_pixmap = binding.glx_pixmap,
         .gl_texture = gl_texture,
         .damage = damage,
         .gl_display = gl_display,
-        .texture_format = texture_format,
+        .texture_format = binding.texture_format,
         .bound = true,
     };
 }
