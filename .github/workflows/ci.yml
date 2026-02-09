@@ -29,6 +29,8 @@ env:
     libxinerama-dev
     libxkbcommon-dev
     libxrandr-dev
+    libglfw3-dev
+    libxcb-keysyms1-dev
 
 jobs:
   test:

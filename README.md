@@ -2,6 +2,8 @@
 
 A lightning fast Alt+Tab switcher for X11 written in Zig using Raylib.
 
+
+
 ## Features
 
  - Instant window switching, no more waiting for the switcher to appear
@@ -37,26 +39,29 @@ FastTab improves performance in several ways:
 ## Build instructions
 1. Make sure you have Zig installed (version 0.14.0 or later)
 1. You will also need the following development packages installed:
-    - `libx11-dev`
-    - `libxcursor-dev`
-    - `libxrandr-dev`
-    - `libxinerama-dev`
-    - `libxi-dev`
-    - `libxext-dev`
-    - `libxfixes-dev`
-    - `libgl1-mesa-dev`
-    - `libxcb1-dev`
-    - `libxcb-composite0-dev`
-    - `libxcb-image0-dev`
-    - `libxcb-keysyms1-dev`      
+    - libasound2-dev
+    - libgl1-mesa-dev
+    - libglu1-mesa-dev
+    - libwayland-dev
+    - libx11-dev
+    - libx11-xcb-dev
+    - libxcb-composite0-dev
+    - libxcb-damage0-dev
+    - libxcb-image0-dev
+    - libxcb-keysyms1-dev
+    - libxcb-shm0-dev
+    - libxcb-util0-dev
+    - libxcb1-dev
+    - libxcursor-dev
+    - libxi-dev
+    - libxinerama-dev
+    - libxkbcommon-dev
+    - libxrandr-dev
+    - libglfw3-dev
+    - libxcb-keysyms1-dev
 
-    On Debian/Ubuntu, you can install them with:
-    ```
-    sudo apt-get install -y \
-      libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev \
-      libxext-dev libxfixes-dev libgl1-mesa-dev \
-      libxcb1-dev libxcb-composite0-dev libxcb-image0-dev libxcb-keysyms1-dev
-    ```
+    On Debian/Ubuntu, you can install them with `sudo apt install <package-names>`.
+
 1. Clone this repository
 1. Run the `setup.sh` script to install Raylib and other dependencies
 1. Build the project with `zig build -Drelease-safe`
