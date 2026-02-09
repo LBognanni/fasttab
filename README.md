@@ -4,6 +4,10 @@ A lightning fast Alt+Tab switcher for X11 written in Zig using Raylib.
 
 
 
+https://github.com/user-attachments/assets/6327cd4b-4750-40c8-ab30-f8d80463887d
+
+
+
 ## Features
 
  - Instant window switching, no more waiting for the switcher to appear
