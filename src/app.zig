@@ -43,6 +43,7 @@ pub const App = struct {
     window_textures: std.AutoHashMap(x11.xcb.xcb_window_t, x11.WindowTexture),
     focus_grace_frames: u8,
     downsample_shader: ?ui.DownsampleShader,
+    show_delay_frames: ?u8,
 
     const Self = @This();
 
@@ -59,13 +60,11 @@ pub const App = struct {
         const window_textures = std.AutoHashMap(x11.xcb.xcb_window_t, x11.WindowTexture).init(allocator);
         const temp_tasks = std.ArrayList(worker.UpdateTask).init(allocator);
 
-        // Create raylib window (hidden initially)
+        // Create raylib window (hidden initially via FLAG_WINDOW_HIDDEN)
         rl.SetConfigFlags(rl.FLAG_WINDOW_UNDECORATED | rl.FLAG_WINDOW_TRANSPARENT | rl.FLAG_WINDOW_TOPMOST | rl.FLAG_WINDOW_HIDDEN);
         rl.SetTraceLogLevel(rl.LOG_WARNING);
-        // Initial size doesn't matter much as it starts hidden and resizes on show
         rl.InitWindow(800, 600, "FastTab");
         rl.SetTargetFPS(60);
-
         // Load system font
         const font = ui.loadSystemFont(ui.TITLE_FONT_SIZE);
 
@@ -109,6 +108,7 @@ pub const App = struct {
             .window_textures = window_textures,
             .focus_grace_frames = 0,
             .downsample_shader = downsample_shader,
+            .show_delay_frames = null,
         };
 
         // Process initial tasks
@@ -174,9 +174,22 @@ pub const App = struct {
     /// Process one frame: check for window close, render
     pub fn update(self: *Self) void {
         if (self.window_hidden) {
-            // In daemon mode with hidden window, skip rendering
-            std.time.sleep(16 * std.time.ns_per_ms);
-            return;
+            // Check if the deferred show countdown has elapsed
+            if (self.show_delay_frames) |*remaining| {
+                if (remaining.* == 0) {
+                    self.show_delay_frames = null;
+                    self.showWindow();
+                    // Fall through to render the first frame immediately
+                } else {
+                    remaining.* -= 1;
+                    std.time.sleep(16 * std.time.ns_per_ms);
+                    return;
+                }
+            } else {
+                // No show pending, sleep
+                std.time.sleep(16 * std.time.ns_per_ms);
+                return;
+            }
         }
 
         // Check if window should close
@@ -443,6 +456,10 @@ pub const App = struct {
 
     // === Alt+Tab state machine ===
 
+    /// Number of frames to wait before showing the switcher window.
+    /// If Alt is released before this, the window is never shown.
+    const SHOW_DELAY_FRAMES: u8 = 1;
+
     /// Handle initial Alt+Tab press
     pub fn handleAltTab(self: *Self, shift: bool) void {
         if (self.state == .switching) {
@@ -473,7 +490,10 @@ pub const App = struct {
             }
         }
 
-        self.showWindow();
+        // Don't show the window yet — wait a couple of frames.  If Alt is
+        // released before the countdown expires we switch without ever
+        // mapping the window, avoiding the show/hide race during rapid Alt+Tab.
+        self.show_delay_frames = SHOW_DELAY_FRAMES;
         self.state = .switching;
         log.info("Alt+Tab switching started (shift={}, selected={d})", .{ shift, self.selected_index });
     }
@@ -540,7 +560,10 @@ pub const App = struct {
         }
 
         x11.ungrabKeyboard(self.conn.conn);
-        self.hideWindow();
+        self.show_delay_frames = null;
+        if (!self.window_hidden) {
+            self.hideWindow();
+        }
         self.state = .idle;
     }
 
@@ -550,7 +573,10 @@ pub const App = struct {
 
         log.info("Switching cancelled", .{});
         x11.ungrabKeyboard(self.conn.conn);
-        self.hideWindow();
+        self.show_delay_frames = null;
+        if (!self.window_hidden) {
+            self.hideWindow();
+        }
         self.state = .idle;
     }
 
