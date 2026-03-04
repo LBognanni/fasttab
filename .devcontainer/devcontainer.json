@@ -1,0 +1,24 @@
+{
+	"name": "FastTab",
+	"build": {
+		"dockerfile": "Dockerfile",
+		"args": {
+			"UBUNTU_VERSION": "25.10"
+		}
+	},
+	"remoteUser": "vscode",
+	"postCreateCommand": "./setup.sh",
+	"mounts": [
+		"source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind,consistency=cached",
+		"source=${localEnv:HOME}/.config/opencode,target=/home/vscode/.config/opencode,type=bind,consistency=cached",
+		"source=${localEnv:HOME}/.local/share/opencode,target=/home/vscode/.local/share/opencode,type=bind,consistency=cached"
+	],
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ziglang.vscode-zig",
+				"sst-dev.opencode"
+			]
+		}
+	}
+}
