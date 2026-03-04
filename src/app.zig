@@ -590,10 +590,16 @@ pub const App = struct {
             if (self.window_hidden) return;
 
             if (!tex.rebind(self.conn)) {
-                // Rebind failed — texture is stale, remove it
-                log.warn("Removing stale GLX texture for window {x}", .{drawable});
-                var t = self.window_textures.fetchRemove(drawable) orelse return;
-                t.value.deinit(self.conn);
+                // Rebind failed — pixmap is stale, try to reacquire a fresh one
+                log.info("GLX rebind failed for window {x}, reacquiring pixmap", .{drawable});
+                tex.invalidate(self.conn);
+                if (!tex.reacquire(self.conn)) {
+                    // Window is truly gone — destroy texture and remove from items
+                    log.warn("Reacquire also failed for window {x}, removing", .{drawable});
+                    var t = self.window_textures.fetchRemove(drawable) orelse return;
+                    t.value.deinit(self.conn);
+                    self.removeItemByWindowId(drawable);
+                }
                 return;
             }
         }
@@ -671,10 +677,23 @@ pub const App = struct {
                 var t = entry.value;
                 t.deinit(self.conn);
             }
+            self.removeItemByWindowId(wid);
         }
 
         if (to_remove.items.len > 0) {
             log.debug("Reacquire: {d} textures failed", .{to_remove.items.len});
+        }
+    }
+
+    /// Remove a DisplayWindow from self.items by window ID, freeing owned strings.
+    fn removeItemByWindowId(self: *Self, wid: x11.xcb.xcb_window_t) void {
+        for (self.items.items, 0..) |*item, i| {
+            if (item.id == wid) {
+                self.allocator.free(item.title);
+                self.allocator.free(item.icon_id);
+                _ = self.items.orderedRemove(i);
+                return;
+            }
         }
     }
 

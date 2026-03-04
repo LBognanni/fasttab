@@ -218,6 +218,17 @@ pub const WindowTexture = struct {
         self.bound = false;
     }
 
+    /// Invalidate a stale pixmap binding without calling GLX cleanup.
+    /// Use this when the pixmap is known to be stale (rebind failed).
+    /// The GL texture and damage monitor are kept. Use reacquire() to rebind.
+    pub fn invalidate(self: *WindowTexture, conn: *Connection) void {
+        if (!self.bound) return;
+        _ = xcb.xcb_free_pixmap(conn.conn, self.pixmap);
+        self.glx_pixmap = 0;
+        self.pixmap = 0;
+        self.bound = false;
+    }
+
     /// Reacquire the composite pixmap and GLX binding after a release().
     /// Returns false if reacquisition failed (window may have been destroyed).
     pub fn reacquire(self: *WindowTexture, conn: *Connection) bool {
