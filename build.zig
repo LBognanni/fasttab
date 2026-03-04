@@ -14,15 +14,12 @@ pub fn build(b: *std.Build) void {
     // Add include path for stb headers
     exe.addIncludePath(b.path("include"));
 
-    // Add raylib include and library paths
+    // Add raylib include path and static library
     exe.addIncludePath(b.path("lib/raylib-5.5_linux_amd64/include"));
-    exe.addLibraryPath(b.path("lib/raylib-5.5_linux_amd64/lib"));
 
-    // Add stb implementation with SIMD optimizations
-    exe.addCSourceFile(.{
-        .file = b.path("src/stb_impl.c"),
-        .flags = &[_][]const u8{ "-std=c99", "-O3", "-msse4.1" },
-    });
+    // Note: STB implementations (stb_image, stb_image_resize2) are already
+    // compiled into libraylib.a, so we do NOT compile stb_impl.c separately.
+    // The headers in include/ are used only for type/function declarations.
 
     // Link XCB libraries
     exe.linkSystemLibrary("xcb");
@@ -31,8 +28,8 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("xcb-keysyms");
     exe.linkSystemLibrary("xcb-damage");
 
-    // Link raylib and its dependencies
-    exe.linkSystemLibrary("raylib");
+    // Link raylib (static) and its dependencies
+    exe.addObjectFile(b.path("lib/raylib-5.5_linux_amd64/lib/libraylib.a"));
     exe.linkSystemLibrary("GL");
     exe.linkSystemLibrary("m");
     exe.linkSystemLibrary("pthread");
@@ -63,13 +60,12 @@ pub fn build(b: *std.Build) void {
     });
     exe_unit_tests.addIncludePath(b.path("include"));
     exe_unit_tests.addIncludePath(b.path("lib/raylib-5.5_linux_amd64/include"));
-    exe_unit_tests.addLibraryPath(b.path("lib/raylib-5.5_linux_amd64/lib"));
     exe_unit_tests.linkSystemLibrary("xcb");
     exe_unit_tests.linkSystemLibrary("xcb-composite");
     exe_unit_tests.linkSystemLibrary("xcb-image");
     exe_unit_tests.linkSystemLibrary("xcb-keysyms");
     exe_unit_tests.linkSystemLibrary("xcb-damage");
-    exe_unit_tests.linkSystemLibrary("raylib");
+    exe_unit_tests.addObjectFile(b.path("lib/raylib-5.5_linux_amd64/lib/libraylib.a"));
     exe_unit_tests.linkSystemLibrary("GL");
     exe_unit_tests.linkSystemLibrary("m");
     exe_unit_tests.linkSystemLibrary("pthread");
@@ -101,17 +97,12 @@ pub fn build(b: *std.Build) void {
     ui_module.addIncludePath(b.path("lib/raylib-5.5_linux_amd64/include"));
     ui_test.root_module.addImport("ui", ui_module);
     ui_test.addIncludePath(b.path("include"));
-    ui_test.addLibraryPath(b.path("lib/raylib-5.5_linux_amd64/lib"));
-    ui_test.addCSourceFile(.{
-        .file = b.path("src/stb_impl.c"),
-        .flags = &[_][]const u8{ "-std=c99", "-O3", "-msse4.1" },
-    });
     ui_test.linkSystemLibrary("xcb");
     ui_test.linkSystemLibrary("xcb-composite");
     ui_test.linkSystemLibrary("xcb-image");
     ui_test.linkSystemLibrary("xcb-keysyms");
     ui_test.linkSystemLibrary("xcb-damage");
-    ui_test.linkSystemLibrary("raylib");
+    ui_test.addObjectFile(b.path("lib/raylib-5.5_linux_amd64/lib/libraylib.a"));
     ui_test.linkSystemLibrary("GL");
     ui_test.linkSystemLibrary("m");
     ui_test.linkSystemLibrary("pthread");
