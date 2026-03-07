@@ -84,6 +84,7 @@ pub const DisplayWindow = struct {
     source_height: u32, // original thumbnail height (for layout)
     display_width: u32,
     display_height: u32,
+    thumbnail_ready: bool,
 };
 
 // Re-export GridLayout from layout module
@@ -399,17 +400,44 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                 .height = @floatFromInt(item.thumbnail_texture.height),
             };
 
-            // Use downsample shader for high-quality scaling if available
-            if (downsample_shader) |shader| {
-                shader.begin(source_rect.width, source_rect.height, dest_rect.width, dest_rect.height);
-                rl.DrawTexturePro(item.thumbnail_texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
-                shader.end();
+            if (item.thumbnail_ready) {
+                // Use downsample shader for high-quality scaling if available
+                if (downsample_shader) |shader| {
+                    shader.begin(source_rect.width, source_rect.height, dest_rect.width, dest_rect.height);
+                    rl.DrawTexturePro(item.thumbnail_texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+                    shader.end();
+                } else {
+                    rl.DrawTexturePro(item.thumbnail_texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+                }
             } else {
-                rl.DrawTexturePro(item.thumbnail_texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+                const fallback_bg = rl.Color{ .r = 0x18, .g = 0x18, .b = 0x18, .a = 230 };
+                rl.DrawRectangleRounded(dest_rect, 0.06, 6, fallback_bg);
+
+                if (item.icon_texture) |icon_tex| {
+                    const thumb_h: f32 = @floatFromInt(item.display_height);
+                    const thumb_w: f32 = @floatFromInt(item.display_width);
+                    const icon_size = thumb_h * 0.55;
+                    const icon_x = x + (thumb_w - icon_size) / 2.0;
+                    const icon_y = y + (thumb_h - icon_size) / 2.0;
+                    const icon_src = rl.Rectangle{
+                        .x = 0,
+                        .y = 0,
+                        .width = @floatFromInt(icon_tex.width),
+                        .height = @floatFromInt(icon_tex.height),
+                    };
+                    const icon_dst = rl.Rectangle{
+                        .x = icon_x,
+                        .y = icon_y,
+                        .width = icon_size,
+                        .height = icon_size,
+                    };
+                    rl.DrawTexturePro(icon_tex, icon_src, icon_dst, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+                }
             }
 
             // Draw icon overlay at bottom-center of thumbnail
-            if (item.icon_texture) |icon_tex| {
+            if (item.thumbnail_ready and item.icon_texture != null) {
+                const icon_tex = item.icon_texture.?;
                 const thumb_h: f32 = @floatFromInt(item.display_height);
                 const thumb_w: f32 = @floatFromInt(item.display_width);
                 const icon_size = thumb_h * ICON_HEIGHT_RATIO;

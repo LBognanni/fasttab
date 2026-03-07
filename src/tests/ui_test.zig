@@ -22,6 +22,7 @@ fn testWindowWithDisplay(source_width: u32, source_height: u32, display_width: u
         .source_height = source_height,
         .display_width = display_width,
         .display_height = display_height,
+        .thumbnail_ready = true,
     };
 }
 

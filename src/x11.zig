@@ -166,6 +166,7 @@ fn getGlGenerateMipmap() ?*const fn (c_uint) callconv(.C) void {
 
 pub const WindowTexture = struct {
     window_id: xcb.xcb_window_t,
+    visual_id: u32,
     width: u16,
     height: u16,
 
@@ -235,7 +236,7 @@ pub const WindowTexture = struct {
         const display = self.gl_display orelse return false;
         if (self.bound) return true;
 
-        const binding = acquirePixmapBinding(conn, display, self.window_id, self.gl_texture, self.texture_format) catch |err| {
+        const binding = acquirePixmapBinding(conn, display, self.window_id, self.visual_id, self.gl_texture, self.texture_format) catch |err| {
             log.warn("Reacquire failed for window {x}: {}", .{ self.window_id, err });
             return false;
         };
@@ -283,6 +284,9 @@ pub const Connection = struct {
 
     // Damage extension
     damage_event_base: u8,
+
+    // visual_id -> FBConfig cache to avoid repeated full scans
+    fb_config_cache: std.AutoHashMap(u32, xlib.GLXFBConfig),
 
     pub fn init() X11Error!Connection {
         const display = xlib.XOpenDisplay(null) orelse return error.ConnectionFailed;
@@ -353,6 +357,7 @@ pub const Connection = struct {
             .glx_release = @ptrCast(release_fn),
             .screen_num = screen_num,
             .damage_event_base = damage_base,
+            .fb_config_cache = std.AutoHashMap(u32, xlib.GLXFBConfig).init(std.heap.c_allocator),
         };
     }
 
@@ -396,10 +401,12 @@ pub const Connection = struct {
             .glx_release = null,
             .screen_num = 0,
             .damage_event_base = 0,
+            .fb_config_cache = std.AutoHashMap(u32, xlib.GLXFBConfig).init(std.heap.c_allocator),
         };
     }
 
     pub fn deinit(self: *Connection) void {
+        self.fb_config_cache.deinit();
         if (self.display) |display| {
             _ = xlib.XCloseDisplay(display);
         } else {
@@ -457,7 +464,11 @@ fn initComposite(conn: *xcb.xcb_connection_t) X11Error!void {
 
 /// Find an FBConfig that matches a specific X visual ID and supports texture binding.
 /// Iterates all FBConfigs and returns the first one whose GLX_VISUAL_ID matches.
-fn findFBConfigForVisual(display: *xlib.Display, screen: c_int, visual_id: u32) ?xlib.GLXFBConfig {
+fn findFBConfigForVisual(conn: *Connection, display: *xlib.Display, screen: c_int, visual_id: u32) ?xlib.GLXFBConfig {
+    if (conn.fb_config_cache.get(visual_id)) |cached| {
+        return cached;
+    }
+
     var num_configs: c_int = 0;
     const configs = xlib.glXGetFBConfigs(display, screen, &num_configs) orelse return null;
     defer _ = xlib.XFree(@ptrCast(configs));
@@ -487,6 +498,7 @@ fn findFBConfigForVisual(display: *xlib.Display, screen: c_int, visual_id: u32) 
         _ = xlib.glXGetFBConfigAttrib(display, cfg, xlib.GLX_BIND_TO_TEXTURE_TARGETS_EXT, &bind_targets);
         if (bind_targets & xlib.GLX_TEXTURE_2D_BIT_EXT == 0) continue;
 
+        conn.fb_config_cache.put(visual_id, cfg) catch {};
         return cfg;
     }
 
@@ -985,6 +997,7 @@ fn acquirePixmapBinding(
     conn: *Connection,
     display: *xlib.Display,
     window: xcb.xcb_window_t,
+    visual_id: u32,
     gl_texture: c_uint,
     texture_format_hint: ?c_int,
 ) X11Error!PixmapBinding {
@@ -996,17 +1009,7 @@ fn acquirePixmapBinding(
         return error.PixmapCreationFailed;
     }
 
-    // Get visual for FBConfig lookup
-    const attr_cookie = xcb.xcb_get_window_attributes(conn.conn, window);
-    const attr_reply = xcb.xcb_get_window_attributes_reply(conn.conn, attr_cookie, null) orelse {
-        _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
-        return error.GeometryFetchFailed;
-    };
-    const visual_id = attr_reply.*.visual;
-    std.c.free(attr_reply);
-
-    const screen_num = xlib.DefaultScreen(display);
-    const fb_config = findFBConfigForVisual(display, screen_num, visual_id) orelse {
+    const fb_config = findFBConfigForVisual(conn, display, conn.screen_num, visual_id) orelse {
         _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
         return error.NoSuitableFBConfig;
     };
@@ -1027,14 +1030,14 @@ fn acquirePixmapBinding(
 
     clearGlxError(display);
     const glx_pixmap = xlib.glXCreatePixmap(display, fb_config, pixmap, &glx_attribs);
-    if (glx_pixmap == 0 or checkGlxError(display)) {
+    if (glx_pixmap == 0) {
+        _ = xlib.XSync(display, xlib.False);
         _ = xcb.xcb_free_pixmap(conn.conn, pixmap);
         return error.GLXPixmapCreationFailed;
     }
 
     // Bind pixmap content to GL texture
     xlib.glBindTexture(xlib.GL_TEXTURE_2D, gl_texture);
-    clearGlxError(display);
     conn.glx_bind.?(display, glx_pixmap, xlib.GLX_FRONT_LEFT_EXT, null);
 
     if (checkGlxError(display)) {
@@ -1080,6 +1083,11 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
     const height = geom_reply.*.height;
     if (width == 0 or height == 0) return error.InvalidGeometry;
 
+    const attr_cookie = xcb.xcb_get_window_attributes(conn.conn, window);
+    const attr_reply = xcb.xcb_get_window_attributes_reply(conn.conn, attr_cookie, null) orelse return error.GeometryFetchFailed;
+    defer std.c.free(attr_reply);
+    const visual_id = attr_reply.*.visual;
+
     // Create GL texture with filtering params
     var gl_texture: c_uint = undefined;
     xlib.glGenTextures(1, &gl_texture);
@@ -1091,7 +1099,7 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
     xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
 
     // Acquire pixmap binding (composite pixmap + GLX pixmap + bind)
-    const binding = acquirePixmapBinding(conn, gl_display.?, window, gl_texture, null) catch |err| {
+    const binding = acquirePixmapBinding(conn, gl_display.?, window, visual_id, gl_texture, null) catch |err| {
         xlib.glDeleteTextures(1, &gl_texture);
         return err;
     };
@@ -1101,6 +1109,7 @@ pub fn createWindowTexture(conn: *Connection, window: xcb.xcb_window_t) X11Error
 
     return WindowTexture{
         .window_id = window,
+        .visual_id = visual_id,
         .width = width,
         .height = height,
         .pixmap = binding.pixmap,

@@ -44,6 +44,8 @@ pub const App = struct {
     focus_grace_frames: u8,
     downsample_shader: ?ui.DownsampleShader,
     show_delay_frames: ?u8,
+    reacquire_pending: bool,
+    reacquire_cursor: usize,
 
     const Self = @This();
 
@@ -109,6 +111,8 @@ pub const App = struct {
             .focus_grace_frames = 0,
             .downsample_shader = downsample_shader,
             .show_delay_frames = null,
+            .reacquire_pending = false,
+            .reacquire_cursor = 0,
         };
 
         // Process initial tasks
@@ -224,6 +228,8 @@ pub const App = struct {
             self.mouseover_index = null;
         }
 
+        self.processReacquireQueue();
+
         // Render
         self.render();
     }
@@ -277,7 +283,20 @@ pub const App = struct {
                     }
 
                     // Create display window (taking ownership of title and icon_id)
-                    const new_item = ui.DisplayWindow{ .id = data.window_id, .title = data.title, .thumbnail_texture = texture, .icon_texture = icon_tex, .icon_id = data.icon_id, .title_version = 1, .thumbnail_version = 1, .source_width = source_width, .source_height = source_height, .display_width = 0, .display_height = 0 };
+                    const new_item = ui.DisplayWindow{
+                        .id = data.window_id,
+                        .title = data.title,
+                        .thumbnail_texture = texture,
+                        .icon_texture = icon_tex,
+                        .icon_id = data.icon_id,
+                        .title_version = 1,
+                        .thumbnail_version = 1,
+                        .source_width = source_width,
+                        .source_height = source_height,
+                        .display_width = 0,
+                        .display_height = 0,
+                        .thumbnail_ready = !self.window_hidden,
+                    };
 
                     self.items.append(new_item) catch {
                         // Free the strings since we failed to append
@@ -415,6 +434,7 @@ pub const App = struct {
         rl.SetWindowState(rl.FLAG_WINDOW_HIDDEN);
 
         self.window_hidden = true;
+        self.reacquire_pending = false;
 
         // Release GLX bindings so other compositors (KDE taskbar) can use the pixmaps
         self.releaseAllBindings();
@@ -428,9 +448,6 @@ pub const App = struct {
         if (self.update_queue) |queue| {
             queue.setWindowVisible(true);
         }
-
-        // Reacquire GLX pixmaps and texture bindings before rendering
-        self.reacquireAllTextures();
 
         // Recalculate layout
         self.current_layout = ui.calculateBestLayout(self.items.items);
@@ -452,6 +469,9 @@ pub const App = struct {
 
         self.focus_grace_frames = 5;
         self.window_hidden = false;
+
+        self.reacquire_pending = self.hasPendingReacquire();
+        self.reacquire_cursor = if (self.items.items.len > 0) self.selected_index % self.items.items.len else 0;
     }
 
     // === Alt+Tab state machine ===
@@ -599,9 +619,19 @@ pub const App = struct {
                     var t = self.window_textures.fetchRemove(drawable) orelse return;
                     t.value.deinit(self.conn);
                     self.removeItemByWindowId(drawable);
+                    self.reacquire_pending = self.hasPendingReacquire();
+                    self.reacquire_cursor = if (self.items.items.len > 0) self.reacquire_cursor % self.items.items.len else 0;
+                    self.updateLayout();
+                    return;
+                }
+                self.markThumbnailReady(drawable, true);
+                if (self.findItemByWindowId(drawable)) |item| {
+                    item.thumbnail_texture = tex.toRaylibTexture();
                 }
                 return;
             }
+
+            self.markThumbnailReady(drawable, true);
         }
     }
 
@@ -656,32 +686,127 @@ pub const App = struct {
         while (iter.next()) |tex| {
             tex.release(self.conn);
         }
+        for (self.items.items) |*item| {
+            item.thumbnail_ready = false;
+        }
         log.debug("Released {d} GLX bindings", .{self.window_textures.count()});
     }
 
-    /// Reacquire all GLX textures (recreate pixmaps and bindings before rendering)
-    fn reacquireAllTextures(self: *Self) void {
+    const REACQUIRE_FRAME_BUDGET_NS: i128 = 10 * std.time.ns_per_ms;
+
+    /// Incrementally reacquire GLX textures during update() to avoid blocking showWindow.
+    fn processReacquireQueue(self: *Self) void {
+        if (!self.reacquire_pending) return;
+        if (self.window_hidden) {
+            self.reacquire_pending = false;
+            return;
+        }
+
+        const start_ns = std.time.nanoTimestamp();
+        var layout_dirty = false;
         var to_remove = std.ArrayList(x11.xcb.xcb_window_t).init(self.allocator);
         defer to_remove.deinit();
 
-        var iter = self.window_textures.iterator();
-        while (iter.next()) |entry| {
-            if (!entry.value_ptr.reacquire(self.conn)) {
-                to_remove.append(entry.key_ptr.*) catch continue;
+        while (std.time.nanoTimestamp() - start_ns < REACQUIRE_FRAME_BUDGET_NS) {
+            const target_id = self.nextPendingReacquireWindowId() orelse break;
+            const tex = self.window_textures.getPtr(target_id) orelse {
+                self.markThumbnailReady(target_id, false);
+                continue;
+            };
+
+            if (!tex.reacquire(self.conn)) {
+                to_remove.append(target_id) catch continue;
+                self.markThumbnailReady(target_id, true);
+                continue;
+            }
+
+            const new_w = tex.width;
+            const new_h = tex.height;
+            self.markThumbnailReady(target_id, true);
+            if (self.findItemByWindowId(target_id)) |item| {
+                item.thumbnail_texture = tex.toRaylibTexture();
+                if (item.source_width != new_w or item.source_height != new_h) {
+                    item.source_width = new_w;
+                    item.source_height = new_h;
+                    layout_dirty = true;
+                }
             }
         }
 
         for (to_remove.items) |wid| {
-            log.warn("Removing stale GLX texture for window {x} during reacquire", .{wid});
+            log.warn("Removing stale GLX texture for window {x} during progressive reacquire", .{wid});
             if (self.window_textures.fetchRemove(wid)) |entry| {
                 var t = entry.value;
                 t.deinit(self.conn);
             }
             self.removeItemByWindowId(wid);
+            layout_dirty = true;
         }
 
-        if (to_remove.items.len > 0) {
-            log.debug("Reacquire: {d} textures failed", .{to_remove.items.len});
+        if (layout_dirty) {
+            self.updateLayout();
+        }
+
+        self.reacquire_pending = self.hasPendingReacquire();
+    }
+
+    fn hasPendingReacquire(self: *Self) bool {
+        for (self.items.items) |item| {
+            if (!item.thumbnail_ready) {
+                if (self.window_textures.getPtr(item.id)) |tex| {
+                    if (!tex.bound) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    fn nextPendingReacquireWindowId(self: *Self) ?x11.xcb.xcb_window_t {
+        if (self.items.items.len == 0) return null;
+
+        if (self.selected_index < self.items.items.len) {
+            const selected = self.items.items[self.selected_index];
+            if (!selected.thumbnail_ready) {
+                if (self.window_textures.getPtr(selected.id)) |tex| {
+                    if (!tex.bound) {
+                        return selected.id;
+                    }
+                }
+            }
+        }
+
+        const start = self.reacquire_cursor % self.items.items.len;
+        var offset: usize = 0;
+        while (offset < self.items.items.len) : (offset += 1) {
+            const idx = (start + offset) % self.items.items.len;
+            const item = self.items.items[idx];
+            if (item.thumbnail_ready) continue;
+
+            if (self.window_textures.getPtr(item.id)) |tex| {
+                if (!tex.bound) {
+                    self.reacquire_cursor = (idx + 1) % self.items.items.len;
+                    return item.id;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    fn findItemByWindowId(self: *Self, wid: x11.xcb.xcb_window_t) ?*ui.DisplayWindow {
+        for (self.items.items) |*item| {
+            if (item.id == wid) {
+                return item;
+            }
+        }
+        return null;
+    }
+
+    fn markThumbnailReady(self: *Self, wid: x11.xcb.xcb_window_t, ready: bool) void {
+        if (self.findItemByWindowId(wid)) |item| {
+            item.thumbnail_ready = ready;
         }
     }
 
