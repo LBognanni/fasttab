@@ -8,6 +8,10 @@ const nav = @import("navigation.zig");
 const rl = ui.rl;
 const log = std.log.scoped(.fasttab);
 
+const PROFILE_SLOW_SHOW_WINDOW_US: i128 = 5_000;
+const PROFILE_SLOW_REACQUIRE_WINDOW_US: i128 = 4_000;
+const PROFILE_SLOW_REACQUIRE_FRAME_US: i128 = 8_000;
+
 /// State machine for the Alt+Tab switcher
 pub const SwitcherState = enum {
     idle,
@@ -129,6 +133,9 @@ pub const App = struct {
         for (self.items.items) |*item| {
             // Don't unload thumbnail_texture here - it's owned by window_textures
             // Don't unload icon_texture here - it's shared via icon_texture_cache
+            if (item.cached_snapshot) |snapshot| {
+                rl.UnloadRenderTexture(snapshot);
+            }
             self.allocator.free(item.title);
             self.allocator.free(item.icon_id);
         }
@@ -296,6 +303,7 @@ pub const App = struct {
                         .display_width = 0,
                         .display_height = 0,
                         .thumbnail_ready = !self.window_hidden,
+                        .cached_snapshot = null,
                     };
 
                     self.items.append(new_item) catch {
@@ -436,42 +444,70 @@ pub const App = struct {
         self.window_hidden = true;
         self.reacquire_pending = false;
 
+        // Cache thumbnail snapshots before releasing GLX bindings
+        self.cacheAllSnapshots();
+
         // Release GLX bindings so other compositors (KDE taskbar) can use the pixmaps
         self.releaseAllBindings();
     }
 
     /// Show the switcher window (public for socket commands)
     pub fn showWindow(self: *Self) void {
+        const start_ns = std.time.nanoTimestamp();
         log.debug("Showing window with {d} items", .{self.items.items.len});
 
         // Notify worker that window is visible
         if (self.update_queue) |queue| {
             queue.setWindowVisible(true);
         }
+        const after_notify_ns = std.time.nanoTimestamp();
 
         // Recalculate layout
         self.current_layout = ui.calculateBestLayout(self.items.items);
+        const after_layout_ns = std.time.nanoTimestamp();
 
         // Query current mouse position and find monitor
         const mouse_pos = x11.getMousePosition(self.conn.conn, self.conn.root);
         self.monitor = findMonitorAtPosition(mouse_pos);
+        const after_monitor_ns = std.time.nanoTimestamp();
 
         rl.ClearWindowState(rl.FLAG_WINDOW_HIDDEN);
+        const after_map_ns = std.time.nanoTimestamp();
 
         // Set size after showing - SetWindowSize on a hidden window may not take effect
         rl.SetWindowSize(@intCast(self.current_layout.total_width), @intCast(self.current_layout.total_height));
+        const after_size_ns = std.time.nanoTimestamp();
 
         const win_x = self.monitor.x + @divTrunc(self.monitor.width - @as(i32, @intCast(self.current_layout.total_width)), 2);
         const win_y = self.monitor.y + @divTrunc(self.monitor.height - @as(i32, @intCast(self.current_layout.total_height)), 2);
         rl.SetWindowPosition(win_x, win_y);
+        const after_position_ns = std.time.nanoTimestamp();
 
         rl.SetWindowFocused();
+        const after_focus_ns = std.time.nanoTimestamp();
 
         self.focus_grace_frames = 5;
         self.window_hidden = false;
 
         self.reacquire_pending = self.hasPendingReacquire();
         self.reacquire_cursor = if (self.items.items.len > 0) self.selected_index % self.items.items.len else 0;
+
+        const total_us = @divTrunc(after_focus_ns - start_ns, std.time.ns_per_us);
+        if (total_us >= PROFILE_SLOW_SHOW_WINDOW_US) {
+            log.info(
+                "profile showWindow(us): total={d} notify={d} layout={d} monitor={d} map={d} size={d} position={d} focus={d}",
+                .{
+                    total_us,
+                    @divTrunc(after_notify_ns - start_ns, std.time.ns_per_us),
+                    @divTrunc(after_layout_ns - after_notify_ns, std.time.ns_per_us),
+                    @divTrunc(after_monitor_ns - after_layout_ns, std.time.ns_per_us),
+                    @divTrunc(after_map_ns - after_monitor_ns, std.time.ns_per_us),
+                    @divTrunc(after_size_ns - after_map_ns, std.time.ns_per_us),
+                    @divTrunc(after_position_ns - after_size_ns, std.time.ns_per_us),
+                    @divTrunc(after_focus_ns - after_position_ns, std.time.ns_per_us),
+                },
+            );
+        }
     }
 
     // === Alt+Tab state machine ===
@@ -692,6 +728,57 @@ pub const App = struct {
         log.debug("Released {d} GLX bindings", .{self.window_textures.count()});
     }
 
+    /// Cache snapshots of all live thumbnails into RenderTextures before releasing GLX bindings.
+    /// Uses the downsample shader to render each live GLX texture into a per-window FBO at display size.
+    fn cacheAllSnapshots(self: *Self) void {
+        var cached_count: usize = 0;
+        for (self.items.items) |*item| {
+            if (!item.thumbnail_ready) continue;
+            if (item.display_width == 0 or item.display_height == 0) continue;
+
+            // Free any previous cached snapshot
+            if (item.cached_snapshot) |prev| {
+                rl.UnloadRenderTexture(prev);
+                item.cached_snapshot = null;
+            }
+
+            const rt = rl.LoadRenderTexture(@intCast(item.display_width), @intCast(item.display_height));
+            if (rt.id == 0) continue; // FBO creation failed
+
+            const source_rect = rl.Rectangle{
+                .x = 0,
+                .y = 0,
+                .width = @floatFromInt(item.thumbnail_texture.width),
+                .height = @floatFromInt(item.thumbnail_texture.height),
+            };
+            const dest_rect = rl.Rectangle{
+                .x = 0,
+                .y = 0,
+                .width = @floatFromInt(item.display_width),
+                .height = @floatFromInt(item.display_height),
+            };
+
+            rl.BeginTextureMode(rt);
+            rl.ClearBackground(rl.Color{ .r = 0, .g = 0, .b = 0, .a = 0 });
+
+            if (self.downsample_shader) |*shader| {
+                shader.begin(source_rect.width, source_rect.height, dest_rect.width, dest_rect.height);
+                rl.DrawTexturePro(item.thumbnail_texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+                shader.end();
+            } else {
+                rl.DrawTexturePro(item.thumbnail_texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
+            }
+
+            rl.EndTextureMode();
+
+            item.cached_snapshot = rt;
+            cached_count += 1;
+        }
+        if (cached_count > 0) {
+            log.debug("Cached {d} thumbnail snapshots", .{cached_count});
+        }
+    }
+
     const REACQUIRE_FRAME_BUDGET_NS: i128 = 10 * std.time.ns_per_ms;
 
     /// Incrementally reacquire GLX textures during update() to avoid blocking showWindow.
@@ -704,6 +791,10 @@ pub const App = struct {
 
         const start_ns = std.time.nanoTimestamp();
         var layout_dirty = false;
+        var reacquired_count: usize = 0;
+        var failed_count: usize = 0;
+        var max_window_us: i128 = 0;
+        var max_window_id: x11.xcb.xcb_window_t = 0;
         var to_remove = std.ArrayList(x11.xcb.xcb_window_t).init(self.allocator);
         defer to_remove.deinit();
 
@@ -714,17 +805,35 @@ pub const App = struct {
                 continue;
             };
 
+            const window_start_ns = std.time.nanoTimestamp();
+
             if (!tex.reacquire(self.conn)) {
                 to_remove.append(target_id) catch continue;
                 self.markThumbnailReady(target_id, true);
+                failed_count += 1;
                 continue;
             }
+
+            const window_us = @divTrunc(std.time.nanoTimestamp() - window_start_ns, std.time.ns_per_us);
+            if (window_us > max_window_us) {
+                max_window_us = window_us;
+                max_window_id = target_id;
+            }
+            if (window_us >= PROFILE_SLOW_REACQUIRE_WINDOW_US) {
+                log.debug("profile reacquire window: id={x} duration_us={d}", .{ target_id, window_us });
+            }
+            reacquired_count += 1;
 
             const new_w = tex.width;
             const new_h = tex.height;
             self.markThumbnailReady(target_id, true);
             if (self.findItemByWindowId(target_id)) |item| {
                 item.thumbnail_texture = tex.toRaylibTexture();
+                // Free cached snapshot now that live texture is available
+                if (item.cached_snapshot) |snapshot| {
+                    rl.UnloadRenderTexture(snapshot);
+                    item.cached_snapshot = null;
+                }
                 if (item.source_width != new_w or item.source_height != new_h) {
                     item.source_width = new_w;
                     item.source_height = new_h;
@@ -748,6 +857,14 @@ pub const App = struct {
         }
 
         self.reacquire_pending = self.hasPendingReacquire();
+
+        const frame_us = @divTrunc(std.time.nanoTimestamp() - start_ns, std.time.ns_per_us);
+        if (frame_us >= PROFILE_SLOW_REACQUIRE_FRAME_US or failed_count > 0) {
+            log.info(
+                "profile reacquire frame(us): total={d} reacquired={d} failed={d} max_window={d} max_window_id={x} pending={}",
+                .{ frame_us, reacquired_count, failed_count, max_window_us, max_window_id, self.reacquire_pending },
+            );
+        }
     }
 
     fn hasPendingReacquire(self: *Self) bool {
@@ -814,6 +931,9 @@ pub const App = struct {
     fn removeItemByWindowId(self: *Self, wid: x11.xcb.xcb_window_t) void {
         for (self.items.items, 0..) |*item, i| {
             if (item.id == wid) {
+                if (item.cached_snapshot) |snapshot| {
+                    rl.UnloadRenderTexture(snapshot);
+                }
                 self.allocator.free(item.title);
                 self.allocator.free(item.icon_id);
                 _ = self.items.orderedRemove(i);

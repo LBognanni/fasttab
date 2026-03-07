@@ -85,6 +85,7 @@ pub const DisplayWindow = struct {
     display_width: u32,
     display_height: u32,
     thumbnail_ready: bool,
+    cached_snapshot: ?rl.RenderTexture2D,
 };
 
 // Re-export GridLayout from layout module
@@ -409,6 +410,16 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                 } else {
                     rl.DrawTexturePro(item.thumbnail_texture, source_rect, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
                 }
+            } else if (item.cached_snapshot) |snapshot| {
+                // Show cached snapshot of last-known thumbnail while reacquiring.
+                // Negate height to flip Y — raylib RenderTextures are rendered bottom-up.
+                const snap_src = rl.Rectangle{
+                    .x = 0,
+                    .y = 0,
+                    .width = @floatFromInt(snapshot.texture.width),
+                    .height = -@as(f32, @floatFromInt(snapshot.texture.height)),
+                };
+                rl.DrawTexturePro(snapshot.texture, snap_src, dest_rect, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
             } else {
                 const fallback_bg = rl.Color{ .r = 0x18, .g = 0x18, .b = 0x18, .a = 230 };
                 rl.DrawRectangleRounded(dest_rect, 0.06, 6, fallback_bg);
@@ -435,8 +446,8 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                 }
             }
 
-            // Draw icon overlay at bottom-center of thumbnail
-            if (item.thumbnail_ready and item.icon_texture != null) {
+            // Draw icon overlay at bottom-center of thumbnail (when live texture or cached snapshot is shown)
+            if ((item.thumbnail_ready or item.cached_snapshot != null) and item.icon_texture != null) {
                 const icon_tex = item.icon_texture.?;
                 const thumb_h: f32 = @floatFromInt(item.display_height);
                 const thumb_w: f32 = @floatFromInt(item.display_width);
