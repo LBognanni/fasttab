@@ -27,29 +27,53 @@ fn testWindowWithDisplay(source_width: u32, source_height: u32, display_width: u
     };
 }
 
-test "calculateItemWidth with square thumbnail" {
-    const width = ui.calculateItemWidth(100, 100, 100);
-    try testing.expectEqual(@as(u32, 100), width);
+// --- calculateThumbnailSize tests ---
+
+test "calculateThumbnailSize fits to max_height for tall window" {
+    // 100:200 aspect ratio (0.5), max_width=214, max_height=100
+    // height-fit: w=50, h=100. w<214, stays.
+    const size = ui.calculateThumbnailSize(100, 200, 214, 100);
+    try testing.expectEqual(@as(u32, 50), size.width);
+    try testing.expectEqual(@as(u32, 100), size.height);
 }
 
-test "calculateItemWidth with wide thumbnail" {
-    const width = ui.calculateItemWidth(200, 100, 100);
-    try testing.expectEqual(@as(u32, 200), width);
+test "calculateThumbnailSize fits to max_width for wide window" {
+    // 400:100 aspect ratio (4.0), max_width=214, max_height=100
+    // height-fit: w=400, h=100. w>214, so width-fit: w=214, h=53.
+    const size = ui.calculateThumbnailSize(400, 100, 214, 100);
+    try testing.expectEqual(@as(u32, 214), size.width);
+    try testing.expectEqual(@as(u32, 53), size.height);
 }
 
-test "calculateItemWidth with tall thumbnail" {
-    const width = ui.calculateItemWidth(100, 200, 100);
-    try testing.expectEqual(@as(u32, 50), width);
+test "calculateThumbnailSize with square thumbnail fits height" {
+    // 100:100 aspect ratio (1.0), max_width=214, max_height=100
+    // height-fit: w=100, h=100. w<214, stays.
+    const size = ui.calculateThumbnailSize(100, 100, 214, 100);
+    try testing.expectEqual(@as(u32, 100), size.width);
+    try testing.expectEqual(@as(u32, 100), size.height);
 }
 
-test "calculateItemWidth with zero height returns target height" {
-    const width = ui.calculateItemWidth(100, 0, 100);
-    try testing.expectEqual(@as(u32, 100), width);
+test "calculateThumbnailSize with narrow window fits height" {
+    // 30:200 aspect ratio (0.15), max_width=214, max_height=100
+    // height-fit: w=15, h=100. w<214, stays.
+    const size = ui.calculateThumbnailSize(30, 200, 214, 100);
+    try testing.expectEqual(@as(u32, 15), size.width);
+    try testing.expectEqual(@as(u32, 100), size.height);
 }
 
-test "calculateItemWidth with very small result returns 1" {
-    const width = ui.calculateItemWidth(1, 1000, 10);
-    try testing.expectEqual(@as(u32, 1), width);
+test "calculateThumbnailSize with zero dimensions returns max" {
+    const size = ui.calculateThumbnailSize(0, 0, 214, 100);
+    try testing.expectEqual(@as(u32, 214), size.width);
+    try testing.expectEqual(@as(u32, 100), size.height);
+}
+
+test "calculateThumbnailSize exactly at max_width" {
+    // 428:200 aspect ratio (2.14), max_width=214, max_height=100
+    // height-fit: w=100*2.14=214, h=100. Due to float rounding, may
+    // trigger width constraint: w=214, h=214/2.14≈99.
+    const size = ui.calculateThumbnailSize(428, 200, 214, 100);
+    try testing.expectEqual(@as(u32, 214), size.width);
+    try testing.expect(size.height >= 99 and size.height <= 100);
 }
 
 test "calculateGridLayout with empty items" {
@@ -73,6 +97,7 @@ test "calculateGridLayout with single item" {
     try testing.expectEqual(@as(u32, 1), grid.rows);
     try testing.expectEqual(@as(u32, 100), grid.item_height);
 
+    // 160:100 aspect ratio, w=160 < MAX_THUMBNAIL_WIDTH (214), no width constraint
     try testing.expectEqual(@as(u32, 160), items[0].display_width);
     try testing.expectEqual(@as(u32, 100), items[0].display_height);
 }
@@ -90,6 +115,8 @@ test "calculateGridLayout with multiple items in one row" {
 }
 
 test "calculateGridLayout with items requiring multiple rows" {
+    // With MAX_THUMBNAIL_WIDTH=214, 300:100 windows get clamped to w=214.
+    // 214px * N + 12px * (N-1) + 32px > 1720 => N > 7.5 => N=8 to force rows>1
     var items: [10]DisplayWindow = undefined;
     for (&items) |*item| {
         item.* = testWindow(300, 100);
@@ -108,7 +135,9 @@ test "calculateGridLayout with very wide items" {
     };
     _ = ui.calculateGridLayout(&items, 100);
 
-    try testing.expectEqual(@as(u32, 1600), items[0].display_width);
+    // 1600:100 aspect ratio, constrained by MAX_THUMBNAIL_WIDTH (214): w=214, h=13
+    try testing.expectEqual(@as(u32, 214), items[0].display_width);
+    try testing.expectEqual(@as(u32, 13), items[0].display_height);
 }
 
 test "calculateGridLayout with tall thumbnails" {
@@ -117,6 +146,7 @@ test "calculateGridLayout with tall thumbnails" {
     };
     _ = ui.calculateGridLayout(&items, 100);
 
+    // 100:200 aspect ratio (0.5), height-fit: w=50, h=100. w<68, so no width constraint.
     try testing.expectEqual(@as(u32, 50), items[0].display_width);
     try testing.expectEqual(@as(u32, 100), items[0].display_height);
 }
@@ -129,12 +159,14 @@ test "calculateGridLayout with mixed aspect ratios" {
     };
     _ = ui.calculateGridLayout(&items, 100);
 
+    // 160:100 -> w=160 < 214, no width constraint
     try testing.expectEqual(@as(u32, 160), items[0].display_width);
-    try testing.expectEqual(@as(u32, 100), items[1].display_width);
-    try testing.expectEqual(@as(u32, 50), items[2].display_width);
-
     try testing.expectEqual(@as(u32, 100), items[0].display_height);
+    // 100:100 -> w=100 < 214, no width constraint
+    try testing.expectEqual(@as(u32, 100), items[1].display_width);
     try testing.expectEqual(@as(u32, 100), items[1].display_height);
+    // 100:200 -> height-fit: w=50, h=100 (w<214, no width constraint)
+    try testing.expectEqual(@as(u32, 50), items[2].display_width);
     try testing.expectEqual(@as(u32, 100), items[2].display_height);
 }
 

@@ -92,7 +92,9 @@ pub const DisplayWindow = struct {
 pub const GridLayout = layout_module.GridLayout;
 
 // Re-export pure layout functions
-pub const calculateItemWidth = layout_module.calculateItemWidth;
+pub const calculateThumbnailSize = layout_module.calculateThumbnailSize;
+pub const ThumbnailSize = layout_module.ThumbnailSize;
+pub const MAX_THUMBNAIL_WIDTH = layout_module.MAX_THUMBNAIL_WIDTH;
 
 pub fn calculateGridLayout(items: []DisplayWindow, target_height: u32) GridLayout {
     if (items.len == 0) {
@@ -107,8 +109,9 @@ pub fn calculateGridLayout(items: []DisplayWindow, target_height: u32) GridLayou
 
     var total_item_width: u32 = 0;
     for (items) |*item| {
-        item.display_height = target_height;
-        item.display_width = calculateItemWidth(item.source_width, item.source_height, target_height);
+        const size = calculateThumbnailSize(item.source_width, item.source_height, MAX_THUMBNAIL_WIDTH, target_height);
+        item.display_width = size.width;
+        item.display_height = size.height;
         total_item_width += item.display_width;
     }
 
@@ -387,9 +390,14 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                 }
             }
 
+            // Vertically center thumbnail within the item_height cell area.
+            // For items shorter than item_height (wide/short windows constrained
+            // by MAX_THUMBNAIL_WIDTH), this centers the preview in the cell.
+            const thumb_y = y + @as(f32, @floatFromInt((layout.item_height - item.display_height) / 2));
+
             const dest_rect = rl.Rectangle{
                 .x = x,
-                .y = y,
+                .y = thumb_y,
                 .width = @floatFromInt(item.display_width),
                 .height = @floatFromInt(item.display_height),
             };
@@ -429,7 +437,7 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                     const thumb_w: f32 = @floatFromInt(item.display_width);
                     const icon_size = thumb_h * 0.55;
                     const icon_x = x + (thumb_w - icon_size) / 2.0;
-                    const icon_y = y + (thumb_h - icon_size) / 2.0;
+                    const icon_y = thumb_y + (thumb_h - icon_size) / 2.0;
                     const icon_src = rl.Rectangle{
                         .x = 0,
                         .y = 0,
@@ -446,14 +454,16 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                 }
             }
 
-            // Draw icon overlay at bottom-center of thumbnail (when live texture or cached snapshot is shown)
+            // Draw icon overlay at bottom-center of grid cell (when live texture or cached snapshot is shown).
+            // Uses item_height (not display_height) so the icon stays a consistent size
+            // even for wide/short windows that have a smaller display_height.
             if ((item.thumbnail_ready or item.cached_snapshot != null) and item.icon_texture != null) {
                 const icon_tex = item.icon_texture.?;
-                const thumb_h: f32 = @floatFromInt(item.display_height);
+                const cell_h: f32 = @floatFromInt(layout.item_height);
                 const thumb_w: f32 = @floatFromInt(item.display_width);
-                const icon_size = thumb_h * ICON_HEIGHT_RATIO;
+                const icon_size = cell_h * ICON_HEIGHT_RATIO;
                 const icon_x = x + (thumb_w - icon_size) / 2.0;
-                const icon_y = y + thumb_h - icon_size + (thumb_h * ICON_BOTTOM_OVERHANG);
+                const icon_y = y + cell_h - icon_size + (cell_h * ICON_BOTTOM_OVERHANG);
                 const icon_src = rl.Rectangle{
                     .x = 0,
                     .y = 0,
@@ -469,7 +479,8 @@ pub fn renderSwitcher(items: []DisplayWindow, layout: GridLayout, selected_index
                 rl.DrawTexturePro(icon_tex, icon_src, icon_dst, rl.Vector2{ .x = 0, .y = 0 }, 0, rl.WHITE);
             }
 
-            const title_y = y + @as(f32, @floatFromInt(item.display_height + TITLE_SPACING));
+            // Title is always positioned at the bottom of the cell
+            const title_y = y + @as(f32, @floatFromInt(layout.item_height + TITLE_SPACING));
             drawTruncatedText(font, item.title, x, title_y, @floatFromInt(TITLE_FONT_SIZE), @floatFromInt(item.display_width), TITLE_COLOR);
 
             x += @as(f32, @floatFromInt(item.display_width + SPACING));
