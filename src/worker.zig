@@ -55,6 +55,7 @@ pub const UpdateTask = union(enum) {
 pub const TaskQueue = struct {
     mutex: std.Thread.Mutex = .{},
     tasks: std.ArrayList(UpdateTask),
+    dropped_windows: std.ArrayList(x11.xcb.xcb_window_t),
     should_stop: bool = false,
     window_visible: bool = true,
     first_scan_done: bool = false,
@@ -62,6 +63,7 @@ pub const TaskQueue = struct {
     pub fn init(allocator: std.mem.Allocator) TaskQueue {
         return .{
             .tasks = std.ArrayList(UpdateTask).init(allocator),
+            .dropped_windows = std.ArrayList(x11.xcb.xcb_window_t).init(allocator),
         };
     }
 
@@ -143,6 +145,23 @@ pub const TaskQueue = struct {
         }
     }
 
+    /// Called by the main thread to report that a window was dropped
+    /// (texture creation failed, damage/reacquire failed, etc.) so the
+    /// worker can forget about it and re-discover it as new.
+    pub fn reportDropped(self: *TaskQueue, window_id: x11.xcb.xcb_window_t) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.dropped_windows.append(window_id) catch {};
+    }
+
+    /// Called by the worker thread to drain the set of dropped window IDs.
+    pub fn drainDropped(self: *TaskQueue, out: *std.ArrayList(x11.xcb.xcb_window_t)) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        out.appendSlice(self.dropped_windows.items) catch {};
+        self.dropped_windows.clearRetainingCapacity();
+    }
+
     pub fn deinit(self: *TaskQueue) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -150,6 +169,7 @@ pub const TaskQueue = struct {
             task.deinit();
         }
         self.tasks.deinit();
+        self.dropped_windows.deinit();
     }
 };
 
@@ -225,6 +245,10 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
     var known_list = std.ArrayList(x11.xcb.xcb_window_t).init(allocator);
     defer known_list.deinit();
 
+    // Buffer for dropped window IDs reported by the main thread
+    var dropped_list = std.ArrayList(x11.xcb.xcb_window_t).init(allocator);
+    defer dropped_list.deinit();
+
     var is_first_scan = true;
     var pidCache = x11.PidCache.init(allocator);
     defer pidCache.deinit();
@@ -262,6 +286,28 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
         var known_iter = known_windows.keyIterator();
         while (known_iter.next()) |key| {
             known_list.append(key.*) catch {};
+        }
+
+        // Process windows that the main thread dropped (texture failure, etc.)
+        // Removing them from tracked_windows and known_windows ensures the scanner
+        // will treat them as new, triggering a fresh window_added event.
+        dropped_list.clearRetainingCapacity();
+        queue.drainDropped(&dropped_list);
+        for (dropped_list.items) |dropped_wid| {
+            if (tracked_windows.fetchRemove(dropped_wid)) |entry| {
+                var tw = entry.value;
+                tw.deinit();
+                log.info("Re-discovering dropped window {x}", .{dropped_wid});
+            }
+            _ = known_windows.remove(dropped_wid);
+        }
+        // Rebuild known_list if any windows were dropped
+        if (dropped_list.items.len > 0) {
+            known_list.clearRetainingCapacity();
+            var known_iter2 = known_windows.keyIterator();
+            while (known_iter2.next()) |key| {
+                known_list.append(key.*) catch {};
+            }
         }
 
         // Determine capture mode

@@ -254,33 +254,39 @@ pub const App = struct {
             any_changes = true;
             switch (task.*) {
                 .window_added => |*data| {
-                    // Skip minimized windows (can't create GLX texture for them)
-                    if (data.is_minimized) {
-                        log.debug("Skipping minimized window {x}", .{data.window_id});
-                        continue;
-                    }
+                    var texture: rl.Texture2D = std.mem.zeroes(rl.Texture2D);
+                    var source_width: u32 = 0;
+                    var source_height: u32 = 0;
+                    var has_texture = false;
 
-                    // Create GLX texture
-                    const win_tex = x11.createWindowTexture(self.conn, data.window_id) catch |err| {
-                        log.err("GLX texture failed for {x}: {}", .{ data.window_id, err });
-                        continue;
-                    };
+                    // Attempt to create GLX texture (may fail for minimized windows, etc.)
+                    if (!data.is_minimized) {
+                        if (x11.createWindowTexture(self.conn, data.window_id)) |win_tex| {
+                            texture = win_tex.toRaylibTexture();
+                            source_width = win_tex.width;
+                            source_height = win_tex.height;
 
-                    const texture = win_tex.toRaylibTexture();
-                    const source_width = win_tex.width;
-                    const source_height = win_tex.height;
+                            self.window_textures.put(data.window_id, win_tex) catch {
+                                var t = win_tex;
+                                t.deinit(self.conn);
+                                // Fall through — window still gets added without a texture
+                            };
 
-                    self.window_textures.put(data.window_id, win_tex) catch {
-                        var t = win_tex;
-                        t.deinit(self.conn);
-                        continue;
-                    };
+                            if (self.window_textures.contains(data.window_id)) {
+                                has_texture = true;
 
-                    // Release binding immediately if hidden so other compositors can use the pixmap
-                    if (self.window_hidden) {
-                        if (self.window_textures.getPtr(data.window_id)) |stored_tex| {
-                            stored_tex.release(self.conn);
+                                // Release binding immediately if hidden so other compositors can use the pixmap
+                                if (self.window_hidden) {
+                                    if (self.window_textures.getPtr(data.window_id)) |stored_tex| {
+                                        stored_tex.release(self.conn);
+                                    }
+                                }
+                            }
+                        } else |err| {
+                            log.warn("GLX texture failed for {x}: {}, showing icon fallback", .{ data.window_id, err });
                         }
+                    } else {
+                        log.debug("Minimized window {x}, showing icon fallback", .{data.window_id});
                     }
 
                     // Look up icon
@@ -290,6 +296,7 @@ pub const App = struct {
                     }
 
                     // Create display window (taking ownership of title and icon_id)
+                    // Windows without a texture will render with the icon fallback (Tier 3)
                     const new_item = ui.DisplayWindow{
                         .id = data.window_id,
                         .title = data.title,
@@ -302,7 +309,7 @@ pub const App = struct {
                         .source_height = source_height,
                         .display_width = 0,
                         .display_height = 0,
-                        .thumbnail_ready = !self.window_hidden,
+                        .thumbnail_ready = has_texture and !self.window_hidden,
                         .cached_snapshot = null,
                     };
 
@@ -655,6 +662,7 @@ pub const App = struct {
                     var t = self.window_textures.fetchRemove(drawable) orelse return;
                     t.value.deinit(self.conn);
                     self.removeItemByWindowId(drawable);
+                    if (self.update_queue) |q| q.reportDropped(drawable);
                     self.reacquire_pending = self.hasPendingReacquire();
                     self.reacquire_cursor = if (self.items.items.len > 0) self.reacquire_cursor % self.items.items.len else 0;
                     self.updateLayout();
@@ -800,44 +808,79 @@ pub const App = struct {
 
         while (std.time.nanoTimestamp() - start_ns < REACQUIRE_FRAME_BUDGET_NS) {
             const target_id = self.nextPendingReacquireWindowId() orelse break;
-            const tex = self.window_textures.getPtr(target_id) orelse {
-                self.markThumbnailReady(target_id, false);
-                continue;
-            };
-
             const window_start_ns = std.time.nanoTimestamp();
 
-            if (!tex.reacquire(self.conn)) {
-                to_remove.append(target_id) catch continue;
-                self.markThumbnailReady(target_id, true);
-                failed_count += 1;
-                continue;
-            }
-
-            const window_us = @divTrunc(std.time.nanoTimestamp() - window_start_ns, std.time.ns_per_us);
-            if (window_us > max_window_us) {
-                max_window_us = window_us;
-                max_window_id = target_id;
-            }
-            if (window_us >= PROFILE_SLOW_REACQUIRE_WINDOW_US) {
-                log.debug("profile reacquire window: id={x} duration_us={d}", .{ target_id, window_us });
-            }
-            reacquired_count += 1;
-
-            const new_w = tex.width;
-            const new_h = tex.height;
-            self.markThumbnailReady(target_id, true);
-            if (self.findItemByWindowId(target_id)) |item| {
-                item.thumbnail_texture = tex.toRaylibTexture();
-                // Free cached snapshot now that live texture is available
-                if (item.cached_snapshot) |snapshot| {
-                    rl.UnloadRenderTexture(snapshot);
-                    item.cached_snapshot = null;
+            if (self.window_textures.getPtr(target_id)) |tex| {
+                // Existing texture — rebind the pixmap
+                if (!tex.reacquire(self.conn)) {
+                    to_remove.append(target_id) catch continue;
+                    self.markThumbnailReady(target_id, true);
+                    failed_count += 1;
+                    continue;
                 }
-                if (item.source_width != new_w or item.source_height != new_h) {
-                    item.source_width = new_w;
-                    item.source_height = new_h;
-                    layout_dirty = true;
+
+                const window_us = @divTrunc(std.time.nanoTimestamp() - window_start_ns, std.time.ns_per_us);
+                if (window_us > max_window_us) {
+                    max_window_us = window_us;
+                    max_window_id = target_id;
+                }
+                if (window_us >= PROFILE_SLOW_REACQUIRE_WINDOW_US) {
+                    log.debug("profile reacquire window: id={x} duration_us={d}", .{ target_id, window_us });
+                }
+                reacquired_count += 1;
+
+                const new_w = tex.width;
+                const new_h = tex.height;
+                self.markThumbnailReady(target_id, true);
+                if (self.findItemByWindowId(target_id)) |item| {
+                    item.thumbnail_texture = tex.toRaylibTexture();
+                    // Free cached snapshot now that live texture is available
+                    if (item.cached_snapshot) |snapshot| {
+                        rl.UnloadRenderTexture(snapshot);
+                        item.cached_snapshot = null;
+                    }
+                    if (item.source_width != new_w or item.source_height != new_h) {
+                        item.source_width = new_w;
+                        item.source_height = new_h;
+                        layout_dirty = true;
+                    }
+                }
+            } else {
+                // No texture yet (minimized or initial creation failed) — try to create one
+                const win_tex = x11.createWindowTexture(self.conn, target_id) catch {
+                    failed_count += 1;
+                    // Leave thumbnail_ready = false; will retry on next show
+                    continue;
+                };
+
+                self.window_textures.put(target_id, win_tex) catch {
+                    var t = win_tex;
+                    t.deinit(self.conn);
+                    failed_count += 1;
+                    continue;
+                };
+
+                const window_us = @divTrunc(std.time.nanoTimestamp() - window_start_ns, std.time.ns_per_us);
+                if (window_us > max_window_us) {
+                    max_window_us = window_us;
+                    max_window_id = target_id;
+                }
+                if (window_us >= PROFILE_SLOW_REACQUIRE_WINDOW_US) {
+                    log.debug("profile acquire new texture: id={x} duration_us={d}", .{ target_id, window_us });
+                }
+                reacquired_count += 1;
+
+                self.markThumbnailReady(target_id, true);
+                if (self.findItemByWindowId(target_id)) |item| {
+                    // Update from the now-stored texture pointer
+                    if (self.window_textures.getPtr(target_id)) |stored_tex| {
+                        item.thumbnail_texture = stored_tex.toRaylibTexture();
+                    }
+                    if (item.source_width != win_tex.width or item.source_height != win_tex.height) {
+                        item.source_width = win_tex.width;
+                        item.source_height = win_tex.height;
+                        layout_dirty = true;
+                    }
                 }
             }
         }
@@ -849,6 +892,7 @@ pub const App = struct {
                 t.deinit(self.conn);
             }
             self.removeItemByWindowId(wid);
+            if (self.update_queue) |q| q.reportDropped(wid);
             layout_dirty = true;
         }
 
@@ -874,6 +918,9 @@ pub const App = struct {
                     if (!tex.bound) {
                         return true;
                     }
+                } else {
+                    // No texture at all (minimized or initial creation failed) — needs acquire
+                    return true;
                 }
             }
         }
@@ -890,6 +937,8 @@ pub const App = struct {
                     if (!tex.bound) {
                         return selected.id;
                     }
+                } else {
+                    return selected.id;
                 }
             }
         }
@@ -906,6 +955,9 @@ pub const App = struct {
                     self.reacquire_cursor = (idx + 1) % self.items.items.len;
                     return item.id;
                 }
+            } else {
+                self.reacquire_cursor = (idx + 1) % self.items.items.len;
+                return item.id;
             }
         }
 

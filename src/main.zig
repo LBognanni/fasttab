@@ -56,7 +56,7 @@ fn killExistingInstance() !void {
         if (std.mem.eql(u8, comm, "fasttab")) {
             std.debug.print("Killing existing instance (PID {d})...\n", .{pid});
             std.posix.kill(pid, std.posix.SIG.TERM) catch |err| {
-                std.debug.print("Failed to kill PID {d}: {}\n", .{pid, err});
+                std.debug.print("Failed to kill PID {d}: {}\n", .{ pid, err });
             };
         }
     }
