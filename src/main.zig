@@ -154,7 +154,7 @@ fn processXcbEvents(application: *app.App, conn: *x11.Connection) void {
         switch (response_type) {
             x11.xcb.XCB_KEY_PRESS => {
                 const key_event: *x11.xcb.xcb_key_press_event_t = @ptrCast(event);
-                const keysym = x11.keycodeToKeysym(conn.conn, key_event.detail, 0);
+                const keysym = x11.keycodeToKeysym(conn, key_event.detail, 0);
                 const state_mask = key_event.state;
 
                 // Check for Shift via state mask or keysym
@@ -177,7 +177,7 @@ fn processXcbEvents(application: *app.App, conn: *x11.Connection) void {
             },
             x11.xcb.XCB_KEY_RELEASE => {
                 const key_event: *x11.xcb.xcb_key_release_event_t = @ptrCast(event);
-                const keysym = x11.keycodeToKeysym(conn.conn, key_event.detail, 0);
+                const keysym = x11.keycodeToKeysym(conn, key_event.detail, 0);
 
                 _ = application.handleKeyEvent(keysym, false);
             },

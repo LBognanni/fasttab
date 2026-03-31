@@ -288,6 +288,9 @@ pub const Connection = struct {
     // visual_id -> FBConfig cache to avoid repeated full scans
     fb_config_cache: std.AutoHashMap(u32, xlib.GLXFBConfig),
 
+    // Cached key symbols table — avoids a per-keyevent XCB round-trip
+    key_symbols: ?*xcb.xcb_key_symbols_t,
+
     pub fn init() X11Error!Connection {
         const display = xlib.XOpenDisplay(null) orelse return error.ConnectionFailed;
 
@@ -358,6 +361,7 @@ pub const Connection = struct {
             .screen_num = screen_num,
             .damage_event_base = damage_base,
             .fb_config_cache = std.AutoHashMap(u32, xlib.GLXFBConfig).init(std.heap.c_allocator),
+            .key_symbols = xcb.xcb_key_symbols_alloc(xcb_conn),
         };
     }
 
@@ -402,11 +406,15 @@ pub const Connection = struct {
             .screen_num = 0,
             .damage_event_base = 0,
             .fb_config_cache = std.AutoHashMap(u32, xlib.GLXFBConfig).init(std.heap.c_allocator),
+            .key_symbols = null, // XCB-only: no keyboard handling
         };
     }
 
     pub fn deinit(self: *Connection) void {
         self.fb_config_cache.deinit();
+        if (self.key_symbols) |ks| {
+            xcb.xcb_key_symbols_free(ks);
+        }
         if (self.display) |display| {
             _ = xlib.XCloseDisplay(display);
         } else {
@@ -972,8 +980,13 @@ pub fn getStackingWindowList(
 }
 
 /// Convert a keycode to a keysym using xcb-keysyms.
-pub fn keycodeToKeysym(conn: *xcb.xcb_connection_t, keycode: xcb.xcb_keycode_t, col: u16) xcb.xcb_keysym_t {
-    const key_symbols = xcb.xcb_key_symbols_alloc(conn);
+/// Uses the cached key_symbols from the connection to avoid per-call XCB round-trips.
+pub fn keycodeToKeysym(conn: *Connection, keycode: xcb.xcb_keycode_t, col: u16) xcb.xcb_keysym_t {
+    if (conn.key_symbols) |ks| {
+        return xcb.xcb_key_symbols_get_keysym(ks, keycode, @intCast(col));
+    }
+    // Fallback: alloc/free (slower, but safe if init failed)
+    const key_symbols = xcb.xcb_key_symbols_alloc(conn.conn);
     if (key_symbols == null) return 0;
     defer xcb.xcb_key_symbols_free(key_symbols);
     return xcb.xcb_key_symbols_get_keysym(key_symbols, keycode, @intCast(col));
