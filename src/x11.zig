@@ -252,19 +252,35 @@ pub const WindowTexture = struct {
     pub fn rebind(self: *WindowTexture, conn: *Connection) bool {
         const display = self.gl_display orelse return false;
         if (!self.bound) return false;
+        const start_ns = std.time.nanoTimestamp();
+
         clearGlxError(display);
+        const after_clear_ns = std.time.nanoTimestamp();
 
         xlib.glBindTexture(xlib.GL_TEXTURE_2D, self.gl_texture);
         conn.glx_release.?(display, self.glx_pixmap, xlib.GLX_FRONT_LEFT_EXT);
         conn.glx_bind.?(display, self.glx_pixmap, xlib.GLX_FRONT_LEFT_EXT, null);
 
         if (checkGlxError(display)) {
+            const total_us = @divTrunc(std.time.nanoTimestamp() - start_ns, std.time.ns_per_us);
             xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
-            log.warn("GLX rebind failed for window {x}", .{self.window_id});
+            log.warn("GLX rebind failed for window {x} (us: total={d} clear_sync={d})", .{
+                self.window_id,
+                total_us,
+                @divTrunc(after_clear_ns - start_ns, std.time.ns_per_us),
+            });
             return false;
         }
 
         xlib.glBindTexture(xlib.GL_TEXTURE_2D, 0);
+        const total_us = @divTrunc(std.time.nanoTimestamp() - start_ns, std.time.ns_per_us);
+        if (total_us >= 2_000) {
+            log.warn("profile rebind slow (us): window={x} total={d} clear_sync={d}", .{
+                self.window_id,
+                total_us,
+                @divTrunc(after_clear_ns - start_ns, std.time.ns_per_us),
+            });
+        }
 
         return true;
     }
@@ -882,6 +898,7 @@ pub fn ungrabAltTab(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) void {
 
 /// Actively grab the keyboard so ALL key events go to us during switching.
 pub fn grabKeyboard(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) bool {
+    const start_ns = std.time.nanoTimestamp();
     const cookie = xcb.xcb_grab_keyboard(
         conn,
         1, // owner_events
@@ -891,6 +908,12 @@ pub fn grabKeyboard(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) bool {
         xcb.XCB_GRAB_MODE_ASYNC,
     );
     const reply = xcb.xcb_grab_keyboard_reply(conn, cookie, null);
+    const elapsed_us = @divTrunc(std.time.nanoTimestamp() - start_ns, std.time.ns_per_us);
+    if (elapsed_us >= 2_000) {
+        log.warn("profile grabKeyboard slow: {d}us", .{elapsed_us});
+    } else {
+        log.debug("grabKeyboard round-trip: {d}us", .{elapsed_us});
+    }
     if (reply == null) {
         log.err("Failed to grab keyboard (no reply)", .{});
         return false;

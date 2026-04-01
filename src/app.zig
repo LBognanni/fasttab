@@ -9,6 +9,7 @@ const rl = ui.rl;
 const log = std.log.scoped(.fasttab);
 
 const PROFILE_SLOW_SHOW_WINDOW_US: i128 = 5_000;
+const PROFILE_SLOW_HIDE_WINDOW_US: i128 = 5_000;
 const PROFILE_SLOW_REACQUIRE_WINDOW_US: i128 = 4_000;
 const PROFILE_SLOW_REACQUIRE_FRAME_US: i128 = 8_000;
 
@@ -440,22 +441,54 @@ pub const App = struct {
     /// Hide the switcher window
     pub fn hideWindow(self: *Self) void {
         log.debug("Hiding window", .{});
+        const start_ns = std.time.nanoTimestamp();
 
         // Notify worker that window is hidden
         if (self.update_queue) |queue| {
             queue.setWindowVisible(false);
         }
+        const after_notify_ns = std.time.nanoTimestamp();
 
         rl.SetWindowState(rl.FLAG_WINDOW_HIDDEN);
+        const after_hide_ns = std.time.nanoTimestamp();
 
         self.window_hidden = true;
         self.reacquire_pending = false;
 
         // Cache thumbnail snapshots before releasing GLX bindings
         self.cacheAllSnapshots();
+        const after_snapshot_ns = std.time.nanoTimestamp();
 
         // Release GLX bindings so other compositors (KDE taskbar) can use the pixmaps
         self.releaseAllBindings();
+        const after_release_ns = std.time.nanoTimestamp();
+
+        const total_us = @divTrunc(after_release_ns - start_ns, std.time.ns_per_us);
+        if (total_us >= PROFILE_SLOW_HIDE_WINDOW_US) {
+            log.warn(
+                "profile hideWindow(us): total={d} notify={d} hide={d} snapshot={d} release={d} windows={d}",
+                .{
+                    total_us,
+                    @divTrunc(after_notify_ns - start_ns, std.time.ns_per_us),
+                    @divTrunc(after_hide_ns - after_notify_ns, std.time.ns_per_us),
+                    @divTrunc(after_snapshot_ns - after_hide_ns, std.time.ns_per_us),
+                    @divTrunc(after_release_ns - after_snapshot_ns, std.time.ns_per_us),
+                    self.window_textures.count(),
+                },
+            );
+        } else {
+            log.debug(
+                "hideWindow(us): total={d} notify={d} hide={d} snapshot={d} release={d} windows={d}",
+                .{
+                    total_us,
+                    @divTrunc(after_notify_ns - start_ns, std.time.ns_per_us),
+                    @divTrunc(after_hide_ns - after_notify_ns, std.time.ns_per_us),
+                    @divTrunc(after_snapshot_ns - after_hide_ns, std.time.ns_per_us),
+                    @divTrunc(after_release_ns - after_snapshot_ns, std.time.ns_per_us),
+                    self.window_textures.count(),
+                },
+            );
+        }
     }
 
     /// Show the switcher window (public for socket commands)
@@ -616,31 +649,62 @@ pub const App = struct {
     pub fn confirmSwitching(self: *Self) void {
         if (self.state != .switching) return;
 
+        const start_ns = std.time.nanoTimestamp();
+
         if (self.items.items.len > 0 and self.selected_index < self.items.items.len) {
             const selected_id = self.items.items[self.selected_index].id;
             x11.activateWindow(self.conn.conn, self.conn.root, selected_id, self.conn.atoms);
             log.info("Confirmed: activating window {x}", .{selected_id});
         }
+        const after_activate_ns = std.time.nanoTimestamp();
 
         x11.ungrabKeyboard(self.conn.conn);
+        const after_ungrab_ns = std.time.nanoTimestamp();
+
         self.show_delay_frames = null;
         if (!self.window_hidden) {
             self.hideWindow();
         }
+        const after_hide_ns = std.time.nanoTimestamp();
+
         self.state = .idle;
+
+        log.info(
+            "profile confirmSwitching(us): total={d} activate={d} ungrab={d} hide={d}",
+            .{
+                @divTrunc(after_hide_ns - start_ns, std.time.ns_per_us),
+                @divTrunc(after_activate_ns - start_ns, std.time.ns_per_us),
+                @divTrunc(after_ungrab_ns - after_activate_ns, std.time.ns_per_us),
+                @divTrunc(after_hide_ns - after_ungrab_ns, std.time.ns_per_us),
+            },
+        );
     }
 
     /// Cancel switching
     pub fn cancelSwitching(self: *Self) void {
         if (self.state != .switching) return;
 
+        const start_ns = std.time.nanoTimestamp();
         log.info("Switching cancelled", .{});
         x11.ungrabKeyboard(self.conn.conn);
+        const after_ungrab_ns = std.time.nanoTimestamp();
+
         self.show_delay_frames = null;
         if (!self.window_hidden) {
             self.hideWindow();
         }
+        const after_hide_ns = std.time.nanoTimestamp();
+
         self.state = .idle;
+
+        log.info(
+            "profile cancelSwitching(us): total={d} ungrab={d} hide={d}",
+            .{
+                @divTrunc(after_hide_ns - start_ns, std.time.ns_per_us),
+                @divTrunc(after_ungrab_ns - start_ns, std.time.ns_per_us),
+                @divTrunc(after_hide_ns - after_ungrab_ns, std.time.ns_per_us),
+            },
+        );
     }
 
     /// Handle damage event for a window (rebind GLX texture)
