@@ -61,7 +61,6 @@ pub const App = struct {
         daemon_mode: bool,
         conn: *x11.Connection,
     ) !Self {
-        // Create empty items list and caches
         const items = std.ArrayList(ui.DisplayWindow).init(allocator);
         const icon_texture_cache = std.StringHashMap(rl.Texture2D).init(allocator);
         const window_textures = std.AutoHashMap(x11.xcb.xcb_window_t, x11.WindowTexture).init(allocator);
@@ -72,13 +71,9 @@ pub const App = struct {
         rl.SetTraceLogLevel(rl.LOG_WARNING);
         rl.InitWindow(800, 600, "FastTab");
         rl.SetTargetFPS(60);
-        // Load system font
         const font = ui.loadSystemFont(ui.TITLE_FONT_SIZE);
-
-        // Load downsample shader for high-quality thumbnail scaling
         const downsample_shader = ui.DownsampleShader.load();
 
-        // Default layout
         const layout = ui.GridLayout{
             .columns = 0,
             .rows = 0,
@@ -120,7 +115,6 @@ pub const App = struct {
             .reacquire_cursor = 0,
         };
 
-        // Process initial tasks
         self.drainUpdateQueue();
 
         log.info("App initialized: {d} windows tracked", .{self.items.items.len});
@@ -245,7 +239,6 @@ pub const App = struct {
     pub fn drainUpdateQueue(self: *Self) void {
         const queue = self.update_queue orelse return;
 
-        // Move tasks to temp buffer
         _ = queue.drainAll(&self.temp_tasks);
         if (self.temp_tasks.items.len == 0) return;
 
@@ -549,8 +542,6 @@ pub const App = struct {
             );
         }
     }
-
-    // === Alt+Tab state machine ===
 
     /// Number of frames to wait before showing the switcher window.
     /// If Alt is released before this, the window is never shown.
@@ -875,7 +866,6 @@ pub const App = struct {
             const window_start_ns = std.time.nanoTimestamp();
 
             if (self.window_textures.getPtr(target_id)) |tex| {
-                // Existing texture — rebind the pixmap
                 if (!tex.reacquire(self.conn)) {
                     to_remove.append(target_id) catch continue;
                     self.markThumbnailReady(target_id, true);
@@ -1057,8 +1047,6 @@ pub const App = struct {
             }
         }
     }
-
-    // === Private methods ===
 
     fn render(self: *Self) void {
         const win_x = self.monitor.x + @divTrunc(self.monitor.width - @as(i32, @intCast(self.current_layout.total_width)), 2);

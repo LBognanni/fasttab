@@ -15,7 +15,6 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "--replace")) {
             replace = true;
         } else if (std.mem.eql(u8, arg, "daemon") or std.mem.eql(u8, arg, "--daemon")) {
-            // explicit daemon mode, continue
         } else {
             std.debug.print("Unknown command: {s}\n", .{arg});
             std.debug.print("Usage: fasttab [daemon] [--replace]\n", .{});
@@ -29,7 +28,6 @@ pub fn main() !void {
         std.time.sleep(200 * std.time.ns_per_ms);
     }
 
-    // Run daemon
     return runDaemon();
 }
 
@@ -44,7 +42,6 @@ fn killExistingInstance() !void {
         const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
         if (pid == my_pid) continue;
 
-        // Check comm
         var buf: [256]u8 = undefined;
         const comm_path = try std.fmt.bufPrint(&buf, "/proc/{d}/comm", .{pid});
         const file = std.fs.openFileAbsolute(comm_path, .{}) catch continue;
@@ -70,7 +67,6 @@ fn runDaemon() !void {
 
     const stdout = std.io.getStdOut().writer();
 
-    // Connect to X11
     var conn = try x11.Connection.init();
     defer conn.deinit();
 
@@ -83,7 +79,6 @@ fn runDaemon() !void {
     x11.grabAltTab(conn.conn, conn.root);
     defer x11.ungrabAltTab(conn.conn, conn.root);
 
-    // Create update queue and start background worker
     var task_queue = worker.TaskQueue.init(allocator);
 
     const worker_thread = std.Thread.spawn(.{}, worker.backgroundWorker, .{ &task_queue, allocator }) catch |err| {
@@ -93,7 +88,6 @@ fn runDaemon() !void {
 
     try stdout.print("Waiting for initial window scan...\n", .{});
 
-    // Wait for first scan completion from worker
     if (!task_queue.waitForFirstScan(10000)) {
         try stdout.print("Timeout waiting for worker scan.\n", .{});
         task_queue.requestStop();
@@ -122,19 +116,14 @@ fn runDaemon() !void {
         // Poll for XCB events (16ms timeout ~= 60fps)
         _ = std.posix.poll(&pollfds, 16) catch {};
 
-        // Process XCB events (key press/release, damage)
         if (pollfds[0].revents & std.posix.POLL.IN != 0) {
             processXcbEvents(&application, &conn);
         }
 
-        // Process updates from queue
         application.drainUpdateQueue();
-
-        // Update and render
         application.update();
     }
 
-    // Stop background worker
     task_queue.requestStop();
     worker_thread.join();
     task_queue.deinit();
@@ -157,7 +146,6 @@ fn processXcbEvents(application: *app.App, conn: *x11.Connection) void {
                 const keysym = x11.keycodeToKeysym(conn, key_event.detail, 0);
                 const state_mask = key_event.state;
 
-                // Check for Shift via state mask or keysym
                 const is_shift = (state_mask & x11.MOD_SHIFT) != 0;
 
                 if (application.state == .idle) {

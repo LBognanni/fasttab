@@ -19,16 +19,13 @@ pub const IconResult = struct {
 const ICON_SIZES = [_][]const u8{ "16x16", "22x22", "24x24", "32x32", "48x48", "64x64", "128x128", "256x256", "512x512" };
 
 pub fn getAppIcon(allocator: mem.Allocator, app_name: []const u8, target_size: u32) !IconResult {
-    // 1. Find the name of the icon from the .desktop file
     const icon_id = try findIconNameFromDesktop(allocator, app_name) orelse return error.IconNameNotFound;
     defer allocator.free(icon_id);
 
-    // If the .desktop file gives us an absolute path already, just load it
     if (fs.path.isAbsolute(icon_id)) {
         return try loadPng(icon_id);
     }
 
-    // 2. Search the filesystem for the best PNG match
     const icon_path = try resolveIconPath(allocator, icon_id, target_size) orelse return error.IconFileNotFound;
     defer allocator.free(icon_path);
 
@@ -95,8 +92,6 @@ fn resolveIconPath(allocator: mem.Allocator, icon_id: []const u8, target_size: u
     for (ICON_SIZES[start_idx..]) |size_dir| {
         for (icon_roots) |root| {
             const path = try std.fs.path.join(allocator, &[_][]const u8{ root, size_dir, "apps", try std.fmt.allocPrint(allocator, "{s}.png", .{icon_id}) });
-            // Note: In a loop, the path needs careful management.
-            // Simplified here: check access and return if found.
             fs.accessAbsolute(path, .{}) catch {
                 allocator.free(path);
                 continue;

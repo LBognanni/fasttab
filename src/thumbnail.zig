@@ -38,7 +38,6 @@ pub fn processIconArgb(icon_data: []const u32, src_width: u32, src_height: u32, 
         src_rgba[i * 4 + 3] = a;
     }
 
-    // Resize to ICON_SIZE x ICON_SIZE
     const out_data = try allocator.alloc(u8, ICON_SIZE * ICON_SIZE * 4);
     errdefer allocator.free(out_data);
 

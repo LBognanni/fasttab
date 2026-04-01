@@ -151,7 +151,6 @@ pub const MousePosition = struct {
     y: i32,
 };
 
-/// GLX texture directly bound to window pixmap (zero-copy)
 // Cached glGenerateMipmap function pointer (looked up once)
 var cached_glGenerateMipmap: ?*const fn (c_uint) callconv(.C) void = null;
 var glGenerateMipmap_looked_up: bool = false;
@@ -164,6 +163,7 @@ fn getGlGenerateMipmap() ?*const fn (c_uint) callconv(.C) void {
     return cached_glGenerateMipmap;
 }
 
+/// GLX texture directly bound to a window's composite pixmap (zero-copy).
 pub const WindowTexture = struct {
     window_id: xcb.xcb_window_t,
     visual_id: u32,
@@ -804,8 +804,6 @@ pub fn isCurrentExecutable(
     return false;
 }
 
-// === Key Grab Infrastructure ===
-
 /// Grab Alt+Tab and Alt+Shift+Tab passively on the root window.
 /// Each combo needs 4 grabs for NumLock/CapsLock variants.
 pub fn grabAltTab(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) void {
@@ -824,7 +822,6 @@ pub fn grabAltTab(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) void {
         MOD_LOCK | MOD_MOD2,
     };
 
-    // Grab Alt+Tab (4 lock variants)
     const tab_codes = xcb.xcb_key_symbols_get_keycode(key_symbols, XK_Tab);
     if (tab_codes) |codes| {
         defer std.c.free(codes);
@@ -832,7 +829,6 @@ pub fn grabAltTab(conn: *xcb.xcb_connection_t, root: xcb.xcb_window_t) void {
         while (codes[i] != 0) : (i += 1) {
             for (lock_variants) |lock| {
                 _ = xcb.xcb_grab_key(conn, 1, root, MOD_ALT | lock, codes[i], xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC);
-                // Also grab Alt+Shift+Tab
                 _ = xcb.xcb_grab_key(conn, 1, root, MOD_ALT | MOD_SHIFT | lock, codes[i], xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC);
             }
         }

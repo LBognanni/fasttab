@@ -52,7 +52,6 @@ pub const ScanResult = struct {
 /// - Filters windows by type and current desktop
 /// - Returns window info (no thumbnail capture - that's done via GLX on main thread)
 pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, options: ScanOptions, pidCache: ?*x11.PidCache) !ScanResult {
-    // Build a set of known windows for fast lookup
     var known_set = std.AutoHashMap(x11.xcb.xcb_window_t, void).init(allocator);
     defer known_set.deinit();
     if (options.known_windows) |known| {
@@ -61,7 +60,6 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
         }
     }
 
-    // Get current window list from X11
     const windows = try x11.getWindowList(allocator, conn.conn, conn.root, conn.atoms);
     defer allocator.free(windows);
 
@@ -73,17 +71,14 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
             continue;
         }
 
-        // Filter by window type
         if (!x11.shouldShowWindow(conn.conn, window_id, conn.atoms)) {
             continue;
         }
 
-        // Filter by current desktop
         if (!x11.isWindowOnCurrentDesktop(conn.conn, window_id, conn.root, conn.atoms)) {
             continue;
         }
 
-        // Add to window_ids (all windows on current desktop)
         try result.window_ids.append(window_id);
 
         const is_minimized = x11.isWindowMinimized(conn.conn, window_id, conn.atoms);
@@ -98,7 +93,6 @@ pub fn scanAndProcess(allocator: std.mem.Allocator, conn: *x11.Connection, optio
             continue;
         }
 
-        // Get window title
         const title = x11.getWindowTitle(allocator, conn.conn, window_id, conn.atoms);
 
         try result.items.append(.{

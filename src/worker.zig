@@ -81,16 +81,7 @@ pub const TaskQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const count = self.tasks.items.len;
-        // Attempt to move items to 'out'. If we can't append, we just clear tasks to avoid
-        // unbound growth, but ideally we would want to signal error or retry.
-        // For now, assume out has capacity or can grow.
         out.appendSlice(self.tasks.items) catch {
-            // If we fail to copy, we unfortunately have to drop them to avoid deadlock/stall,
-            // or we could keep them. Let's keep them if copy fails, hoping next time it works?
-            // But main thread loop might depend on draining.
-            // Let's drop them to be safe against infinite loop, but log it?
-            // Cannot log easily inside here without scope.
-            // Given typical usage, OOM here is fatal anyway.
             return 0;
         };
         self.tasks.clearRetainingCapacity();
@@ -198,7 +189,7 @@ fn fetchAndCacheIcon(
 
     const icon_thumb = thumbnail.processIconArgb(icon_raw.data, icon_raw.width, icon_raw.height, allocator) catch return null;
 
-    // Make a copy for the cache (icon_thumb.data will be the canonical cached copy)
+    // Dupe the key; icon_thumb transfers directly into the cache (no thumbnail copy)
     const cache_key = allocator.dupe(u8, wm_class) catch {
         var t = icon_thumb;
         t.deinit();
@@ -227,11 +218,9 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
 
     log.info("Background worker started", .{});
 
-    // Track known windows between refreshes (for scanner optimization)
     var known_windows = std.AutoHashMap(x11.xcb.xcb_window_t, void).init(allocator);
     defer known_windows.deinit();
 
-    // Track detailed window state for change detection
     var tracked_windows = std.AutoHashMap(x11.xcb.xcb_window_t, TrackedWindow).init(allocator);
     defer {
         var iter = tracked_windows.iterator();
@@ -241,11 +230,9 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
         tracked_windows.deinit();
     }
 
-    // Buffer for known window list (scanner input)
     var known_list = std.ArrayList(x11.xcb.xcb_window_t).init(allocator);
     defer known_list.deinit();
 
-    // Buffer for dropped window IDs reported by the main thread
     var dropped_list = std.ArrayList(x11.xcb.xcb_window_t).init(allocator);
     defer dropped_list.deinit();
 
@@ -265,14 +252,12 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
         icon_cache.deinit();
     }
 
-    // Track which icons have been pushed to the queue
     var pushed_icons = std.StringHashMap(void).init(allocator);
     defer pushed_icons.deinit();
 
     const ourPid = std.os.linux.getpid();
     log.debug("Background worker: Our PID is {d}", .{ourPid});
 
-    // Main worker loop
     while (!queue.shouldStop()) {
         // For first scan, don't wait - produce results immediately
         if (!is_first_scan) {
@@ -281,7 +266,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
 
         if (queue.shouldStop()) break;
 
-        // Build known window list for scanner
         known_list.clearRetainingCapacity();
         var known_iter = known_windows.keyIterator();
         while (known_iter.next()) |key| {
@@ -301,7 +285,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
             }
             _ = known_windows.remove(dropped_wid);
         }
-        // Rebuild known_list if any windows were dropped
         if (dropped_list.items.len > 0) {
             known_list.clearRetainingCapacity();
             var known_iter2 = known_windows.keyIterator();
@@ -310,11 +293,9 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
             }
         }
 
-        // Determine capture mode
         const window_visible = queue.isWindowVisible();
         const capture_only_new = !is_first_scan and !window_visible;
 
-        // Use window_scanner for window discovery
         var scan_result = window_scanner.scanAndProcess(allocator, &conn, .{
             .known_windows = if (known_list.items.len > 0) known_list.items else null,
             .capture_only_new = capture_only_new,
@@ -324,7 +305,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
         };
         defer scan_result.deinit();
 
-        // 1. Detect removals
         var tracked_ids = std.ArrayList(x11.xcb.xcb_window_t).init(allocator);
         // Collect keys first to avoid modification during iteration issues
         var tracked_iter = tracked_windows.keyIterator();
@@ -342,7 +322,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
                 }
             }
             if (!found) {
-                // Window removed
                 queue.push(.{ .window_removed = .{ .window_id = wid } });
                 if (tracked_windows.fetchRemove(wid)) |entry| {
                     var tw = entry.value;
@@ -351,13 +330,8 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
             }
         }
 
-        // 2. Process captured windows (additions and updates)
         for (scan_result.items.items) |*item| {
-            // Check if existing
             if (tracked_windows.getPtr(item.window_id)) |existing| {
-                // Update existing
-
-                // Check title
                 if (!std.mem.eql(u8, item.title, existing.title)) {
                     existing.title_version += 1;
 
@@ -380,7 +354,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
                     } });
                 }
             } else {
-                // New window
                 const wm_class = x11.getWindowClass(allocator, conn.conn, item.window_id, conn.atoms);
                 defer {
                     if (!std.mem.eql(u8, wm_class, "(unknown)")) {
@@ -388,7 +361,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
                     }
                 }
 
-                // Check if we need to send icon
                 if (!pushed_icons.contains(wm_class)) {
                     var icon_data_copy: ?[]u8 = null;
                     var icon_w: u32 = 0;
@@ -425,7 +397,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
                     }
                 }
 
-                // Add window
                 const title_owned = if (std.mem.eql(u8, item.title, "(unknown)"))
                     allocator.dupe(u8, "(unknown)") catch continue
                 else
@@ -455,7 +426,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
                     continue;
                 };
 
-                // Send to queue (needs its own copies)
                 const title_send = allocator.dupe(u8, title_owned) catch continue;
                 const icon_id_send = allocator.dupe(u8, icon_id_owned) catch {
                     allocator.free(title_send);
@@ -474,7 +444,6 @@ pub fn backgroundWorker(queue: *TaskQueue, allocator: std.mem.Allocator) void {
             }
         }
 
-        // Update known windows for scanner optimization
         known_windows.clearRetainingCapacity();
         for (scan_result.window_ids.items) |wid| {
             known_windows.put(wid, {}) catch {};
