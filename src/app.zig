@@ -726,6 +726,12 @@ pub const App = struct {
                 self.markThumbnailReady(drawable, true);
                 if (self.findItemByWindowId(drawable)) |item| {
                     item.thumbnail_texture = tex.toRaylibTexture();
+                    // Update dimensions in case the window was resized
+                    if (item.source_width != tex.width or item.source_height != tex.height) {
+                        item.source_width = tex.width;
+                        item.source_height = tex.height;
+                        self.updateLayout();
+                    }
                 }
                 return;
             }

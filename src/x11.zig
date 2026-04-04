@@ -244,6 +244,17 @@ pub const WindowTexture = struct {
         self.pixmap = binding.pixmap;
         self.glx_pixmap = binding.glx_pixmap;
         self.bound = true;
+
+        // Update dimensions in case the window was resized since creation
+        const geom_cookie = xcb.xcb_get_geometry(conn.conn, self.window_id);
+        if (xcb.xcb_get_geometry_reply(conn.conn, geom_cookie, null)) |geom_reply| {
+            defer std.c.free(geom_reply);
+            if (geom_reply.*.width > 0 and geom_reply.*.height > 0) {
+                self.width = geom_reply.*.width;
+                self.height = geom_reply.*.height;
+            }
+        }
+
         return true;
     }
 
