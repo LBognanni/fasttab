@@ -62,6 +62,10 @@ pub const App = struct {
     reacquire_cursor: usize,
     mru_list: std.ArrayList(x11.xcb.xcb_window_t),
 
+    // Shift-tap tracking: press-and-release Shift (without Tab) selects previous window
+    shift_held: bool,
+    tab_pressed_during_shift: bool,
+
     // Win+Tab same-app filtering
     switch_mode: SwitchMode,
     filtered_items: std.ArrayList(ui.DisplayWindow), // non-owning shallow copies; strings owned by items
@@ -139,6 +143,8 @@ pub const App = struct {
             .reacquire_pending = false,
             .reacquire_cursor = 0,
             .mru_list = mru_list,
+            .shift_held = false,
+            .tab_pressed_during_shift = false,
             .switch_mode = .all_windows,
             .filtered_items = std.ArrayList(ui.DisplayWindow).init(allocator),
             .active_app_class = null,
@@ -647,6 +653,7 @@ pub const App = struct {
     pub fn handleWinTab(self: *Self, shift: bool) void {
         if (self.state == .switching) {
             if (shift) {
+                self.tab_pressed_during_shift = true;
                 self.selectPrev();
             } else {
                 self.selectNext();
@@ -709,15 +716,28 @@ pub const App = struct {
                 self.confirmSwitching();
                 return true;
             }
+            if (keysym == x11.XK_Shift_L or keysym == x11.XK_Shift_R) {
+                if (self.shift_held and !self.tab_pressed_during_shift) {
+                    self.selectPrev();
+                }
+                self.shift_held = false;
+                return true;
+            }
             return false;
         }
 
         switch (keysym) {
+            x11.XK_Shift_L, x11.XK_Shift_R => {
+                self.shift_held = true;
+                self.tab_pressed_during_shift = false;
+                return true;
+            },
             x11.XK_Tab => {
                 self.selectNext();
                 return true;
             },
             x11.XK_ISO_Left_Tab => {
+                self.tab_pressed_during_shift = true;
                 self.selectPrev();
                 return true;
             },
@@ -773,6 +793,8 @@ pub const App = struct {
         const after_hide_ns = std.time.nanoTimestamp();
 
         self.state = .idle;
+        self.shift_held = false;
+        self.tab_pressed_during_shift = false;
         self.resetSwitchMode();
 
         log.info(
@@ -802,6 +824,8 @@ pub const App = struct {
         const after_hide_ns = std.time.nanoTimestamp();
 
         self.state = .idle;
+        self.shift_held = false;
+        self.tab_pressed_during_shift = false;
         self.resetSwitchMode();
 
         log.info(

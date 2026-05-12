@@ -3,9 +3,20 @@
 A lightning fast Alt+Tab switcher for X11 written in Zig using Raylib.
 
 
-
 https://github.com/user-attachments/assets/6327cd4b-4750-40c8-ab30-f8d80463887d
 
+
+## How It Works
+
+- Press `Alt+Tab` to switch between all windows
+- Press `Win+Tab` to switch between windows of the same application (e.g. all Chrome windows)
+- Press `Tab` to move to the next window
+    - Hold `Shift` while pressing `Tab` to navigate backwards
+    - Or quick tap the `Shift` key to move backwards
+    - Or navigate using the arrow keys!
+    - Or click on a window with the mouse!
+    - And yes, keyboard takes precedence over the mouse, unlike _some other switcher_ 🤫
+- Release `Alt` or `Win/Super` to confirm the switch
 
 
 ## Features

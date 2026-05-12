@@ -63,6 +63,8 @@ fn checkGlxError(display: *xlib.Display) bool {
 // Keysym constants (from X11/keysymdef.h)
 pub const XK_Tab = 0xff09;
 pub const XK_ISO_Left_Tab = 0xfe20;
+pub const XK_Shift_L = 0xffe1;
+pub const XK_Shift_R = 0xffe2;
 pub const XK_Alt_L = 0xffe9;
 pub const XK_Alt_R = 0xffea;
 pub const XK_Super_L = 0xffeb;
